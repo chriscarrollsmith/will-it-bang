@@ -40,6 +40,13 @@ PARQUET_URL = (
     "https://fabxmporizzqflnftavs.supabase.co/storage/v1/object/public/"
     "enriched_tweets/enriched_tweets.parquet"
 )
+CA_API = "https://fabxmporizzqflnftavs.supabase.co/rest/v1"
+CA_ANON_KEY = (
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+    "eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZhYnhtcG9yaXp6cWZsbmZ0YXZzIiwicm9sZSI6ImFub24i"
+    "LCJpYXQiOjE3MjIyNDQ5MTIsImV4cCI6MjAzNzgyMDkxMn0."
+    "UIEJiUNkLsW28tBHmG-RQDW-I5JNlJLt62CSk9D_qG8"
+)
 
 URL_RE = re.compile(r"https?://|www\.", re.IGNORECASE)
 MENTION_RE = re.compile(r"(?<!\w)@\w+")
@@ -186,6 +193,51 @@ def sample_accounts(
     return df
 
 
+def _ca_headers() -> dict[str, str]:
+    return {
+        "apikey": CA_ANON_KEY,
+        "Authorization": f"Bearer {CA_ANON_KEY}",
+    }
+
+
+def _fetch_id_counts(table: str, id_col: str, tweet_ids: list[str], batch_size: int = 80) -> dict[str, int]:
+    """Count rows per tweet_id in a CA table (media/urls)."""
+    counts: dict[str, int] = {}
+    session = requests.Session()
+    for start in range(0, len(tweet_ids), batch_size):
+        batch = tweet_ids[start : start + batch_size]
+        # PostgREST `in` filter; quote ids for safety.
+        joined = ",".join(f'"{tid}"' for tid in batch)
+        url = f"{CA_API}/{table}"
+        params = {"select": id_col, id_col: f"in.({joined})"}
+        resp = session.get(url, headers=_ca_headers(), params=params, timeout=60)
+        resp.raise_for_status()
+        for row in resp.json():
+            tid = str(row[id_col])
+            counts[tid] = counts.get(tid, 0) + 1
+        if start == 0 or (start // batch_size) % 20 == 0:
+            print(f"  {table}: {min(start + batch_size, len(tweet_ids)):,}/{len(tweet_ids):,}")
+    return counts
+
+
+def attach_media_flags(df: pd.DataFrame) -> pd.DataFrame:
+    """Join sparse CA tweet_media / tweet_urls presence flags (known at post time)."""
+    df = df.copy()
+    ids = df["tweet_id"].astype(str).tolist()
+    print(f"Fetching attachment flags for {len(ids):,} tweets…")
+    media_counts = _fetch_id_counts("tweet_media", "tweet_id", ids)
+    url_counts = _fetch_id_counts("tweet_urls", "tweet_id", ids)
+    df["n_media"] = df["tweet_id"].astype(str).map(lambda t: media_counts.get(t, 0)).astype(np.int16)
+    df["has_media"] = (df["n_media"] > 0).astype(np.int8)
+    df["n_ca_urls"] = df["tweet_id"].astype(str).map(lambda t: url_counts.get(t, 0)).astype(np.int16)
+    df["has_ca_url"] = (df["n_ca_urls"] > 0).astype(np.int8)
+    print(
+        f"  media coverage: {df['has_media'].mean():.1%}, "
+        f"ca_url coverage: {df['has_ca_url'].mean():.1%}"
+    )
+    return df
+
+
 # ---------------------------------------------------------------------------
 # Leakage-safe features
 # ---------------------------------------------------------------------------
@@ -250,9 +302,19 @@ def build_features(df: pd.DataFrame, min_history: int) -> pd.DataFrame:
         df["reply_to_user_id"].notna()
         & (df["reply_to_user_id"].astype(str) == df["account_id"].astype(str))
     ).astype(np.int8)
+    if "has_media" not in df.columns:
+        df["has_media"] = 0
+        df["n_media"] = 0
+        df["has_ca_url"] = 0
+        df["n_ca_urls"] = 0
     df["hour"] = df["created_at"].dt.hour.astype(np.int8)
     df["dow"] = df["created_at"].dt.dayofweek.astype(np.int8)
     df["is_weekend"] = (df["dow"] >= 5).astype(np.int8)
+    # Cyclical time encodings (leakage-free calendar features).
+    df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24.0)
+    df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24.0)
+    df["dow_sin"] = np.sin(2 * np.pi * df["dow"] / 7.0)
+    df["dow_cos"] = np.cos(2 * np.pi * df["dow"] / 7.0)
 
     rows: list[dict] = []
     for account_id, g in df.groupby("account_id", sort=False):
@@ -261,6 +323,7 @@ def build_features(df: pd.DataFrame, min_history: int) -> pd.DataFrame:
         log_eng = g["log_engagement"].to_numpy(dtype=np.float64)
         is_reply = g["is_reply"].to_numpy(dtype=np.int8)
         has_url = g["has_url"].to_numpy(dtype=np.int8)
+        has_media = g["has_media"].to_numpy(dtype=np.int8)
 
         for i in range(len(g)):
             if i < min_history:
@@ -279,6 +342,7 @@ def build_features(df: pd.DataFrame, min_history: int) -> pd.DataFrame:
 
             row = g.iloc[i]
             hist_mean = float(prior_e.mean())
+            hist_mean_nr = float(prior_e[non_reply].mean()) if non_reply.any() else hist_mean
             rows.append(
                 {
                     "tweet_id": row["tweet_id"],
@@ -298,12 +362,20 @@ def build_features(df: pd.DataFrame, min_history: int) -> pd.DataFrame:
                     "n_emoji": int(row["n_emoji"]),
                     "starts_mention": int(row["starts_mention"]),
                     "caps_ratio": float(row["caps_ratio"]),
+                    "has_media": int(row["has_media"]),
+                    "n_media": int(row["n_media"]),
+                    "has_ca_url": int(row["has_ca_url"]),
+                    "n_ca_urls": int(row["n_ca_urls"]),
                     "is_reply": int(row["is_reply"]),
                     "is_quote": int(row["is_quote"]),
                     "is_self_reply": int(row["is_self_reply"]),
                     "hour": int(row["hour"]),
                     "dow": int(row["dow"]),
                     "is_weekend": int(row["is_weekend"]),
+                    "hour_sin": float(row["hour_sin"]),
+                    "hour_cos": float(row["hour_cos"]),
+                    "dow_sin": float(row["dow_sin"]),
+                    "dow_cos": float(row["dow_cos"]),
                     "hist_n": i,
                     "hist_mean_eng": hist_mean,
                     "hist_median_eng": float(np.median(prior_e)),
@@ -313,13 +385,17 @@ def build_features(df: pd.DataFrame, min_history: int) -> pd.DataFrame:
                     "hist_mean_eng_7d": float(prior_e[mask_7].mean()) if mask_7.any() else 0.0,
                     "hist_mean_eng_30d": float(prior_e[mask_30].mean()) if mask_30.any() else 0.0,
                     "hist_decay_mean_eng": decay_mean,
-                    "hist_mean_nonreply": float(prior_e[non_reply].mean()) if non_reply.any() else hist_mean,
+                    "hist_mean_nonreply": hist_mean_nr,
                     "hist_mean_reply": float(prior_e[reply_only].mean()) if reply_only.any() else hist_mean,
                     "hist_tweets_7d": int(mask_7.sum()),
                     "hist_tweets_30d": int(mask_30.sum()),
                     "days_since_last": float(age_days[-1]),
                     "hist_frac_reply": float(prior_reply.mean()),
                     "hist_frac_url": float(has_url[:i].mean()),
+                    "hist_frac_media": float(has_media[:i].mean()),
+                    # Interactions: reply status vs the author's typical non-reply baseline.
+                    "reply_x_hist_nonreply": float(row["is_reply"]) * hist_mean_nr,
+                    "media_x_hist_mean": float(row["has_media"]) * hist_mean,
                 }
             )
 
@@ -425,14 +501,15 @@ def attach_embeddings(df: pd.DataFrame, batch_size: int) -> pd.DataFrame:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--max-tweets", type=int, default=20000, help="Cap on sampled original tweets")
-    p.add_argument("--per-account-cap", type=int, default=250, help="Max tweets kept per account")
+    p.add_argument("--max-tweets", type=int, default=25000, help="Cap on sampled original tweets")
+    p.add_argument("--per-account-cap", type=int, default=200, help="Max tweets kept per account")
     p.add_argument("--min-account-tweets", type=int, default=80)
     p.add_argument("--max-account-tweets", type=int, default=5000)
     p.add_argument("--min-history", type=int, default=5, help="Require this many prior tweets")
     p.add_argument("--embed-batch-size", type=int, default=256)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--force-download", action="store_true")
+    p.add_argument("--skip-media", action="store_true", help="Skip CA media/url API joins")
     return p.parse_args()
 
 
@@ -448,6 +525,8 @@ def main() -> None:
         per_account_cap=args.per_account_cap,
         seed=args.seed,
     )
+    if not args.skip_media:
+        sampled = attach_media_flags(sampled)
     featured = build_features(sampled, min_history=args.min_history)
     del sampled
 
