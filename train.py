@@ -189,8 +189,67 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--absolute", action="store_true", help="Predict log engagement directly")
     p.add_argument("--skip-embeddings", action="store_true", help="Ablation: tabular features only")
+    p.add_argument(
+        "--split-reply",
+        action="store_true",
+        help="Train separate residual models for replies vs non-replies",
+    )
+    p.add_argument(
+        "--emb-pca",
+        type=int,
+        default=64,
+        help="PCA-reduce emb_* to this many dims (fit on train only); 0 disables",
+    )
     p.add_argument("--description", type=str, default="hybrid residual")
     return p.parse_args()
+
+
+def apply_emb_pca(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    n_components: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    from sklearn.decomposition import PCA
+
+    emb_cols = [c for c in train_df.columns if c.startswith("emb_")]
+    if not emb_cols:
+        return train_df, val_df
+    pca = PCA(n_components=min(n_components, len(emb_cols), len(train_df) - 1), random_state=0)
+    train_z = pca.fit_transform(train_df[emb_cols].to_numpy(dtype=np.float32))
+    val_z = pca.transform(val_df[emb_cols].to_numpy(dtype=np.float32))
+    train_out = train_df.drop(columns=emb_cols).copy()
+    val_out = val_df.drop(columns=emb_cols).copy()
+    for i in range(train_z.shape[1]):
+        train_out[f"emb_{i}"] = train_z[:, i]
+        val_out[f"emb_{i}"] = val_z[:, i]
+    print(f"PCA embeddings: {len(emb_cols)} → {train_z.shape[1]} (var={pca.explained_variance_ratio_.sum():.3f})")
+    return train_out, val_out
+
+
+def fit_predict_group(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    *,
+    residual: bool,
+    skip_embeddings: bool,
+    seed: int,
+) -> tuple[np.ndarray, lgb.Booster, list[str]]:
+    x_train, feature_names = feature_matrix(train_df, skip_embeddings=skip_embeddings)
+    x_val, _ = feature_matrix(val_df, skip_embeddings=skip_embeddings)
+    y_train_abs = train_df["log_engagement"].to_numpy(dtype=np.float64)
+    y_val_abs = val_df["log_engagement"].to_numpy(dtype=np.float64)
+    hist_train = train_df["hist_mean_eng"].to_numpy(dtype=np.float64)
+    hist_val = val_df["hist_mean_eng"].to_numpy(dtype=np.float64)
+    if residual:
+        y_train = y_train_abs - hist_train
+        y_val_model = y_val_abs - hist_val
+    else:
+        y_train = y_train_abs
+        y_val_model = y_val_abs
+    model = train_model(x_train, y_train, x_val, y_val_model, feature_names, seed=seed)
+    raw = model.predict(x_val, num_iteration=model.best_iteration)
+    pred = raw + hist_val if residual else raw
+    return pred, model, feature_names
 
 
 def main() -> None:
@@ -205,35 +264,52 @@ def main() -> None:
         raise SystemExit("Dataset missing hist_mean_eng — re-run prepare.py")
 
     train_df, val_df = time_split(df, args.val_frac)
-    residual = not args.absolute
+    if args.emb_pca > 0 and not args.skip_embeddings:
+        train_df, val_df = apply_emb_pca(train_df, val_df, args.emb_pca)
 
-    x_train, feature_names = feature_matrix(train_df, skip_embeddings=args.skip_embeddings)
-    x_val, _ = feature_matrix(val_df, skip_embeddings=args.skip_embeddings)
+    residual = not args.absolute
     y_train_abs = train_df["log_engagement"].to_numpy(dtype=np.float64)
     y_val_abs = val_df["log_engagement"].to_numpy(dtype=np.float64)
-    hist_train = train_df["hist_mean_eng"].to_numpy(dtype=np.float64)
     hist_val = val_df["hist_mean_eng"].to_numpy(dtype=np.float64)
 
     mean_metrics = evaluate(y_val_abs, np.full(len(y_val_abs), float(y_train_abs.mean())))
     hist_metrics = evaluate(y_val_abs, hist_val)
     print("Baseline (train-mean):", {k: round(v, 4) for k, v in mean_metrics.items()})
     print("Baseline (hist-mean): ", {k: round(v, 4) for k, v in hist_metrics.items()})
+    print("Target:", "residual" if residual else "absolute", "| split_reply=", args.split_reply)
 
-    if residual:
-        y_train = y_train_abs - hist_train
-        y_val_model = y_val_abs - hist_val
-        print("Target: residual log_engagement - hist_mean_eng")
+    if args.split_reply:
+        pred = np.zeros(len(val_df), dtype=np.float64)
+        models = []
+        feature_names: list[str] = []
+        for label, mask_val in (("nonreply", 0), ("reply", 1)):
+            tr = train_df[train_df["is_reply"] == mask_val]
+            va = val_df[val_df["is_reply"] == mask_val]
+            if len(tr) < 100 or len(va) == 0:
+                print(f"  skip {label}: train={len(tr)} val={len(va)}")
+                continue
+            print(f"  fitting {label}: train={len(tr):,} val={len(va):,}")
+            p, model, feature_names = fit_predict_group(
+                tr,
+                va,
+                residual=residual,
+                skip_embeddings=args.skip_embeddings,
+                seed=args.seed + mask_val,
+            )
+            pred[val_df["is_reply"].to_numpy() == mask_val] = p
+            models.append(model)
+        model = models[-1] if models else None
     else:
-        y_train = y_train_abs
-        y_val_model = y_val_abs
-        print("Target: absolute log_engagement")
-
-    model = train_model(x_train, y_train, x_val, y_val_model, feature_names, seed=args.seed)
-    raw_pred = model.predict(x_val, num_iteration=model.best_iteration)
-    pred = raw_pred + hist_val if residual else raw_pred
+        pred, model, feature_names = fit_predict_group(
+            train_df,
+            val_df,
+            residual=residual,
+            skip_embeddings=args.skip_embeddings,
+            seed=args.seed,
+        )
 
     metrics = evaluate(y_val_abs, pred)
-    metrics["best_iteration"] = int(model.best_iteration or 0)
+    metrics["best_iteration"] = int(getattr(model, "best_iteration", 0) or 0)
     metrics["num_features"] = len(feature_names)
     metrics["train_rows"] = int(len(train_df))
     metrics["val_rows"] = int(len(val_df))
@@ -245,22 +321,25 @@ def main() -> None:
     metrics["seconds"] = round(time.time() - t0, 2)
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    model.save_model(str(MODEL_PATH))
+    if model is not None:
+        # For split-reply, persist the reply model as a convenience artifact.
+        model.save_model(str(MODEL_PATH))
     METRICS_PATH.write_text(json.dumps(metrics, indent=2) + "\n")
     append_results(args.description, metrics)
 
-    importance = (
-        pd.DataFrame(
-            {
-                "feature": feature_names,
-                "gain": model.feature_importance(importance_type="gain"),
-            }
+    if model is not None and feature_names:
+        importance = (
+            pd.DataFrame(
+                {
+                    "feature": feature_names,
+                    "gain": model.feature_importance(importance_type="gain"),
+                }
+            )
+            .sort_values("gain", ascending=False)
+            .head(15)
         )
-        .sort_values("gain", ascending=False)
-        .head(15)
-    )
-    print("\nTop features by gain:")
-    print(importance.to_string(index=False))
+        print("\nTop features by gain:")
+        print(importance.to_string(index=False))
 
     print("\n---")
     for key in (

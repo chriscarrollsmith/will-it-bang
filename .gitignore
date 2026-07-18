@@ -13,6 +13,8 @@ wheels/
 run.log
 prepare.log
 train.log
+train_split.log
+train_pca.log
 train_abs.log
 train_ablation.log
 results.tsv
