@@ -95,6 +95,8 @@ def feature_matrix(df: pd.DataFrame, skip_embeddings: bool) -> tuple[np.ndarray,
         cols = cols + emb_cols
     tfidf_cols = [c for c in df.columns if c.startswith("tfidf_")]
     cols = cols + tfidf_cols
+    if "p_breakout" in df.columns:
+        cols = cols + ["p_breakout"]
     x = df[cols].to_numpy(dtype=np.float32)
     return x, cols
 
@@ -144,8 +146,14 @@ def train_model(
     y_val: np.ndarray,
     feature_names: list[str],
     seed: int,
+    weight_train: np.ndarray | None = None,
 ) -> lgb.Booster:
-    train_set = lgb.Dataset(x_train, label=y_train, feature_name=feature_names)
+    train_set = lgb.Dataset(
+        x_train,
+        label=y_train,
+        weight=weight_train,
+        feature_name=feature_names,
+    )
     val_set = lgb.Dataset(x_val, label=y_val, reference=train_set, feature_name=feature_names)
     params = {
         "objective": "huber",
@@ -172,6 +180,125 @@ def train_model(
             lgb.log_evaluation(period=100),
         ],
     )
+
+
+def train_breakout_classifier(
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    x_val: np.ndarray,
+    y_val: np.ndarray,
+    feature_names: list[str],
+    seed: int,
+    weight_train: np.ndarray | None = None,
+) -> lgb.Booster:
+    train_set = lgb.Dataset(
+        x_train,
+        label=y_train,
+        weight=weight_train,
+        feature_name=feature_names,
+    )
+    val_set = lgb.Dataset(x_val, label=y_val, reference=train_set, feature_name=feature_names)
+    params = {
+        "objective": "binary",
+        "metric": "auc",
+        "learning_rate": 0.05,
+        "num_leaves": 31,
+        "min_data_in_leaf": 40,
+        "feature_fraction": 0.8,
+        "bagging_fraction": 0.8,
+        "bagging_freq": 1,
+        "verbosity": -1,
+        "seed": seed,
+    }
+    return lgb.train(
+        params,
+        train_set,
+        num_boost_round=600,
+        valid_sets=[val_set],
+        valid_names=["val"],
+        callbacks=[
+            lgb.early_stopping(stopping_rounds=40, verbose=False),
+            lgb.log_evaluation(period=0),
+        ],
+    )
+
+
+def add_breakout_probs(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    *,
+    baseline_kind: str,
+    skip_embeddings: bool,
+    seed: int,
+    n_folds: int = 3,
+    nonreply_weight: float = 1.0,
+    mode: str = "vs_baseline",
+    quantile: float = 0.8,
+) -> tuple[pd.DataFrame, pd.DataFrame, float]:
+    """OOF P(breakout) on train; full-fit probs on val.
+
+    mode=vs_baseline: log_eng > leakage-safe author baseline (often too frequent).
+    mode=vs_quantile: log_eng >= train-fold quantile (default 0.8).
+    """
+    from sklearn.model_selection import KFold
+
+    y_train_abs = train_df["log_engagement"].to_numpy(dtype=np.float64)
+    y_val_abs = val_df["log_engagement"].to_numpy(dtype=np.float64)
+    if mode == "vs_baseline":
+        base_train = author_baseline(train_df, baseline_kind)
+        base_val = author_baseline(val_df, baseline_kind)
+        y_break_train = (y_train_abs > base_train).astype(np.float64)
+        y_break_val = (y_val_abs > base_val).astype(np.float64)
+    elif mode == "vs_quantile":
+        thr = float(np.quantile(y_train_abs, quantile))
+        y_break_train = (y_train_abs >= thr).astype(np.float64)
+        y_break_val = (y_val_abs >= thr).astype(np.float64)
+        print(f"Breakout quantile threshold (train q={quantile}): {thr:.4f}")
+    else:
+        raise ValueError(mode)
+
+    x_all, feature_names = feature_matrix(train_df, skip_embeddings=skip_embeddings)
+    x_val, _ = feature_matrix(val_df, skip_embeddings=skip_embeddings)
+    weights = np.where(train_df["is_reply"].to_numpy() == 0, nonreply_weight, 1.0).astype(np.float64)
+
+    oof = np.zeros(len(train_df), dtype=np.float64)
+    kf = KFold(n_splits=n_folds, shuffle=True, random_state=seed)
+    for fold, (tr_idx, va_idx) in enumerate(kf.split(x_all)):
+        clf = train_breakout_classifier(
+            x_all[tr_idx],
+            y_break_train[tr_idx],
+            x_all[va_idx],
+            y_break_train[va_idx],
+            feature_names,
+            seed=seed + fold,
+            weight_train=weights[tr_idx],
+        )
+        oof[va_idx] = clf.predict(x_all[va_idx], num_iteration=clf.best_iteration)
+
+    clf_full = train_breakout_classifier(
+        x_all,
+        y_break_train,
+        x_val,
+        y_break_val,
+        feature_names,
+        seed=seed + 99,
+        weight_train=weights,
+    )
+    p_val = clf_full.predict(x_val, num_iteration=clf_full.best_iteration)
+    # Quick val AUC for logging.
+    from sklearn.metrics import roc_auc_score
+
+    auc = float(roc_auc_score(y_break_val, p_val)) if y_break_val.min() != y_break_val.max() else float("nan")
+    print(
+        f"Breakout head: rate_train={y_break_train.mean():.3f} "
+        f"rate_val={y_break_val.mean():.3f} val_auc={auc:.3f}"
+    )
+
+    train_out = train_df.copy()
+    val_out = val_df.copy()
+    train_out["p_breakout"] = oof.astype(np.float32)
+    val_out["p_breakout"] = p_val.astype(np.float32)
+    return train_out, val_out, auc
 
 
 def append_results(description: str, metrics: dict) -> None:
@@ -221,6 +348,34 @@ def parse_args() -> argparse.Namespace:
         choices=("hist_replies", "hist_decay_replies", "context_replies"),
         default="context_replies",
         help="Leakage-safe author baseline (pre-T reply rates); used only with --residual",
+    )
+    p.add_argument(
+        "--nonreply-weight",
+        type=float,
+        default=1.0,
+        help="Sample weight for original (non-reply) tweets during training",
+    )
+    p.add_argument(
+        "--breakout-head",
+        action="store_true",
+        help="Add OOF P(breakout) as a regressor feature",
+    )
+    p.add_argument(
+        "--breakout-mode",
+        choices=("vs_baseline", "vs_quantile"),
+        default="vs_quantile",
+        help="Breakout label definition for --breakout-head",
+    )
+    p.add_argument(
+        "--breakout-quantile",
+        type=float,
+        default=0.8,
+        help="Train quantile for --breakout-mode vs_quantile",
+    )
+    p.add_argument(
+        "--nonreply-only",
+        action="store_true",
+        help="Train regressor on non-replies only; replies use baseline + mean reply residual",
     )
     p.add_argument("--description", type=str, default="leakage-safe hybrid")
     return p.parse_args()
@@ -287,11 +442,15 @@ def apply_text_svd(
     svd = TruncatedSVD(n_components=n_comp, random_state=0)
     train_z = svd.fit_transform(train_x).astype(np.float32)
     val_z = svd.transform(val_x).astype(np.float32)
-    train_out = train_df.copy()
-    val_out = val_df.copy()
-    for i in range(train_z.shape[1]):
-        train_out[f"tfidf_{i}"] = train_z[:, i]
-        val_out[f"tfidf_{i}"] = val_z[:, i]
+    tfidf_cols = [f"tfidf_{i}" for i in range(train_z.shape[1])]
+    train_out = pd.concat(
+        [train_df.reset_index(drop=True), pd.DataFrame(train_z, columns=tfidf_cols)],
+        axis=1,
+    )
+    val_out = pd.concat(
+        [val_df.reset_index(drop=True), pd.DataFrame(val_z, columns=tfidf_cols)],
+        axis=1,
+    )
     print(
         f"TF-IDF SVD: vocab={len(vectorizer.vocabulary_):,} → {train_z.shape[1]} "
         f"(var={svd.explained_variance_ratio_.sum():.3f})"
@@ -307,6 +466,7 @@ def fit_predict_group(
     baseline_kind: str,
     skip_embeddings: bool,
     seed: int,
+    nonreply_weight: float = 1.0,
 ) -> tuple[np.ndarray, lgb.Booster, list[str]]:
     x_train, feature_names = feature_matrix(train_df, skip_embeddings=skip_embeddings)
     x_val, _ = feature_matrix(val_df, skip_embeddings=skip_embeddings)
@@ -320,7 +480,20 @@ def fit_predict_group(
     else:
         y_train = y_train_abs
         y_val_model = y_val_abs
-    model = train_model(x_train, y_train, x_val, y_val_model, feature_names, seed=seed)
+    weight_train = np.where(
+        train_df["is_reply"].to_numpy() == 0,
+        nonreply_weight,
+        1.0,
+    ).astype(np.float64)
+    model = train_model(
+        x_train,
+        y_train,
+        x_val,
+        y_val_model,
+        feature_names,
+        seed=seed,
+        weight_train=weight_train,
+    )
     raw = model.predict(x_val, num_iteration=model.best_iteration)
     pred = raw + base_val if residual else raw
     return pred, model, feature_names
@@ -363,10 +536,55 @@ def main() -> None:
     print(
         "Target:",
         "residual" if residual else "absolute",
-        f"| baseline={args.baseline} | split_reply={args.split_reply}",
+        f"| baseline={args.baseline} | split_reply={args.split_reply} "
+        f"| nonreply_weight={args.nonreply_weight} | breakout_head={args.breakout_head}",
     )
 
-    if args.split_reply:
+    breakout_auc = float("nan")
+    if args.breakout_head:
+        train_df, val_df, breakout_auc = add_breakout_probs(
+            train_df,
+            val_df,
+            baseline_kind=args.baseline,
+            skip_embeddings=args.skip_embeddings,
+            seed=args.seed,
+            nonreply_weight=args.nonreply_weight,
+            mode=args.breakout_mode,
+            quantile=args.breakout_quantile,
+        )
+
+    if args.nonreply_only:
+        tr_nr = train_df[train_df["is_reply"] == 0]
+        va_nr = val_df[val_df["is_reply"] == 0]
+        print(f"Non-reply-only train: {len(tr_nr):,} / {len(train_df):,} (val NR {len(va_nr):,})")
+        _, model, feature_names = fit_predict_group(
+            tr_nr,
+            va_nr,
+            residual=residual,
+            baseline_kind=args.baseline,
+            skip_embeddings=args.skip_embeddings,
+            seed=args.seed,
+            nonreply_weight=1.0,
+        )
+        # Score full val with the non-reply model, then overwrite replies.
+        x_val_full, _ = feature_matrix(val_df, skip_embeddings=args.skip_embeddings)
+        raw_full = model.predict(x_val_full, num_iteration=model.best_iteration)
+        base_val = author_baseline(val_df, args.baseline)
+        pred = raw_full + base_val if residual else raw_full
+        tr_r = train_df[train_df["is_reply"] == 1]
+        if len(tr_r):
+            mean_r_resid = float(
+                (
+                    tr_r["log_engagement"].to_numpy(dtype=np.float64)
+                    - author_baseline(tr_r, args.baseline)
+                ).mean()
+            )
+        else:
+            mean_r_resid = 0.0
+        reply_m = val_df["is_reply"].to_numpy() == 1
+        pred[reply_m] = base_val[reply_m] + mean_r_resid
+        print(f"Reply fallback residual mean: {mean_r_resid:.4f}")
+    elif args.split_reply:
         pred = np.zeros(len(val_df), dtype=np.float64)
         models = []
         feature_names: list[str] = []
@@ -384,6 +602,7 @@ def main() -> None:
                 baseline_kind=args.baseline,
                 skip_embeddings=args.skip_embeddings,
                 seed=args.seed + mask_val,
+                nonreply_weight=1.0 if mask_val == 0 else args.nonreply_weight,
             )
             pred[val_df["is_reply"].to_numpy() == mask_val] = p
             models.append(model)
@@ -396,9 +615,15 @@ def main() -> None:
             baseline_kind=args.baseline,
             skip_embeddings=args.skip_embeddings,
             seed=args.seed,
+            nonreply_weight=args.nonreply_weight,
         )
 
     metrics = evaluate(y_val_abs, pred)
+    nonreply_mask = val_df["is_reply"].to_numpy() == 0
+    reply_mask = ~nonreply_mask
+    metrics["rmse_log_nonreply"] = evaluate(y_val_abs[nonreply_mask], pred[nonreply_mask])["rmse_log"]
+    metrics["rmse_log_reply"] = evaluate(y_val_abs[reply_mask], pred[reply_mask])["rmse_log"]
+    metrics["spearman_nonreply"] = evaluate(y_val_abs[nonreply_mask], pred[nonreply_mask])["spearman"]
     metrics["best_iteration"] = int(getattr(model, "best_iteration", 0) or 0)
     metrics["num_features"] = len(feature_names)
     metrics["train_rows"] = int(len(train_df))
@@ -410,6 +635,9 @@ def main() -> None:
     metrics["chosen_baseline_rmse_log"] = chosen_base_metrics["rmse_log"]
     metrics["residual"] = residual
     metrics["baseline_kind"] = args.baseline
+    metrics["nonreply_weight"] = args.nonreply_weight
+    metrics["breakout_head"] = args.breakout_head
+    metrics["breakout_auc"] = breakout_auc
     metrics["seconds"] = round(time.time() - t0, 2)
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -470,13 +698,17 @@ def main() -> None:
     print("\n---")
     for key in (
         "rmse_log",
+        "rmse_log_nonreply",
+        "rmse_log_reply",
         "mae_log",
         "r2_log",
         "spearman",
+        "spearman_nonreply",
         "mae_engagement",
         "baseline_rmse_log",
         "reply_baseline_rmse_log",
         "chosen_baseline_rmse_log",
+        "breakout_auc",
         "best_iteration",
         "num_features",
         "train_rows",
