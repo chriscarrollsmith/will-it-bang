@@ -4,15 +4,14 @@ Train a hybrid engagement model on the prepared Community Archive dataset.
 Frozen MiniLM embeddings + leakage-safe tabular features → LightGBM regressor
 predicting log1p(favorites + retweets). Evaluation is a global time holdout.
 
-By default trains a residual model against a reply-aware author baseline
-(`hist_mean_reply` for replies, else `hist_mean_nonreply`), then adds that
-baseline back at inference. MiniLM embeddings are PCA-reduced (train-fit).
+History features must not use dump-time fav/RT (see AGENTS.md). Author
+popularity inputs are pre-T reply-received rates. Default: absolute regression
+with train-fit emb PCA; optional residual against reply-history baselines.
 
 Usage:
     uv run train.py
-    uv run train.py --baseline hist_mean   # older residualization
-    uv run train.py --absolute             # predict log engagement directly
-    uv run train.py --skip-embeddings      # tabular ablation
+    uv run train.py --baseline context_replies
+    uv run train.py --skip-embeddings
 """
 
 from __future__ import annotations
@@ -62,24 +61,24 @@ TABULAR_FEATURES = [
     "dow_sin",
     "dow_cos",
     "hist_n",
-    "hist_mean_eng",
-    "hist_median_eng",
-    "hist_p90_eng",
-    "hist_last_eng",
-    "hist_std_eng",
-    "hist_mean_eng_7d",
-    "hist_mean_eng_30d",
-    "hist_decay_mean_eng",
-    "hist_mean_nonreply",
-    "hist_mean_reply",
     "hist_tweets_7d",
     "hist_tweets_30d",
     "days_since_last",
     "hist_frac_reply",
     "hist_frac_url",
     "hist_frac_media",
-    "reply_x_hist_nonreply",
-    "media_x_hist_mean",
+    "hist_mean_replies",
+    "hist_median_replies",
+    "hist_p90_replies",
+    "hist_last_replies",
+    "hist_std_replies",
+    "hist_mean_replies_7d",
+    "hist_mean_replies_30d",
+    "hist_decay_mean_replies",
+    "hist_mean_replies_nonreply",
+    "hist_mean_replies_reply",
+    "reply_x_hist_replies_nr",
+    "media_x_hist_replies",
 ]
 
 
@@ -190,12 +189,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset", type=Path, default=DATASET_PATH)
     p.add_argument("--val-frac", type=float, default=0.2)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--absolute", action="store_true", help="Predict log engagement directly")
+    p.add_argument(
+        "--residual",
+        action="store_true",
+        help="Residualize against --baseline (default is absolute log engagement)",
+    )
     p.add_argument("--skip-embeddings", action="store_true", help="Ablation: tabular features only")
     p.add_argument(
         "--split-reply",
         action="store_true",
-        help="Train separate residual models for replies vs non-replies",
+        help="Train separate models for replies vs non-replies",
     )
     p.add_argument(
         "--emb-pca",
@@ -205,27 +208,24 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--baseline",
-        choices=("hist_mean", "hist_decay", "hist_30d", "context"),
-        default="context",
-        help="Author baseline subtracted for residual training / added back at inference",
+        choices=("hist_replies", "hist_decay_replies", "context_replies"),
+        default="context_replies",
+        help="Leakage-safe author baseline (pre-T reply rates); used only with --residual",
     )
-    p.add_argument("--description", type=str, default="hybrid residual")
+    p.add_argument("--description", type=str, default="leakage-safe hybrid")
     return p.parse_args()
 
 
 def author_baseline(df: pd.DataFrame, kind: str) -> np.ndarray:
-    """Leakage-safe author baseline used for residualization."""
-    if kind == "hist_mean":
-        return df["hist_mean_eng"].to_numpy(dtype=np.float64)
-    if kind == "hist_decay":
-        return df["hist_decay_mean_eng"].to_numpy(dtype=np.float64)
-    if kind == "hist_30d":
-        return df["hist_mean_eng_30d"].to_numpy(dtype=np.float64)
-    if kind == "context":
-        # Use reply-history mean for replies, non-reply mean otherwise.
+    """Leakage-safe author baseline (pre-T reply-received rates on prior tweets)."""
+    if kind == "hist_replies":
+        return df["hist_mean_replies"].to_numpy(dtype=np.float64)
+    if kind == "hist_decay_replies":
+        return df["hist_decay_mean_replies"].to_numpy(dtype=np.float64)
+    if kind == "context_replies":
         reply = df["is_reply"].to_numpy(dtype=bool)
-        out = df["hist_mean_nonreply"].to_numpy(dtype=np.float64).copy()
-        out[reply] = df.loc[reply, "hist_mean_reply"].to_numpy(dtype=np.float64)
+        out = df["hist_mean_replies_nonreply"].to_numpy(dtype=np.float64).copy()
+        out[reply] = df.loc[reply, "hist_mean_replies_reply"].to_numpy(dtype=np.float64)
         return out
     raise ValueError(kind)
 
@@ -287,24 +287,29 @@ def main() -> None:
     t0 = time.time()
     df = pd.read_parquet(args.dataset)
     df["created_at"] = pd.to_datetime(df["created_at"], utc=True)
-    if "hist_mean_eng" not in df.columns:
-        raise SystemExit("Dataset missing hist_mean_eng — re-run prepare.py")
+    if "hist_mean_replies" not in df.columns:
+        raise SystemExit(
+            "Dataset missing hist_mean_replies — re-run prepare.py "
+            "(fav/RT history features are banned; need reply-received rebuild)."
+        )
+    if any(c.startswith("hist_mean_eng") for c in df.columns):
+        print("Warning: dataset still has hist_*_eng columns; they are ignored by TABULAR_FEATURES")
 
     train_df, val_df = time_split(df, args.val_frac)
     if args.emb_pca > 0 and not args.skip_embeddings:
         train_df, val_df = apply_emb_pca(train_df, val_df, args.emb_pca)
 
-    residual = not args.absolute
+    residual = args.residual
     y_train_abs = train_df["log_engagement"].to_numpy(dtype=np.float64)
     y_val_abs = val_df["log_engagement"].to_numpy(dtype=np.float64)
-    hist_val = author_baseline(val_df, "hist_mean")
+    reply_base_val = author_baseline(val_df, "hist_replies")
     chosen_base_val = author_baseline(val_df, args.baseline)
 
     mean_metrics = evaluate(y_val_abs, np.full(len(y_val_abs), float(y_train_abs.mean())))
-    hist_metrics = evaluate(y_val_abs, hist_val)
+    reply_base_metrics = evaluate(y_val_abs, reply_base_val)
     chosen_base_metrics = evaluate(y_val_abs, chosen_base_val)
     print("Baseline (train-mean):", {k: round(v, 4) for k, v in mean_metrics.items()})
-    print("Baseline (hist-mean): ", {k: round(v, 4) for k, v in hist_metrics.items()})
+    print("Baseline (hist_replies):", {k: round(v, 4) for k, v in reply_base_metrics.items()})
     print(f"Baseline ({args.baseline}):", {k: round(v, 4) for k, v in chosen_base_metrics.items()})
     print(
         "Target:",
@@ -352,7 +357,7 @@ def main() -> None:
     metrics["n_accounts_train"] = int(train_df["account_id"].nunique())
     metrics["n_accounts_val"] = int(val_df["account_id"].nunique())
     metrics["baseline_rmse_log"] = mean_metrics["rmse_log"]
-    metrics["hist_baseline_rmse_log"] = hist_metrics["rmse_log"]
+    metrics["reply_baseline_rmse_log"] = reply_base_metrics["rmse_log"]
     metrics["chosen_baseline_rmse_log"] = chosen_base_metrics["rmse_log"]
     metrics["residual"] = residual
     metrics["baseline_kind"] = args.baseline
@@ -382,9 +387,9 @@ def main() -> None:
                 "has_media",
                 "has_url",
                 "text_len",
-                "hist_mean_eng",
-                "hist_mean_reply",
-                "hist_mean_nonreply",
+                "hist_mean_replies",
+                "hist_mean_replies_reply",
+                "hist_mean_replies_nonreply",
                 "days_since_last",
             )
             if c in val_df.columns
@@ -392,7 +397,7 @@ def main() -> None:
     ].copy()
     pred_df["y_true_log"] = y_val_abs
     pred_df["y_pred_log"] = pred
-    pred_df["y_base_log"] = chosen_base_val
+    pred_df["y_base_log"] = chosen_base_val if residual else np.full(len(val_df), float(y_train_abs.mean()))
     pred_df["abs_err_log"] = np.abs(pred - y_val_abs)
     pred_df["err_log"] = pred - y_val_abs
     pred_df["y_pred_eng"] = np.expm1(np.clip(pred, 0, 20))
@@ -421,7 +426,7 @@ def main() -> None:
         "spearman",
         "mae_engagement",
         "baseline_rmse_log",
-        "hist_baseline_rmse_log",
+        "reply_baseline_rmse_log",
         "chosen_baseline_rmse_log",
         "best_iteration",
         "num_features",

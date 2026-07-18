@@ -7,7 +7,7 @@ Predict a tweet's engagement from Community Archive data available at post time.
 1. **`prepare.py`** — download the CA `enriched_tweets` parquet dump, sample accounts, build leakage-safe author/structure features, embed `full_text` with frozen MiniLM, write `~/.cache/will-it-bang/dataset.parquet`.
 2. **`train.py`** — time-split the dataset, train LightGBM on tabular features + embeddings to regress `log1p(favorite_count + retweet_count)`.
 
-Retweets (`full_text` starting with `RT @`) are excluded from labels/training rows. Author history features use only strictly earlier tweets by the same account. Current follower counts are **not** used (they're a present-day snapshot → leakage).
+Retweets (`full_text` starting with `RT @`) are excluded from labels/training rows. Author history uses only strictly earlier tweets; dump-time fav/RT are **labels only**, never history inputs (use pre-T reply arrivals instead). Current follower counts are **not** used.
 
 ## Setup
 

@@ -27,9 +27,11 @@ Any time you have to look up how to do something you might want to do again, add
 - Bulk ML dump: `enriched_tweets.parquet` at `https://fabxmporizzqflnftavs.supabase.co/storage/v1/object/public/enriched_tweets/enriched_tweets.parquet` (~900MB); prefer this over paging the REST API for corpus work.
 - Agent index for CA: https://www.community-archive.org/llms.txt
 - Do not use `all_account.num_followers` (etc.) as historical features — those fields are current snapshots and leak the future for older tweets.
+- Ban dump-time `favorite_count` / `retweet_count` as **input** history features. CA stores eventual totals, not counts-as-of-time-T, so using prior tweets’ fav/RT for a later tweet leaks post-T engagement. Labels may still use final fav+RT on the target tweet.
+- Safe engagement-style history: count replies (and similarly timestamped events) to the author’s earlier tweets with `created_at < T` via `reply_to_tweet_id`; do not use undated `likes`.
 - Frozen text encoder used here: `sentence-transformers/all-MiniLM-L6-v2` (Apache-2.0); dataset/model cache under `~/.cache/will-it-bang/`.
 - Sample the CA parquet with DuckDB (`read_parquet`) instead of loading the full dump into pandas — 14M rows OOMs a 16GB laptop.
 - Cache MiniLM vectors by `tweet_id` in `~/.cache/will-it-bang/embed_cache.parquet` so feature rebuilds don't re-embed.
 - Prefer many accounts with a per-account tweet cap over a few fat accounts — otherwise the time-split barely tests generalization.
 - Attachment flags: page `tweet_media` / `tweet_urls` with `tweet_id=in.(...)` batches (~80 ids); coverage is sparse but leakage-safe.
-- Strong residual baseline: reply-aware (`hist_mean_reply` vs `hist_mean_nonreply`) beats plain `hist_mean_eng`; pair with train-fit emb PCA (~96).
+- Train-fit emb PCA (~96) on MiniLM; residualize only against leakage-safe baselines (e.g. pre-T reply-received rates), never against dump-time fav/RT history.

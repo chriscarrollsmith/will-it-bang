@@ -270,18 +270,74 @@ def _text_stats(text: str) -> dict[str, float]:
     }
 
 
-def build_features(df: pd.DataFrame, min_history: int) -> pd.DataFrame:
-    """Per-tweet features using only strictly earlier tweets by the same author."""
+def load_reply_arrival_times(tweet_ids: pd.Series) -> dict[str, np.ndarray]:
+    """Map parent tweet_id → sorted reply created_at (UTC ns) from the full dump."""
+    ids = pd.DataFrame({"tweet_id": tweet_ids.astype(str).unique()})
+    tmp_ids = CACHE_DIR / "_target_tweet_ids.parquet"
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    ids.to_parquet(tmp_ids, index=False)
+    path = str(RAW_PARQUET)
+    print(f"Scanning dump for replies to {len(ids):,} sampled tweets…")
+    con = duckdb.connect()
+    con.execute(f"SET threads TO {max(1, os.cpu_count() or 4)}")
+    reply_df = con.execute(
+        f"""
+        SELECT
+          CAST(r.reply_to_tweet_id AS VARCHAR) AS parent_id,
+          r.created_at
+        FROM read_parquet('{path}') r
+        SEMI JOIN read_parquet('{tmp_ids}') t
+          ON CAST(r.reply_to_tweet_id AS VARCHAR) = t.tweet_id
+        WHERE r.reply_to_tweet_id IS NOT NULL
+        """
+    ).fetchdf()
+    con.close()
+    try:
+        tmp_ids.unlink()
+    except OSError:
+        pass
+
+    if reply_df.empty:
+        print("  no replies found targeting sampled tweets")
+        return {}
+
+    reply_df["created_at"] = pd.to_datetime(reply_df["created_at"], utc=True)
+    out: dict[str, np.ndarray] = {}
+    for parent_id, g in reply_df.groupby("parent_id", sort=False):
+        out[str(parent_id)] = np.sort(g["created_at"].to_numpy(dtype="datetime64[ns]"))
+    print(f"  reply events: {len(reply_df):,} across {len(out):,} parents")
+    return out
+
+
+def _replies_before(reply_times: dict[str, np.ndarray], tweet_id: str, cutoff) -> int:
+    times = reply_times.get(str(tweet_id))
+    if times is None or len(times) == 0:
+        return 0
+    cut = np.datetime64(pd.Timestamp(cutoff).to_datetime64())
+    return int(np.searchsorted(times, cut, side="left"))
+
+
+def build_features(
+    df: pd.DataFrame,
+    min_history: int,
+    reply_times: dict[str, np.ndarray] | None = None,
+) -> pd.DataFrame:
+    """Per-tweet features using only information available strictly before each tweet.
+
+    Dump-time favorite_count / retweet_count are labels only — never history inputs.
+    Author "success" history uses pre-cutoff reply arrivals when available.
+    """
     df = df.copy()
+    reply_times = reply_times or {}
     df["favorite_count"] = pd.to_numeric(df["favorite_count"], errors="coerce").fillna(0).astype(np.int64)
     df["retweet_count"] = pd.to_numeric(df["retweet_count"], errors="coerce").fillna(0).astype(np.int64)
+    # Label only (eventual engagement). Not used as a feature input.
     df["engagement"] = df["favorite_count"] + df["retweet_count"]
     df["log_engagement"] = np.log1p(df["engagement"].astype(np.float64))
 
     stats = df["full_text"].map(_text_stats)
     for key in next(iter(stats)).keys() if len(stats) else []:
         df[key] = stats.map(lambda d, k=key: d[k])
-    # Robust if empty (shouldn't happen).
     for key, default in (
         ("text_len", 0),
         ("has_url", 0),
@@ -310,7 +366,6 @@ def build_features(df: pd.DataFrame, min_history: int) -> pd.DataFrame:
     df["hour"] = df["created_at"].dt.hour.astype(np.int8)
     df["dow"] = df["created_at"].dt.dayofweek.astype(np.int8)
     df["is_weekend"] = (df["dow"] >= 5).astype(np.int8)
-    # Cyclical time encodings (leakage-free calendar features).
     df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24.0)
     df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24.0)
     df["dow_sin"] = np.sin(2 * np.pi * df["dow"] / 7.0)
@@ -320,7 +375,7 @@ def build_features(df: pd.DataFrame, min_history: int) -> pd.DataFrame:
     for account_id, g in df.groupby("account_id", sort=False):
         g = g.sort_values("created_at", kind="mergesort")
         times = g["created_at"].to_numpy()
-        log_eng = g["log_engagement"].to_numpy(dtype=np.float64)
+        tweet_ids = g["tweet_id"].astype(str).to_numpy()
         is_reply = g["is_reply"].to_numpy(dtype=np.int8)
         has_url = g["has_url"].to_numpy(dtype=np.int8)
         has_media = g["has_media"].to_numpy(dtype=np.int8)
@@ -328,21 +383,26 @@ def build_features(df: pd.DataFrame, min_history: int) -> pd.DataFrame:
         for i in range(len(g)):
             if i < min_history:
                 continue
-            prior_e = log_eng[:i]
+            cutoff = times[i]
             prior_reply = is_reply[:i]
-            age_days = (times[i] - times[:i]).astype("timedelta64[s]").astype(np.float64) / 86400.0
+            age_days = (cutoff - times[:i]).astype("timedelta64[s]").astype(np.float64) / 86400.0
             mask_7 = age_days <= 7.0
             mask_30 = age_days <= 30.0
             non_reply = prior_reply == 0
             reply_only = prior_reply == 1
 
-            # Exponentially decayed mean over prior tweets (half-life 14d).
+            # Replies received by each prior tweet *before* this tweet's time.
+            recv = np.array(
+                [_replies_before(reply_times, tid, cutoff) for tid in tweet_ids[:i]],
+                dtype=np.float64,
+            )
+            log_recv = np.log1p(recv)
             weights = np.exp(-np.log(2.0) * age_days / 14.0)
-            decay_mean = float(np.average(prior_e, weights=weights))
+            mean_recv = float(log_recv.mean())
+            mean_recv_nr = float(log_recv[non_reply].mean()) if non_reply.any() else mean_recv
+            mean_recv_r = float(log_recv[reply_only].mean()) if reply_only.any() else mean_recv
 
             row = g.iloc[i]
-            hist_mean = float(prior_e.mean())
-            hist_mean_nr = float(prior_e[non_reply].mean()) if non_reply.any() else hist_mean
             rows.append(
                 {
                     "tweet_id": row["tweet_id"],
@@ -377,25 +437,25 @@ def build_features(df: pd.DataFrame, min_history: int) -> pd.DataFrame:
                     "dow_sin": float(row["dow_sin"]),
                     "dow_cos": float(row["dow_cos"]),
                     "hist_n": i,
-                    "hist_mean_eng": hist_mean,
-                    "hist_median_eng": float(np.median(prior_e)),
-                    "hist_p90_eng": float(np.quantile(prior_e, 0.9)),
-                    "hist_last_eng": float(prior_e[-1]),
-                    "hist_std_eng": float(prior_e.std(ddof=0)) if i > 1 else 0.0,
-                    "hist_mean_eng_7d": float(prior_e[mask_7].mean()) if mask_7.any() else 0.0,
-                    "hist_mean_eng_30d": float(prior_e[mask_30].mean()) if mask_30.any() else 0.0,
-                    "hist_decay_mean_eng": decay_mean,
-                    "hist_mean_nonreply": hist_mean_nr,
-                    "hist_mean_reply": float(prior_e[reply_only].mean()) if reply_only.any() else hist_mean,
                     "hist_tweets_7d": int(mask_7.sum()),
                     "hist_tweets_30d": int(mask_30.sum()),
                     "days_since_last": float(age_days[-1]),
                     "hist_frac_reply": float(prior_reply.mean()),
                     "hist_frac_url": float(has_url[:i].mean()),
                     "hist_frac_media": float(has_media[:i].mean()),
-                    # Interactions: reply status vs the author's typical non-reply baseline.
-                    "reply_x_hist_nonreply": float(row["is_reply"]) * hist_mean_nr,
-                    "media_x_hist_mean": float(row["has_media"]) * hist_mean,
+                    # Leakage-safe popularity proxy: pre-T reply arrivals on prior tweets.
+                    "hist_mean_replies": mean_recv,
+                    "hist_median_replies": float(np.median(log_recv)),
+                    "hist_p90_replies": float(np.quantile(log_recv, 0.9)),
+                    "hist_last_replies": float(log_recv[-1]),
+                    "hist_std_replies": float(log_recv.std(ddof=0)) if i > 1 else 0.0,
+                    "hist_mean_replies_7d": float(log_recv[mask_7].mean()) if mask_7.any() else 0.0,
+                    "hist_mean_replies_30d": float(log_recv[mask_30].mean()) if mask_30.any() else 0.0,
+                    "hist_decay_mean_replies": float(np.average(log_recv, weights=weights)),
+                    "hist_mean_replies_nonreply": mean_recv_nr,
+                    "hist_mean_replies_reply": mean_recv_r,
+                    "reply_x_hist_replies_nr": float(row["is_reply"]) * mean_recv_nr,
+                    "media_x_hist_replies": float(row["has_media"]) * mean_recv,
                 }
             )
 
@@ -501,8 +561,8 @@ def attach_embeddings(df: pd.DataFrame, batch_size: int) -> pd.DataFrame:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--max-tweets", type=int, default=25000, help="Cap on sampled original tweets")
-    p.add_argument("--per-account-cap", type=int, default=200, help="Max tweets kept per account")
+    p.add_argument("--max-tweets", type=int, default=60000, help="Cap on sampled original tweets")
+    p.add_argument("--per-account-cap", type=int, default=180, help="Max tweets kept per account")
     p.add_argument("--min-account-tweets", type=int, default=80)
     p.add_argument("--max-account-tweets", type=int, default=5000)
     p.add_argument("--min-history", type=int, default=5, help="Require this many prior tweets")
@@ -527,7 +587,8 @@ def main() -> None:
     )
     if not args.skip_media:
         sampled = attach_media_flags(sampled)
-    featured = build_features(sampled, min_history=args.min_history)
+    reply_times = load_reply_arrival_times(sampled["tweet_id"])
+    featured = build_features(sampled, min_history=args.min_history, reply_times=reply_times)
     del sampled
 
     dataset = attach_embeddings(featured, batch_size=args.embed_batch_size)
