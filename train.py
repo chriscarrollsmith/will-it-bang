@@ -4,14 +4,15 @@ Train a hybrid engagement model on the prepared Community Archive dataset.
 Frozen MiniLM embeddings + leakage-safe tabular features → LightGBM regressor
 predicting log1p(favorites + retweets). Evaluation is a global time holdout.
 
-By default trains a residual model: predict (log_engagement - hist_mean_eng),
-then add hist_mean_eng back at inference. This focuses capacity on
-above/below-baseline content effects.
+By default trains a residual model against a reply-aware author baseline
+(`hist_mean_reply` for replies, else `hist_mean_nonreply`), then adds that
+baseline back at inference. MiniLM embeddings are PCA-reduced (train-fit).
 
 Usage:
     uv run train.py
-    uv run train.py --absolute          # predict log engagement directly
-    uv run train.py --skip-embeddings   # tabular ablation
+    uv run train.py --baseline hist_mean   # older residualization
+    uv run train.py --absolute             # predict log engagement directly
+    uv run train.py --skip-embeddings      # tabular ablation
 """
 
 from __future__ import annotations
@@ -197,11 +198,34 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--emb-pca",
         type=int,
-        default=64,
+        default=96,
         help="PCA-reduce emb_* to this many dims (fit on train only); 0 disables",
+    )
+    p.add_argument(
+        "--baseline",
+        choices=("hist_mean", "hist_decay", "hist_30d", "context"),
+        default="context",
+        help="Author baseline subtracted for residual training / added back at inference",
     )
     p.add_argument("--description", type=str, default="hybrid residual")
     return p.parse_args()
+
+
+def author_baseline(df: pd.DataFrame, kind: str) -> np.ndarray:
+    """Leakage-safe author baseline used for residualization."""
+    if kind == "hist_mean":
+        return df["hist_mean_eng"].to_numpy(dtype=np.float64)
+    if kind == "hist_decay":
+        return df["hist_decay_mean_eng"].to_numpy(dtype=np.float64)
+    if kind == "hist_30d":
+        return df["hist_mean_eng_30d"].to_numpy(dtype=np.float64)
+    if kind == "context":
+        # Use reply-history mean for replies, non-reply mean otherwise.
+        reply = df["is_reply"].to_numpy(dtype=bool)
+        out = df["hist_mean_nonreply"].to_numpy(dtype=np.float64).copy()
+        out[reply] = df.loc[reply, "hist_mean_reply"].to_numpy(dtype=np.float64)
+        return out
+    raise ValueError(kind)
 
 
 def apply_emb_pca(
@@ -231,6 +255,7 @@ def fit_predict_group(
     val_df: pd.DataFrame,
     *,
     residual: bool,
+    baseline_kind: str,
     skip_embeddings: bool,
     seed: int,
 ) -> tuple[np.ndarray, lgb.Booster, list[str]]:
@@ -238,17 +263,17 @@ def fit_predict_group(
     x_val, _ = feature_matrix(val_df, skip_embeddings=skip_embeddings)
     y_train_abs = train_df["log_engagement"].to_numpy(dtype=np.float64)
     y_val_abs = val_df["log_engagement"].to_numpy(dtype=np.float64)
-    hist_train = train_df["hist_mean_eng"].to_numpy(dtype=np.float64)
-    hist_val = val_df["hist_mean_eng"].to_numpy(dtype=np.float64)
+    base_train = author_baseline(train_df, baseline_kind)
+    base_val = author_baseline(val_df, baseline_kind)
     if residual:
-        y_train = y_train_abs - hist_train
-        y_val_model = y_val_abs - hist_val
+        y_train = y_train_abs - base_train
+        y_val_model = y_val_abs - base_val
     else:
         y_train = y_train_abs
         y_val_model = y_val_abs
     model = train_model(x_train, y_train, x_val, y_val_model, feature_names, seed=seed)
     raw = model.predict(x_val, num_iteration=model.best_iteration)
-    pred = raw + hist_val if residual else raw
+    pred = raw + base_val if residual else raw
     return pred, model, feature_names
 
 
@@ -270,13 +295,20 @@ def main() -> None:
     residual = not args.absolute
     y_train_abs = train_df["log_engagement"].to_numpy(dtype=np.float64)
     y_val_abs = val_df["log_engagement"].to_numpy(dtype=np.float64)
-    hist_val = val_df["hist_mean_eng"].to_numpy(dtype=np.float64)
+    hist_val = author_baseline(val_df, "hist_mean")
+    chosen_base_val = author_baseline(val_df, args.baseline)
 
     mean_metrics = evaluate(y_val_abs, np.full(len(y_val_abs), float(y_train_abs.mean())))
     hist_metrics = evaluate(y_val_abs, hist_val)
+    chosen_base_metrics = evaluate(y_val_abs, chosen_base_val)
     print("Baseline (train-mean):", {k: round(v, 4) for k, v in mean_metrics.items()})
     print("Baseline (hist-mean): ", {k: round(v, 4) for k, v in hist_metrics.items()})
-    print("Target:", "residual" if residual else "absolute", "| split_reply=", args.split_reply)
+    print(f"Baseline ({args.baseline}):", {k: round(v, 4) for k, v in chosen_base_metrics.items()})
+    print(
+        "Target:",
+        "residual" if residual else "absolute",
+        f"| baseline={args.baseline} | split_reply={args.split_reply}",
+    )
 
     if args.split_reply:
         pred = np.zeros(len(val_df), dtype=np.float64)
@@ -293,6 +325,7 @@ def main() -> None:
                 tr,
                 va,
                 residual=residual,
+                baseline_kind=args.baseline,
                 skip_embeddings=args.skip_embeddings,
                 seed=args.seed + mask_val,
             )
@@ -304,6 +337,7 @@ def main() -> None:
             train_df,
             val_df,
             residual=residual,
+            baseline_kind=args.baseline,
             skip_embeddings=args.skip_embeddings,
             seed=args.seed,
         )
@@ -317,7 +351,9 @@ def main() -> None:
     metrics["n_accounts_val"] = int(val_df["account_id"].nunique())
     metrics["baseline_rmse_log"] = mean_metrics["rmse_log"]
     metrics["hist_baseline_rmse_log"] = hist_metrics["rmse_log"]
+    metrics["chosen_baseline_rmse_log"] = chosen_base_metrics["rmse_log"]
     metrics["residual"] = residual
+    metrics["baseline_kind"] = args.baseline
     metrics["seconds"] = round(time.time() - t0, 2)
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -350,6 +386,7 @@ def main() -> None:
         "mae_engagement",
         "baseline_rmse_log",
         "hist_baseline_rmse_log",
+        "chosen_baseline_rmse_log",
         "best_iteration",
         "num_features",
         "train_rows",

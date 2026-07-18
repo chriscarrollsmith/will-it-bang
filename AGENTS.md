@@ -32,3 +32,4 @@ Any time you have to look up how to do something you might want to do again, add
 - Cache MiniLM vectors by `tweet_id` in `~/.cache/will-it-bang/embed_cache.parquet` so feature rebuilds don't re-embed.
 - Prefer many accounts with a per-account tweet cap over a few fat accounts — otherwise the time-split barely tests generalization.
 - Attachment flags: page `tweet_media` / `tweet_urls` with `tweet_id=in.(...)` batches (~80 ids); coverage is sparse but leakage-safe.
+- Strong residual baseline: reply-aware (`hist_mean_reply` vs `hist_mean_nonreply`) beats plain `hist_mean_eng`; pair with train-fit emb PCA (~96).
