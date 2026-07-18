@@ -35,3 +35,4 @@ Any time you have to look up how to do something you might want to do again, add
 - Prefer many accounts with a per-account tweet cap over a few fat accounts — otherwise the time-split barely tests generalization.
 - Attachment flags: page `tweet_media` / `tweet_urls` with `tweet_id=in.(...)` batches (~80 ids); coverage is sparse but leakage-safe.
 - Train-fit emb PCA (~96) on MiniLM; residualize only against leakage-safe baselines (e.g. pre-T reply-received rates), never against dump-time fav/RT history.
+- Optional train-fit TF-IDF→SVD on `full_text` (default 128 dims) adds a small honest lift once fav/RT history is banned.

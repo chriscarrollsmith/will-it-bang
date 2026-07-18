@@ -5,12 +5,13 @@ Frozen MiniLM embeddings + leakage-safe tabular features → LightGBM regressor
 predicting log1p(favorites + retweets). Evaluation is a global time holdout.
 
 History features must not use dump-time fav/RT (see AGENTS.md). Author
-popularity inputs are pre-T reply-received rates. Default: absolute regression
-with train-fit emb PCA; optional residual against reply-history baselines.
+popularity inputs are pre-T reply-received rates. Default: residual against
+context reply baseline + train-fit emb PCA; optional TF-IDF SVD text features.
 
 Usage:
     uv run train.py
-    uv run train.py --baseline context_replies
+    uv run train.py --text-svd 64
+    uv run train.py --no-residual
     uv run train.py --skip-embeddings
 """
 
@@ -92,6 +93,8 @@ def feature_matrix(df: pd.DataFrame, skip_embeddings: bool) -> tuple[np.ndarray,
         if not emb_cols:
             raise SystemExit("Dataset has no emb_* columns — re-run prepare.py")
         cols = cols + emb_cols
+    tfidf_cols = [c for c in df.columns if c.startswith("tfidf_")]
+    cols = cols + tfidf_cols
     x = df[cols].to_numpy(dtype=np.float32)
     return x, cols
 
@@ -191,8 +194,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
         "--residual",
-        action="store_true",
-        help="Residualize against --baseline (default is absolute log engagement)",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Residualize against --baseline (default on; use --no-residual for absolute)",
     )
     p.add_argument("--skip-embeddings", action="store_true", help="Ablation: tabular features only")
     p.add_argument(
@@ -205,6 +209,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=96,
         help="PCA-reduce emb_* to this many dims (fit on train only); 0 disables",
+    )
+    p.add_argument(
+        "--text-svd",
+        type=int,
+        default=128,
+        help="Train-fit TF-IDF + TruncatedSVD dims from full_text; 0 disables",
     )
     p.add_argument(
         "--baseline",
@@ -249,6 +259,43 @@ def apply_emb_pca(
         train_out[f"emb_{i}"] = train_z[:, i]
         val_out[f"emb_{i}"] = val_z[:, i]
     print(f"PCA embeddings: {len(emb_cols)} → {train_z.shape[1]} (var={pca.explained_variance_ratio_.sum():.3f})")
+    return train_out, val_out
+
+
+def apply_text_svd(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    n_components: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Bag-time text only; vectorizer + SVD fit on train fold."""
+    from sklearn.decomposition import TruncatedSVD
+    from sklearn.feature_extraction.text import TfidfVectorizer
+
+    train_text = train_df["full_text"].fillna("").astype(str)
+    val_text = val_df["full_text"].fillna("").astype(str)
+    n_comp = min(n_components, max(2, len(train_df) - 1))
+    vectorizer = TfidfVectorizer(
+        max_features=50000,
+        ngram_range=(1, 2),
+        min_df=3,
+        sublinear_tf=True,
+        strip_accents="unicode",
+    )
+    train_x = vectorizer.fit_transform(train_text)
+    val_x = vectorizer.transform(val_text)
+    n_comp = min(n_comp, train_x.shape[1] - 1) if train_x.shape[1] > 1 else 1
+    svd = TruncatedSVD(n_components=n_comp, random_state=0)
+    train_z = svd.fit_transform(train_x).astype(np.float32)
+    val_z = svd.transform(val_x).astype(np.float32)
+    train_out = train_df.copy()
+    val_out = val_df.copy()
+    for i in range(train_z.shape[1]):
+        train_out[f"tfidf_{i}"] = train_z[:, i]
+        val_out[f"tfidf_{i}"] = val_z[:, i]
+    print(
+        f"TF-IDF SVD: vocab={len(vectorizer.vocabulary_):,} → {train_z.shape[1]} "
+        f"(var={svd.explained_variance_ratio_.sum():.3f})"
+    )
     return train_out, val_out
 
 
@@ -298,6 +345,8 @@ def main() -> None:
     train_df, val_df = time_split(df, args.val_frac)
     if args.emb_pca > 0 and not args.skip_embeddings:
         train_df, val_df = apply_emb_pca(train_df, val_df, args.emb_pca)
+    if args.text_svd > 0:
+        train_df, val_df = apply_text_svd(train_df, val_df, args.text_svd)
 
     residual = args.residual
     y_train_abs = train_df["log_engagement"].to_numpy(dtype=np.float64)
