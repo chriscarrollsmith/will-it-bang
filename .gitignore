@@ -13,6 +13,7 @@ wheels/
 run.log
 prepare.log
 train.log
+train_abs.log
 train_ablation.log
 results.tsv
 *.parquet

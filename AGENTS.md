@@ -29,3 +29,5 @@ Any time you have to look up how to do something you might want to do again, add
 - Do not use `all_account.num_followers` (etc.) as historical features — those fields are current snapshots and leak the future for older tweets.
 - Frozen text encoder used here: `sentence-transformers/all-MiniLM-L6-v2` (Apache-2.0); dataset/model cache under `~/.cache/will-it-bang/`.
 - Sample the CA parquet with DuckDB (`read_parquet`) instead of loading the full dump into pandas — 14M rows OOMs a 16GB laptop.
+- Cache MiniLM vectors by `tweet_id` in `~/.cache/will-it-bang/embed_cache.parquet` so feature rebuilds don't re-embed.
+- Prefer many accounts with a per-account tweet cap over a few fat accounts — otherwise the time-split barely tests generalization.

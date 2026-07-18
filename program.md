@@ -31,4 +31,4 @@ Primary: **RMSE on log engagement** (`rmse_log`), plus Spearman rank correlation
 
 ## Experiment loop (optional)
 
-After the baseline lands, iterate on `train.py` (and feature ideas in `prepare.py` when needed). Keep changes simple; avoid future leakage.
+After the baseline lands, iterate on `train.py` (and feature ideas in `prepare.py` when needed). Keep changes simple; avoid future leakage. Commit training code after a successful run, or roll back after a failed experiment. Always keep an experimental log.
