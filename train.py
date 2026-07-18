@@ -32,6 +32,8 @@ CACHE_DIR = Path.home() / ".cache" / "will-it-bang"
 DATASET_PATH = CACHE_DIR / "dataset.parquet"
 MODEL_PATH = CACHE_DIR / "model.txt"
 METRICS_PATH = CACHE_DIR / "metrics.json"
+VAL_PRED_PATH = CACHE_DIR / "val_predictions.parquet"
+ANALYSIS_PATH = CACHE_DIR / "error_analysis.json"
 RESULTS_PATH = Path(__file__).resolve().parent / "results.tsv"
 
 TABULAR_FEATURES = [
@@ -362,6 +364,40 @@ def main() -> None:
         model.save_model(str(MODEL_PATH))
     METRICS_PATH.write_text(json.dumps(metrics, indent=2) + "\n")
     append_results(args.description, metrics)
+
+    # Persist val rows + predictions for error analysis.
+    pred_df = val_df[
+        [
+            c
+            for c in (
+                "tweet_id",
+                "account_id",
+                "username",
+                "created_at",
+                "full_text",
+                "engagement",
+                "log_engagement",
+                "is_reply",
+                "is_quote",
+                "has_media",
+                "has_url",
+                "text_len",
+                "hist_mean_eng",
+                "hist_mean_reply",
+                "hist_mean_nonreply",
+                "days_since_last",
+            )
+            if c in val_df.columns
+        ]
+    ].copy()
+    pred_df["y_true_log"] = y_val_abs
+    pred_df["y_pred_log"] = pred
+    pred_df["y_base_log"] = chosen_base_val
+    pred_df["abs_err_log"] = np.abs(pred - y_val_abs)
+    pred_df["err_log"] = pred - y_val_abs
+    pred_df["y_pred_eng"] = np.expm1(np.clip(pred, 0, 20))
+    pred_df.to_parquet(VAL_PRED_PATH, index=False)
+    print(f"Wrote val predictions: {VAL_PRED_PATH}")
 
     if model is not None and feature_names:
         importance = (

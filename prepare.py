@@ -200,7 +200,7 @@ def _ca_headers() -> dict[str, str]:
     }
 
 
-def _fetch_id_counts(table: str, id_col: str, tweet_ids: list[str], batch_size: int = 80) -> dict[str, int]:
+def _fetch_id_counts(table: str, id_col: str, tweet_ids: list[str], batch_size: int = 120) -> dict[str, int]:
     """Count rows per tweet_id in a CA table (media/urls)."""
     counts: dict[str, int] = {}
     session = requests.Session()
