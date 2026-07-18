@@ -1,0 +1,19 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local experiment artifacts
+run.log
+prepare.log
+train.log
+train_ablation.log
+results.tsv
+*.parquet
+!.cache/

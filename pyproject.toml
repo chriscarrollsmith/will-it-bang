@@ -1,0 +1,20 @@
+[project]
+name = "will-it-bang"
+version = "0.1.0"
+description = "Predict tweet engagement from Community Archive data"
+readme = "program.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aideml>=0.2.2",
+    "duckdb>=1.5.4",
+    "lightgbm>=4.6.0",
+    "modal>=1.5.2",
+    "numpy>=1.26",
+    "pandas>=2.1",
+    "pyarrow>=14",
+    "requests>=2.31",
+    "scikit-learn>=1.5",
+    "scipy>=1.11",
+    "torch>=2.2",
+    "transformers>=4.40",
+]
