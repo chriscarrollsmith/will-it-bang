@@ -1,17 +1,18 @@
 """
 Train a hybrid engagement model on the prepared Community Archive dataset.
 
-Frozen MiniLM embeddings + leakage-safe tabular features → LightGBM regressor
-predicting log1p(favorites + retweets). Evaluation is a global time holdout.
+Frozen MiniLM embeddings + leakage-safe tabular features → LightGBM regressor.
+Default target is an exposure-adjusted log rate (maturity-controlled intensity),
+not raw dump-time log1p(favorites + retweets). Evaluation is a global time holdout.
 
 History features must not use dump-time fav/RT (see AGENTS.md). Author
-popularity inputs are pre-T reply-received rates. Default: residual against
-context reply baseline + train-fit emb PCA; optional TF-IDF SVD text features.
+popularity inputs are pre-T reply-received rates. Default stack also uses
+train-fit emb PCA + TF-IDF SVD. Context residual is off under rate targets
+(mixed units); use --no-exposure-correct for dump-total prediction + residual.
 
 Usage:
     uv run train.py
-    uv run train.py --text-svd 64
-    uv run train.py --no-residual
+    uv run train.py --no-exposure-correct --residual   # dump-total / v13-style
     uv run train.py --skip-embeddings
 """
 
@@ -19,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import time
 from pathlib import Path
 
@@ -80,18 +82,141 @@ TABULAR_FEATURES = [
     "hist_mean_replies_reply",
     "reply_x_hist_replies_nr",
     "media_x_hist_replies",
+    "hist_dump_n",
+    "hist_dump_mean_replies",
+    "hist_dump_decay_replies",
+    "hist_dump_p90_replies",
+    "inbound_replies",
+    "inbound_replies_7d",
+    "inbound_replies_30d",
+    "inbound_replies_per_tweet",
+    "inbound_quotes",
+    "inbound_quotes_7d",
+    "inbound_quotes_30d",
+    "inbound_quotes_per_tweet",
+    "media_x_inbound_replies",
+    "reply_x_inbound_replies",
+    "has_reply_parent",
+    "reply_parent_emb_cos",
+    "reply_parent_log_text_len",
+    "reply_parent_is_reply",
+    "reply_parent_is_quote",
+    "reply_parent_same_author",
+    "reply_parent_age_hours",
+    "reply_parent_replies",
+    "has_quote_parent",
+    "quote_parent_emb_cos",
+    "quote_parent_log_text_len",
+    "quote_parent_is_reply",
+    "quote_parent_is_quote",
+    "quote_parent_same_author",
+    "quote_parent_age_hours",
+    "quote_parent_replies",
+    "year",
+    "month_sin",
+    "month_cos",
+    "platform_era",
+    "era_pre_timeline",
+    "era_algo_timeline",
+    "era_pre_musk",
+    "era_musk_early",
+    "era_musk_late",
+]
+
+# Opt-in descriptive text tags (--descriptive-text); flat on rate RMSE in v15.
+DESCRIPTIVE_TEXT_FEATURES = [
+    "sent_neg",
+    "sent_neu",
+    "sent_pos",
+    "sent_compound",
+    "sent_abs_compound",
+    "first_person_ratio",
+    "n_sentences",
+]
+
+# From prepare.attach_url_domains (+ train-fold domain_mean_rate).
+URL_DOMAIN_FEATURES = [
+    "n_text_urls",
+    "url_only",
+    "url_at_end",
+    "has_expanded_domain",
+    "n_ca_url_rows",
+    "domain_is_twitter",
+    "domain_is_youtube",
+    "domain_is_github",
+    "domain_is_substack",
+    "domain_is_wiki",
+    "domain_mean_rate",
+    "log_domain_n",
+]
+
+# Cached LM descriptive scores (label_provoke.py); used when columns present.
+PROVOKE_FEATURES = [
+    "wrongheaded",
+    "infuriating",
+    "provoke",
+    "has_provoke",
+]
+
+# Train-fold account target encoding (add_account_target_encoding).
+ACCOUNT_TE_FEATURES = [
+    "account_mean_rate",
+    "log_account_n",
+]
+
+# Train-fold MiniLM neighborhood TE (cold-start content prior).
+EMB_KNN_TE_FEATURES = [
+    "emb_knn_mean_rate",
+    "emb_knn_std_rate",
+    "emb_knn_mean_sim",
+    "account_is_cold",
+    "knn_x_cold",
+    "te_minus_knn",
+]
+
+# Added when --author-emb-affinity is set (flat alone in v10).
+AFFINITY_FEATURES = [
+    "author_emb_cos",
+    "author_emb_l2",
+    "author_emb_cos_30d",
+    "author_emb_l2_30d",
+]
+
+# TE × own-corpus novelty (needs affinity + account TE columns).
+BREAKOUT_FEATURES = [
+    "author_emb_novelty",
+    "author_emb_novelty_sq",
+    "te_x_novelty",
+    "te_x_author_l2",
+    "te_x_novelty_30d",
+    "novelty_x_nonreply",
 ]
 
 
 def feature_matrix(df: pd.DataFrame, skip_embeddings: bool) -> tuple[np.ndarray, list[str]]:
-    cols = [c for c in TABULAR_FEATURES if c in df.columns]
+    extra = [
+        c
+        for c in (
+            AFFINITY_FEATURES
+            + BREAKOUT_FEATURES
+            + DESCRIPTIVE_TEXT_FEATURES
+            + URL_DOMAIN_FEATURES
+            + PROVOKE_FEATURES
+            + ACCOUNT_TE_FEATURES
+            + EMB_KNN_TE_FEATURES
+        )
+        if c in df.columns
+    ]
+    tabular = TABULAR_FEATURES + extra
+    cols = [c for c in tabular if c in df.columns]
     missing = [c for c in TABULAR_FEATURES if c not in df.columns]
     if missing:
         print(f"Warning: missing tabular features (skipped): {missing}")
     if not skip_embeddings:
-        emb_cols = [c for c in df.columns if c.startswith("emb_")]
+        emb_cols = [c for c in df.columns if re.fullmatch(r"emb_\d+", c)]
         if not emb_cols:
             raise SystemExit("Dataset has no emb_* columns — re-run prepare.py")
+        emb_cols = sorted(emb_cols, key=lambda c: int(c.split("_", 1)[1]))
         cols = cols + emb_cols
     tfidf_cols = [c for c in df.columns if c.startswith("tfidf_")]
     cols = cols + tfidf_cols
@@ -147,6 +272,10 @@ def train_model(
     feature_names: list[str],
     seed: int,
     weight_train: np.ndarray | None = None,
+    *,
+    loss: str = "huber",
+    quantile_alpha: float = 0.65,
+    asymmetric_under_weight: float = 3.0,
 ) -> lgb.Booster:
     train_set = lgb.Dataset(
         x_train,
@@ -155,9 +284,7 @@ def train_model(
         feature_name=feature_names,
     )
     val_set = lgb.Dataset(x_val, label=y_val, reference=train_set, feature_name=feature_names)
-    params = {
-        "objective": "huber",
-        "alpha": 1.0,
+    params: dict = {
         "metric": "rmse",
         "learning_rate": 0.04,
         "num_leaves": 47,
@@ -169,6 +296,35 @@ def train_model(
         "verbosity": -1,
         "seed": seed,
     }
+    if loss == "huber":
+        params["objective"] = "huber"
+        params["alpha"] = 1.0
+    elif loss == "mse":
+        params["objective"] = "regression"
+    elif loss == "quantile":
+        params["objective"] = "quantile"
+        params["alpha"] = float(quantile_alpha)
+    elif loss == "asymmetric":
+        under_w = float(asymmetric_under_weight)
+
+        def asymmetric_mse(y_pred: np.ndarray, dataset: lgb.Dataset):
+            y_true = dataset.get_label()
+            resid = y_true - y_pred
+            w = np.where(resid > 0.0, under_w, 1.0)
+            grad = -2.0 * w * resid
+            hess = 2.0 * w
+            return grad, hess
+
+        params["objective"] = asymmetric_mse
+    else:
+        raise ValueError(f"Unknown loss={loss!r}")
+
+    print(
+        f"Loss: {loss}"
+        + (f" alpha={quantile_alpha:g}" if loss == "quantile" else "")
+        + (f" under_weight={asymmetric_under_weight:g}" if loss == "asymmetric" else ""),
+        flush=True,
+    )
     return lgb.train(
         params,
         train_set,
@@ -322,8 +478,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--residual",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Residualize against --baseline (default on; use --no-residual for absolute)",
+        default=None,
+        help="Residualize against --baseline. Default: on for dump-total targets, "
+        "off for --exposure-mode rate (mixed units)",
     )
     p.add_argument("--skip-embeddings", action="store_true", help="Ablation: tabular features only")
     p.add_argument(
@@ -377,8 +534,175 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Train regressor on non-replies only; replies use baseline + mean reply residual",
     )
-    p.add_argument("--description", type=str, default="leakage-safe hybrid")
+    p.add_argument(
+        "--author-emb-affinity",
+        action="store_true",
+        help="Add pre-T mean-author MiniLM cosine/L2 features (flat in v10; off by default)",
+    )
+    p.add_argument(
+        "--descriptive-text",
+        action="store_true",
+        help="Add VADER sentiment + first-person ratio (v15: flat rate RMSE; off by default)",
+    )
+    p.add_argument(
+        "--provoke-labels",
+        action="store_true",
+        help="Join LM wrongheaded/infuriating scores from provoke cache",
+    )
+    p.add_argument(
+        "--provoke-cache",
+        type=Path,
+        default=None,
+        help="Path to provoke cache parquet (default: ~/.cache/will-it-bang/provoke_cache.parquet)",
+    )
+    p.add_argument(
+        "--account-te",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Train-fold smoothed account mean of the model target (LOO on train)",
+    )
+    p.add_argument(
+        "--account-te-prior",
+        type=float,
+        default=20.0,
+        help="Shrinkage strength toward global mean for --account-te",
+    )
+    p.add_argument(
+        "--loss",
+        choices=("huber", "mse", "quantile", "asymmetric"),
+        default="asymmetric",
+        help="Regression objective (default asymmetric upweights under-prediction)",
+    )
+    p.add_argument(
+        "--quantile-alpha",
+        type=float,
+        default=0.65,
+        help="Quantile level when --loss quantile",
+    )
+    p.add_argument(
+        "--asymmetric-under-weight",
+        type=float,
+        default=3.0,
+        help="Under-prediction weight when --loss asymmetric",
+    )
+    p.add_argument(
+        "--emb-knn-te",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Train-fold MiniLM kNN target encoding (cold-start content prior; default on)",
+    )
+    p.add_argument("--emb-knn-k", type=int, default=40, help="Neighbors for --emb-knn-te")
+    p.add_argument(
+        "--emb-knn-cold-max-n",
+        type=float,
+        default=5.0,
+        help="Train account count ≤ this counts as cold for knn_x_cold",
+    )
+    p.add_argument(
+        "--exposure-correct",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Train/eval maturity-adjusted intensity (default on). "
+        "Use --no-exposure-correct for dump-total log1p(eng)",
+    )
+    p.add_argument(
+        "--exposure-mode",
+        choices=("rate", "resid"),
+        default="rate",
+        help="rate: log1p(eng/(min(age,cap)+eps)^beta) [default]; "
+        "resid: subtract train-fit a+b*log1p(eff_age)",
+    )
+    p.add_argument(
+        "--exposure-cap-days",
+        type=float,
+        default=30.0,
+        help="Saturating exposure cap in days (with --exposure-correct)",
+    )
+    p.add_argument(
+        "--exposure-beta",
+        type=float,
+        default=1.0,
+        help="Exponent on effective age when --exposure-mode rate",
+    )
+    p.add_argument(
+        "--exposure-eps",
+        type=float,
+        default=1.0,
+        help="Smoothing days added to effective age",
+    )
+    p.add_argument("--description", type=str, default="exposure-rate hybrid")
     return p.parse_args()
+
+
+def _exposure_eff_days(
+    created_at: pd.Series,
+    dump_time: pd.Timestamp,
+    cap_days: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    ts = pd.to_datetime(created_at, utc=True)
+    age_days = (dump_time - ts).dt.total_seconds().to_numpy(dtype=np.float64) / 86400.0
+    age_days = np.clip(age_days, 0.0, None)
+    eff = np.minimum(age_days, float(cap_days))
+    return age_days, eff
+
+
+def fit_exposure_resid(
+    log_eng: np.ndarray,
+    eff_days: np.ndarray,
+    eps: float,
+) -> tuple[float, float]:
+    """OLS log_eng ~ a + b * log1p(eff) on the train fold."""
+    x = np.log1p(eff_days + float(eps))
+    x_c = x - x.mean()
+    y_c = log_eng - log_eng.mean()
+    var = float(np.dot(x_c, x_c))
+    b = float(np.dot(x_c, y_c) / var) if var > 1e-12 else 0.0
+    a = float(log_eng.mean() - b * x.mean())
+    return a, b
+
+
+def exposure_resid_baseline(eff_days: np.ndarray, a: float, b: float, eps: float) -> np.ndarray:
+    return a + b * np.log1p(eff_days + float(eps))
+
+
+def apply_exposure_rate_targets(
+    df: pd.DataFrame,
+    *,
+    dump_time: pd.Timestamp,
+    cap_days: float,
+    beta: float,
+    eps: float,
+) -> pd.DataFrame:
+    """Replace log_engagement with saturating exposure-adjusted log rate."""
+    out = df.copy()
+    age_days, eff = _exposure_eff_days(out["created_at"], dump_time, cap_days)
+    log_raw = out["log_engagement"].to_numpy(dtype=np.float64)
+    eng = np.expm1(np.clip(log_raw, 0.0, 30.0))
+    log_rate = np.log1p(eng / np.power(eff + float(eps), float(beta)))
+    out["log_engagement_raw"] = log_raw
+    out["exposure_age_days"] = age_days
+    out["exposure_eff_days"] = eff
+    out["log_engagement"] = log_rate
+    print(
+        f"Exposure rate: dump={dump_time.date()} cap={cap_days:g}d "
+        f"beta={beta:g} eps={eps:g} | "
+        f"age p50={np.median(age_days):.1f} eff p50={np.median(eff):.1f} | "
+        f"log_raw mean={log_raw.mean():.3f} → log_rate mean={log_rate.mean():.3f}",
+        flush=True,
+    )
+    return out
+
+
+def log_rate_to_log_eng(
+    log_rate: np.ndarray,
+    eff_days: np.ndarray,
+    *,
+    beta: float,
+    eps: float,
+) -> np.ndarray:
+    rate_eng = np.expm1(np.clip(log_rate, -1.0, 30.0))
+    eng = np.clip(rate_eng, 0.0, None) * np.power(eff_days + float(eps), float(beta))
+    return np.log1p(eng)
 
 
 def author_baseline(df: pd.DataFrame, kind: str) -> np.ndarray:
@@ -395,6 +719,405 @@ def author_baseline(df: pd.DataFrame, kind: str) -> np.ndarray:
     raise ValueError(kind)
 
 
+_FIRST_PERSON_RE = re.compile(
+    r"\b(i|i'm|i’ve|i've|me|my|mine|we|we're|we’ve|we've|us|our|ours)\b",
+    re.IGNORECASE,
+)
+_SENT_SPLIT_RE = re.compile(r"[.!?]+")
+
+
+def add_provoke_features(df: pd.DataFrame, cache_path: Path | None = None) -> pd.DataFrame:
+    """Join cached LM tone scores (text-only; no engagement in the labeler)."""
+    path = cache_path or (CACHE_DIR / "provoke_cache.parquet")
+    if not path.exists():
+        raise SystemExit(f"Missing {path}; run: uv run modal run label_provoke.py")
+    cache = pd.read_parquet(path)
+    cache["tweet_id"] = cache["tweet_id"].astype(str)
+    cache = cache.drop_duplicates("tweet_id", keep="last")
+    if "ok" in cache.columns:
+        cache = cache.loc[cache["ok"].fillna(0).astype(int) == 1]
+    ok = cache[["tweet_id", "wrongheaded", "infuriating"]]
+    out = df.copy()
+    out["tweet_id"] = out["tweet_id"].astype(str)
+    merged = out[["tweet_id"]].merge(ok, on="tweet_id", how="left")
+    wh = merged["wrongheaded"].to_numpy(dtype=np.float64)
+    inf = merged["infuriating"].to_numpy(dtype=np.float64)
+    has = np.isfinite(wh) & np.isfinite(inf)
+    # Scale 0-10 → 0-1; missing → 0 with has_provoke=0.
+    wh_s = np.where(has, wh / 10.0, 0.0)
+    inf_s = np.where(has, inf / 10.0, 0.0)
+    out["wrongheaded"] = wh_s.astype(np.float32)
+    out["infuriating"] = inf_s.astype(np.float32)
+    out["provoke"] = np.maximum(wh_s, inf_s).astype(np.float32)
+    out["has_provoke"] = has.astype(np.int8)
+    print(
+        f"Provoke labels: coverage={has.mean():.1%} "
+        f"mean wrongheaded={wh_s[has].mean() if has.any() else float('nan'):.3f} "
+        f"infuriating={inf_s[has].mean() if has.any() else float('nan'):.3f}",
+        flush=True,
+    )
+    return out
+
+
+def add_descriptive_text_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Lexical sentiment + light descriptive text stats (no user/handle LM scoring)."""
+    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+
+    out = df.copy()
+    texts = out["full_text"].fillna("").astype(str)
+    analyzer = SentimentIntensityAnalyzer()
+    neg = np.zeros(len(out), dtype=np.float64)
+    neu = np.zeros(len(out), dtype=np.float64)
+    pos = np.zeros(len(out), dtype=np.float64)
+    compound = np.zeros(len(out), dtype=np.float64)
+    first_person = np.zeros(len(out), dtype=np.float64)
+    n_sent = np.zeros(len(out), dtype=np.float64)
+
+    for i, text in enumerate(texts):
+        s = analyzer.polarity_scores(text)
+        neg[i] = s["neg"]
+        neu[i] = s["neu"]
+        pos[i] = s["pos"]
+        compound[i] = s["compound"]
+        toks = re.findall(r"[A-Za-z']+", text)
+        if toks:
+            first_person[i] = sum(1 for t in toks if _FIRST_PERSON_RE.fullmatch(t)) / len(toks)
+        parts = [p for p in _SENT_SPLIT_RE.split(text) if p.strip()]
+        n_sent[i] = float(max(len(parts), 1 if text.strip() else 0))
+
+    out["sent_neg"] = neg
+    out["sent_neu"] = neu
+    out["sent_pos"] = pos
+    out["sent_compound"] = compound
+    out["sent_abs_compound"] = np.abs(compound)
+    out["first_person_ratio"] = first_person
+    out["n_sentences"] = n_sent
+    print(
+        f"Descriptive text features: mean compound={compound.mean():.3f}, "
+        f"mean |compound|={np.abs(compound).mean():.3f}, "
+        f"mean first_person={first_person.mean():.3f}",
+        flush=True,
+    )
+    return out
+
+
+def add_domain_priors(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    *,
+    min_count: int = 30,
+    target_col: str = "log_engagement",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Train-fold mean target by expanded domain; rare/unknown → global mean."""
+    if "url_domain" not in train_df.columns:
+        return train_df, val_df
+    train_out = train_df.copy()
+    val_out = val_df.copy()
+    domain_tr = train_out["url_domain"].fillna("").astype(str)
+    y = train_out[target_col].to_numpy(dtype=np.float64)
+    global_mean = float(np.mean(y))
+    stats = (
+        pd.DataFrame({"domain": domain_tr.to_numpy(), "y": y})
+        .loc[lambda d: d["domain"] != ""]
+        .groupby("domain", sort=False)["y"]
+        .agg(["mean", "count"])
+    )
+    stats = stats.loc[stats["count"] >= min_count]
+    mean_map = stats["mean"].to_dict()
+    count_map = stats["count"].to_dict()
+
+    def _encode(domains: pd.Series) -> tuple[np.ndarray, np.ndarray]:
+        means = np.empty(len(domains), dtype=np.float32)
+        log_n = np.empty(len(domains), dtype=np.float32)
+        for i, d in enumerate(domains.fillna("").astype(str)):
+            if d in mean_map:
+                means[i] = mean_map[d]
+                log_n[i] = np.log1p(count_map[d])
+            else:
+                means[i] = global_mean
+                log_n[i] = 0.0
+        return means, log_n
+
+    train_out["domain_mean_rate"], train_out["log_domain_n"] = _encode(domain_tr)
+    val_out["domain_mean_rate"], val_out["log_domain_n"] = _encode(val_out["url_domain"])
+    print(
+        f"Domain priors: {len(mean_map):,} domains with n>={min_count} "
+        f"(coverage train={(domain_tr != '').mean():.1%}, "
+        f"mapped={(domain_tr.map(lambda d: d in mean_map)).mean():.1%})",
+        flush=True,
+    )
+    return train_out, val_out
+
+
+def add_account_target_encoding(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    *,
+    prior_strength: float = 20.0,
+    target_col: str = "log_engagement",
+    id_col: str = "account_id",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Train-fold smoothed mean target by account; LOO on train to avoid row leak."""
+    if id_col not in train_df.columns:
+        return train_df, val_df
+    train_out = train_df.copy()
+    val_out = val_df.copy()
+    ids_tr = train_out[id_col].astype(str)
+    y = train_out[target_col].to_numpy(dtype=np.float64)
+    global_mean = float(np.mean(y))
+    m = float(prior_strength)
+
+    grp = pd.DataFrame({"aid": ids_tr.to_numpy(), "y": y}).groupby("aid", sort=False)["y"]
+    sums = grp.sum()
+    counts = grp.count().astype(np.float64)
+    means = grp.mean()
+
+    # Train: leave-one-out mean, then shrink toward global.
+    n = counts.reindex(ids_tr).to_numpy(dtype=np.float64)
+    s = sums.reindex(ids_tr).to_numpy(dtype=np.float64)
+    loo = np.where(n > 1.0, (s - y) / (n - 1.0), global_mean)
+    n_loo = np.maximum(n - 1.0, 0.0)
+    train_te = (n_loo * loo + m * global_mean) / (n_loo + m)
+    train_out["account_mean_rate"] = train_te.astype(np.float32)
+    train_out["log_account_n"] = np.log1p(n).astype(np.float32)
+
+    # Val: full train-fold mean + same shrinkage; unseen accounts → global.
+    ids_va = val_out[id_col].astype(str)
+    n_va = counts.reindex(ids_va).fillna(0.0).to_numpy(dtype=np.float64)
+    mean_va = means.reindex(ids_va).fillna(global_mean).to_numpy(dtype=np.float64)
+    val_te = (n_va * mean_va + m * global_mean) / (n_va + m)
+    val_out["account_mean_rate"] = val_te.astype(np.float32)
+    val_out["log_account_n"] = np.log1p(n_va).astype(np.float32)
+
+    overlap = float(ids_va.isin(set(ids_tr)).mean())
+    print(
+        f"Account TE: prior_m={m:g} global={global_mean:.4f} "
+        f"train accounts={len(counts):,} val overlap={overlap:.1%} "
+        f"val te p50={np.median(val_te):.4f}",
+        flush=True,
+    )
+    return train_out, val_out
+
+
+def add_te_affinity_interactions(df: pd.DataFrame) -> pd.DataFrame:
+    """Cross account TE with own-corpus novelty (breakout / off-brand signal)."""
+    if "author_emb_cos" not in df.columns or "account_mean_rate" not in df.columns:
+        return df
+    out = df.copy()
+    cos = out["author_emb_cos"].to_numpy(dtype=np.float64)
+    nov = np.clip(1.0 - cos, 0.0, 2.0)
+    te = out["account_mean_rate"].to_numpy(dtype=np.float64)
+    l2 = out["author_emb_l2"].to_numpy(dtype=np.float64)
+    out["author_emb_novelty"] = nov.astype(np.float32)
+    out["author_emb_novelty_sq"] = (nov * nov).astype(np.float32)
+    out["te_x_novelty"] = (te * nov).astype(np.float32)
+    out["te_x_author_l2"] = (te * l2).astype(np.float32)
+    if "author_emb_cos_30d" in out.columns:
+        nov30 = np.clip(1.0 - out["author_emb_cos_30d"].to_numpy(dtype=np.float64), 0.0, 2.0)
+        out["te_x_novelty_30d"] = (te * nov30).astype(np.float32)
+    if "is_reply" in out.columns:
+        nr = 1.0 - out["is_reply"].to_numpy(dtype=np.float64)
+        out["novelty_x_nonreply"] = (nov * nr).astype(np.float32)
+    print(
+        f"TE×affinity: mean novelty={nov.mean():.3f}, "
+        f"mean te_x_novelty={(te * nov).mean():.4f}",
+        flush=True,
+    )
+    return out
+
+
+def add_time_regime_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Calendar + coarse platform-era indicators from tweet created_at (leakage-safe)."""
+    out = df.copy()
+    ts = pd.to_datetime(out["created_at"], utc=True)
+    year = ts.dt.year.astype(np.int16)
+    month = ts.dt.month.astype(np.float64)
+    out["year"] = year
+    out["month_sin"] = np.sin(2 * np.pi * month / 12.0)
+    out["month_cos"] = np.cos(2 * np.pi * month / 12.0)
+
+    # Coarse product/algorithm regimes (UTC cutpoints; ordinal + one-hots).
+    # 0: pre-2015  1: 2015–2017 algo timeline  2: 2018–2022-10 pre-Musk
+    # 3: 2022-11–2023 Musk early  4: 2024+ Musk late / For You era
+    era = np.zeros(len(out), dtype=np.int8)
+    era[ts >= "2015-01-01"] = 1
+    era[ts >= "2018-01-01"] = 2
+    era[ts >= "2022-11-01"] = 3
+    era[ts >= "2024-01-01"] = 4
+    out["platform_era"] = era
+    out["era_pre_timeline"] = (era == 0).astype(np.int8)
+    out["era_algo_timeline"] = (era == 1).astype(np.int8)
+    out["era_pre_musk"] = (era == 2).astype(np.int8)
+    out["era_musk_early"] = (era == 3).astype(np.int8)
+    out["era_musk_late"] = (era == 4).astype(np.int8)
+
+    vc = pd.Series(era).value_counts().sort_index()
+    print("Time regimes:", {int(k): int(v) for k, v in vc.items()}, flush=True)
+    return out
+
+
+def add_author_emb_affinity(df: pd.DataFrame) -> pd.DataFrame:
+    """Cosine / L2 of tweet emb vs mean of author's earlier MiniLM vectors (pre-T only)."""
+    emb_cols = [c for c in df.columns if re.fullmatch(r"emb_\d+", c)]
+    if not emb_cols:
+        print("Skipping author emb affinity (no emb_* columns)")
+        return df
+    emb_cols = sorted(emb_cols, key=lambda c: int(c.split("_", 1)[1]))
+
+    out = df.reset_index(drop=True).copy()
+    emb = out[emb_cols].to_numpy(dtype=np.float64)
+    n = len(out)
+    cos_all = np.zeros(n, dtype=np.float64)
+    l2_all = np.zeros(n, dtype=np.float64)
+    cos_30 = np.zeros(n, dtype=np.float64)
+    l2_30 = np.zeros(n, dtype=np.float64)
+
+    for _, g in out.groupby("account_id", sort=False):
+        g = g.sort_values("created_at", kind="mergesort")
+        ix = g.index.to_numpy()
+        e = emb[ix]
+        times = g["created_at"].to_numpy()
+        cumsum = np.cumsum(e, axis=0)
+        for k in range(len(ix)):
+            if k == 0:
+                continue
+            mean = cumsum[k - 1] / k
+            v = e[k]
+            mean_n = np.linalg.norm(mean)
+            v_n = np.linalg.norm(v)
+            if mean_n > 1e-12 and v_n > 1e-12:
+                cos_all[ix[k]] = float(np.dot(mean, v) / (mean_n * v_n))
+            l2_all[ix[k]] = float(np.linalg.norm(v - mean))
+
+            cut = times[k]
+            start = cut - np.timedelta64(30, "D")
+            left = int(np.searchsorted(times[:k], start, side="left"))
+            n_win = k - left
+            if n_win <= 0:
+                continue
+            # Mean of embeddings in [start, cut) via prefix sums.
+            mean_w = (cumsum[k - 1] - (cumsum[left - 1] if left > 0 else 0.0)) / n_win
+            mean_wn = np.linalg.norm(mean_w)
+            if mean_wn > 1e-12 and v_n > 1e-12:
+                cos_30[ix[k]] = float(np.dot(mean_w, v) / (mean_wn * v_n))
+            l2_30[ix[k]] = float(np.linalg.norm(v - mean_w))
+
+    out["author_emb_cos"] = cos_all
+    out["author_emb_l2"] = l2_all
+    out["author_emb_cos_30d"] = cos_30
+    out["author_emb_l2_30d"] = l2_30
+    print(
+        f"Author emb affinity: mean cos={cos_all.mean():.3f}, "
+        f"mean cos_30d={cos_30.mean():.3f}"
+    )
+    return out
+
+
+def add_emb_knn_target_encoding(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    *,
+    k: int = 40,
+    cold_max_n: float = 5.0,
+    target_col: str = "log_engagement",
+    exclude_same_account: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Train-fold mean target of K nearest MiniLM neighbors (content prior for cold accounts)."""
+    from sklearn.neighbors import NearestNeighbors
+
+    emb_cols = [c for c in train_df.columns if re.fullmatch(r"emb_\d+", c)]
+    if not emb_cols:
+        return train_df, val_df
+    emb_cols = sorted(emb_cols, key=lambda c: int(c.split("_", 1)[1]))
+
+    train_out = train_df.reset_index(drop=True).copy()
+    val_out = val_df.reset_index(drop=True).copy()
+    y = train_out[target_col].to_numpy(dtype=np.float64)
+    global_mean = float(np.mean(y))
+
+    def _l2_normalize(x: np.ndarray) -> np.ndarray:
+        n = np.linalg.norm(x, axis=1, keepdims=True)
+        n = np.maximum(n, 1e-12)
+        return x / n
+
+    x_tr = _l2_normalize(train_out[emb_cols].to_numpy(dtype=np.float64))
+    x_va = _l2_normalize(val_out[emb_cols].to_numpy(dtype=np.float64))
+    aids_tr = train_out["account_id"].astype(str).to_numpy()
+    aids_va = val_out["account_id"].astype(str).to_numpy()
+
+    # Query k+1 on train so we can drop self; optionally drop same account.
+    kk = min(k + 25, len(train_out) - 1)
+    nn = NearestNeighbors(n_neighbors=kk, metric="euclidean", algorithm="auto")
+    nn.fit(x_tr)
+
+    def _aggregate(dist: np.ndarray, idx: np.ndarray, query_aids: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        n_q = idx.shape[0]
+        means = np.empty(n_q, dtype=np.float64)
+        stds = np.empty(n_q, dtype=np.float64)
+        sims = np.empty(n_q, dtype=np.float64)
+        for i in range(n_q):
+            neigh = idx[i]
+            d = dist[i]
+            # Drop self (dist ~ 0) and optionally same-account neighbors.
+            keep = []
+            for j, ni in enumerate(neigh):
+                if d[j] < 1e-9:
+                    continue
+                if exclude_same_account and aids_tr[ni] == query_aids[i]:
+                    continue
+                keep.append(j)
+                if len(keep) >= k:
+                    break
+            if not keep:
+                means[i] = global_mean
+                stds[i] = 0.0
+                sims[i] = 0.0
+                continue
+            sel = neigh[keep]
+            sd = d[keep]
+            yy = y[sel]
+            means[i] = float(np.mean(yy))
+            stds[i] = float(np.std(yy)) if len(yy) > 1 else 0.0
+            # Euclidean on L2-normalized vectors: dist^2 = 2-2cos → cos = 1 - dist^2/2.
+            sims[i] = float(np.mean(1.0 - np.clip(sd, 0, 2) ** 2 / 2.0))
+        return means, stds, sims
+
+    d_tr, i_tr = nn.kneighbors(x_tr)
+    m_tr, s_tr, sim_tr = _aggregate(d_tr, i_tr, aids_tr)
+    d_va, i_va = nn.kneighbors(x_va)
+    m_va, s_va, sim_va = _aggregate(d_va, i_va, aids_va)
+
+    def _attach(df: pd.DataFrame, means: np.ndarray, stds: np.ndarray, sims: np.ndarray) -> pd.DataFrame:
+        out = df
+        out["emb_knn_mean_rate"] = means.astype(np.float32)
+        out["emb_knn_std_rate"] = stds.astype(np.float32)
+        out["emb_knn_mean_sim"] = sims.astype(np.float32)
+        if "log_account_n" in out.columns:
+            # log_account_n is log1p(train count); cold ≈ unseen or rare in train.
+            n = np.expm1(out["log_account_n"].to_numpy(dtype=np.float64))
+            cold = (n <= float(cold_max_n)).astype(np.float32)
+        else:
+            cold = np.zeros(len(out), dtype=np.float32)
+        out["account_is_cold"] = cold
+        out["knn_x_cold"] = (means * cold).astype(np.float32)
+        if "account_mean_rate" in out.columns:
+            out["te_minus_knn"] = (
+                out["account_mean_rate"].to_numpy(dtype=np.float64) - means
+            ).astype(np.float32)
+        return out
+
+    train_out = _attach(train_out, m_tr, s_tr, sim_tr)
+    val_out = _attach(val_out, m_va, s_va, sim_va)
+    cold_rate = float(val_out["account_is_cold"].mean())
+    print(
+        f"Emb kNN TE: k={k} exclude_same_account={exclude_same_account} "
+        f"val_cold={cold_rate:.1%} knn_mean p50={np.median(m_va):.4f} "
+        f"sim p50={np.median(sim_va):.3f}",
+        flush=True,
+    )
+    return train_out, val_out
+
+
 def apply_emb_pca(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
@@ -402,9 +1125,10 @@ def apply_emb_pca(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     from sklearn.decomposition import PCA
 
-    emb_cols = [c for c in train_df.columns if c.startswith("emb_")]
+    emb_cols = [c for c in train_df.columns if re.fullmatch(r"emb_\d+", c)]
     if not emb_cols:
         return train_df, val_df
+    emb_cols = sorted(emb_cols, key=lambda c: int(c.split("_", 1)[1]))
     pca = PCA(n_components=min(n_components, len(emb_cols), len(train_df) - 1), random_state=0)
     train_z = pca.fit_transform(train_df[emb_cols].to_numpy(dtype=np.float32))
     val_z = pca.transform(val_df[emb_cols].to_numpy(dtype=np.float32))
@@ -467,6 +1191,9 @@ def fit_predict_group(
     skip_embeddings: bool,
     seed: int,
     nonreply_weight: float = 1.0,
+    loss: str = "huber",
+    quantile_alpha: float = 0.65,
+    asymmetric_under_weight: float = 3.0,
 ) -> tuple[np.ndarray, lgb.Booster, list[str]]:
     x_train, feature_names = feature_matrix(train_df, skip_embeddings=skip_embeddings)
     x_val, _ = feature_matrix(val_df, skip_embeddings=skip_embeddings)
@@ -493,6 +1220,9 @@ def fit_predict_group(
         feature_names,
         seed=seed,
         weight_train=weight_train,
+        loss=loss,
+        quantile_alpha=quantile_alpha,
+        asymmetric_under_weight=asymmetric_under_weight,
     )
     raw = model.predict(x_val, num_iteration=model.best_iteration)
     pred = raw + base_val if residual else raw
@@ -515,29 +1245,121 @@ def main() -> None:
     if any(c.startswith("hist_mean_eng") for c in df.columns):
         print("Warning: dataset still has hist_*_eng columns; they are ignored by TABULAR_FEATURES")
 
+    if args.author_emb_affinity:
+        # Affinity on raw MiniLM before train-fit PCA replaces emb_*.
+        df = add_author_emb_affinity(df)
+    if args.descriptive_text:
+        df = add_descriptive_text_features(df)
+    if args.provoke_labels:
+        df = add_provoke_features(df, cache_path=args.provoke_cache)
+
+    df = add_time_regime_features(df)
+
+    dump_time = pd.Timestamp(df["created_at"].max())
+    y_train_raw_ref: np.ndarray | None = None
+    y_val_raw_ref: np.ndarray | None = None
+    val_eff_days: np.ndarray | None = None
+    exposure_a = 0.0
+    exposure_b = 0.0
+    if args.exposure_correct and args.exposure_mode == "rate":
+        df = apply_exposure_rate_targets(
+            df,
+            dump_time=dump_time,
+            cap_days=args.exposure_cap_days,
+            beta=args.exposure_beta,
+            eps=args.exposure_eps,
+        )
+
     train_df, val_df = time_split(df, args.val_frac)
+    if args.exposure_correct and args.exposure_mode == "resid":
+        age_tr, eff_tr = _exposure_eff_days(train_df["created_at"], dump_time, args.exposure_cap_days)
+        age_va, eff_va = _exposure_eff_days(val_df["created_at"], dump_time, args.exposure_cap_days)
+        y_train_raw_ref = train_df["log_engagement"].to_numpy(dtype=np.float64)
+        y_val_raw_ref = val_df["log_engagement"].to_numpy(dtype=np.float64)
+        exposure_a, exposure_b = fit_exposure_resid(y_train_raw_ref, eff_tr, args.exposure_eps)
+        train_df = train_df.copy()
+        val_df = val_df.copy()
+        train_df["log_engagement_raw"] = y_train_raw_ref
+        val_df["log_engagement_raw"] = y_val_raw_ref
+        train_df["exposure_eff_days"] = eff_tr
+        val_df["exposure_eff_days"] = eff_va
+        train_df["exposure_age_days"] = age_tr
+        val_df["exposure_age_days"] = age_va
+        base_tr = exposure_resid_baseline(eff_tr, exposure_a, exposure_b, args.exposure_eps)
+        base_va = exposure_resid_baseline(eff_va, exposure_a, exposure_b, args.exposure_eps)
+        train_df["log_engagement"] = y_train_raw_ref - base_tr
+        val_df["log_engagement"] = y_val_raw_ref - base_va
+        val_eff_days = eff_va
+        print(
+            f"Exposure resid: dump={dump_time.date()} cap={args.exposure_cap_days:g}d "
+            f"a={exposure_a:.4f} b={exposure_b:.4f} | "
+            f"train eff p50={np.median(eff_tr):.1f} val eff p50={np.median(eff_va):.1f}",
+            flush=True,
+        )
+    elif args.exposure_correct and args.exposure_mode == "rate":
+        y_train_raw_ref = train_df["log_engagement_raw"].to_numpy(dtype=np.float64)
+        y_val_raw_ref = val_df["log_engagement_raw"].to_numpy(dtype=np.float64)
+        val_eff_days = val_df["exposure_eff_days"].to_numpy(dtype=np.float64)
+    if "url_domain" in train_df.columns:
+        train_df, val_df = add_domain_priors(train_df, val_df)
+    if args.account_te:
+        train_df, val_df = add_account_target_encoding(
+            train_df, val_df, prior_strength=args.account_te_prior
+        )
+        train_df = add_te_affinity_interactions(train_df)
+        val_df = add_te_affinity_interactions(val_df)
+    if args.emb_knn_te and not args.skip_embeddings:
+        train_df, val_df = add_emb_knn_target_encoding(
+            train_df,
+            val_df,
+            k=args.emb_knn_k,
+            cold_max_n=args.emb_knn_cold_max_n,
+        )
     if args.emb_pca > 0 and not args.skip_embeddings:
         train_df, val_df = apply_emb_pca(train_df, val_df, args.emb_pca)
     if args.text_svd > 0:
         train_df, val_df = apply_text_svd(train_df, val_df, args.text_svd)
 
-    residual = args.residual
+    rate_target = bool(args.exposure_correct and args.exposure_mode == "rate")
+    if args.residual is None:
+        residual = not rate_target
+    else:
+        residual = bool(args.residual)
+        if rate_target and residual:
+            print(
+                "Warning: context residual + rate target mixes units; "
+                "prefer --no-residual (the rate-mode default)",
+                flush=True,
+            )
+
     y_train_abs = train_df["log_engagement"].to_numpy(dtype=np.float64)
     y_val_abs = val_df["log_engagement"].to_numpy(dtype=np.float64)
     reply_base_val = author_baseline(val_df, "hist_replies")
     chosen_base_val = author_baseline(val_df, args.baseline)
 
-    mean_metrics = evaluate(y_val_abs, np.full(len(y_val_abs), float(y_train_abs.mean())))
-    reply_base_metrics = evaluate(y_val_abs, reply_base_val)
-    chosen_base_metrics = evaluate(y_val_abs, chosen_base_val)
-    print("Baseline (train-mean):", {k: round(v, 4) for k, v in mean_metrics.items()})
-    print("Baseline (hist_replies):", {k: round(v, 4) for k, v in reply_base_metrics.items()})
-    print(f"Baseline ({args.baseline}):", {k: round(v, 4) for k, v in chosen_base_metrics.items()})
+    # Primary metrics are in model-target space (rate when exposure-rate is on).
+    y_train_metric = y_train_abs
+    y_val_metric = y_val_abs
+    mean_metrics = evaluate(y_val_metric, np.full(len(y_val_metric), float(y_train_metric.mean())))
+    # Reply-history baselines are in a different unit than rate targets — diagnostic only.
+    reply_base_metrics = evaluate(y_val_metric, reply_base_val)
+    chosen_base_metrics = evaluate(y_val_metric, chosen_base_val)
+    print("Baseline (train-mean, target space):", {k: round(v, 4) for k, v in mean_metrics.items()})
+    if not rate_target:
+        print("Baseline (hist_replies):", {k: round(v, 4) for k, v in reply_base_metrics.items()})
+        print(f"Baseline ({args.baseline}):", {k: round(v, 4) for k, v in chosen_base_metrics.items()})
+    else:
+        print(
+            "Note: reply-history baselines skipped as primary comps under rate target "
+            f"(hist_replies rmse vs rate={reply_base_metrics['rmse_log']:.3f}, not comparable)",
+            flush=True,
+        )
     print(
         "Target:",
         "residual" if residual else "absolute",
         f"| baseline={args.baseline} | split_reply={args.split_reply} "
-        f"| nonreply_weight={args.nonreply_weight} | breakout_head={args.breakout_head}",
+        f"| nonreply_weight={args.nonreply_weight} | breakout_head={args.breakout_head} "
+        f"| exposure={args.exposure_correct}:{args.exposure_mode if args.exposure_correct else 'off'}",
     )
 
     breakout_auc = float("nan")
@@ -565,6 +1387,9 @@ def main() -> None:
             skip_embeddings=args.skip_embeddings,
             seed=args.seed,
             nonreply_weight=1.0,
+            loss=args.loss,
+            quantile_alpha=args.quantile_alpha,
+            asymmetric_under_weight=args.asymmetric_under_weight,
         )
         # Score full val with the non-reply model, then overwrite replies.
         x_val_full, _ = feature_matrix(val_df, skip_embeddings=args.skip_embeddings)
@@ -603,6 +1428,9 @@ def main() -> None:
                 skip_embeddings=args.skip_embeddings,
                 seed=args.seed + mask_val,
                 nonreply_weight=1.0 if mask_val == 0 else args.nonreply_weight,
+                loss=args.loss,
+                quantile_alpha=args.quantile_alpha,
+                asymmetric_under_weight=args.asymmetric_under_weight,
             )
             pred[val_df["is_reply"].to_numpy() == mask_val] = p
             models.append(model)
@@ -616,14 +1444,74 @@ def main() -> None:
             skip_embeddings=args.skip_embeddings,
             seed=args.seed,
             nonreply_weight=args.nonreply_weight,
+            loss=args.loss,
+            quantile_alpha=args.quantile_alpha,
+            asymmetric_under_weight=args.asymmetric_under_weight,
         )
 
-    metrics = evaluate(y_val_abs, pred)
+    # Primary prediction/label are in training-target space.
+    y_eval = y_val_abs
+    pred_primary = pred
+    metrics = evaluate(y_eval, pred_primary)
     nonreply_mask = val_df["is_reply"].to_numpy() == 0
     reply_mask = ~nonreply_mask
-    metrics["rmse_log_nonreply"] = evaluate(y_val_abs[nonreply_mask], pred[nonreply_mask])["rmse_log"]
-    metrics["rmse_log_reply"] = evaluate(y_val_abs[reply_mask], pred[reply_mask])["rmse_log"]
-    metrics["spearman_nonreply"] = evaluate(y_val_abs[nonreply_mask], pred[nonreply_mask])["spearman"]
+    metrics["rmse_log_nonreply"] = evaluate(y_eval[nonreply_mask], pred_primary[nonreply_mask])["rmse_log"]
+    metrics["rmse_log_reply"] = evaluate(y_eval[reply_mask], pred_primary[reply_mask])["rmse_log"]
+    metrics["spearman_nonreply"] = evaluate(y_eval[nonreply_mask], pred_primary[nonreply_mask])["spearman"]
+    # Under-prediction diagnostics on hot non-replies (failure mode of interest).
+    if nonreply_mask.any():
+        y_nr = y_eval[nonreply_mask]
+        p_nr = pred_primary[nonreply_mask]
+        thr = float(np.quantile(y_nr, 0.9))
+        hot = y_nr >= thr
+        if hot.any():
+            metrics["rmse_log_nonreply_top10"] = evaluate(y_nr[hot], p_nr[hot])["rmse_log"]
+            metrics["mean_underpred_nonreply_top10"] = float(np.mean(np.maximum(y_nr[hot] - p_nr[hot], 0.0)))
+            print(
+                f"Hot non-reply (top10% thr={thr:.3f}): "
+                f"rmse={metrics['rmse_log_nonreply_top10']:.4f} "
+                f"mean_underpred={metrics['mean_underpred_nonreply_top10']:.4f}",
+                flush=True,
+            )
+    # Diagnostic: decode rate → dump-total log eng (not the optimization target).
+    if args.exposure_correct and args.exposure_mode == "rate":
+        assert y_val_raw_ref is not None and val_eff_days is not None
+        pred_raw = log_rate_to_log_eng(
+            pred_primary,
+            val_eff_days,
+            beta=args.exposure_beta,
+            eps=args.exposure_eps,
+        )
+        raw_m = evaluate(y_val_raw_ref, pred_raw)
+        metrics["rmse_log_raw_dump"] = raw_m["rmse_log"]
+        metrics["spearman_raw_dump"] = raw_m["spearman"]
+        print(
+            "Diagnostic dump-total decode:",
+            {k: round(v, 4) for k, v in raw_m.items() if k in ("rmse_log", "spearman")},
+            flush=True,
+        )
+    elif args.exposure_correct and args.exposure_mode == "resid":
+        assert y_val_raw_ref is not None and val_eff_days is not None
+        pred_raw = pred_primary + exposure_resid_baseline(
+            val_eff_days, exposure_a, exposure_b, args.exposure_eps
+        )
+        raw_m = evaluate(y_val_raw_ref, pred_raw)
+        metrics["rmse_log_raw_dump"] = raw_m["rmse_log"]
+        metrics["spearman_raw_dump"] = raw_m["spearman"]
+    else:
+        metrics["rmse_log_raw_dump"] = metrics["rmse_log"]
+        metrics["spearman_raw_dump"] = metrics["spearman"]
+        pred_raw = pred_primary
+
+    metrics["exposure_correct"] = bool(args.exposure_correct)
+    metrics["exposure_mode"] = args.exposure_mode if args.exposure_correct else ""
+    metrics["exposure_cap_days"] = float(args.exposure_cap_days) if args.exposure_correct else 0.0
+    metrics["exposure_beta"] = float(args.exposure_beta) if args.exposure_correct else 0.0
+    metrics["exposure_a"] = float(exposure_a) if args.exposure_correct else 0.0
+    metrics["exposure_b"] = float(exposure_b) if args.exposure_correct else 0.0
+    metrics["target_space"] = "exposure_rate" if rate_target else (
+        "exposure_resid" if args.exposure_correct else "log_engagement"
+    )
     metrics["best_iteration"] = int(getattr(model, "best_iteration", 0) or 0)
     metrics["num_features"] = len(feature_names)
     metrics["train_rows"] = int(len(train_df))
@@ -668,16 +1556,29 @@ def main() -> None:
                 "hist_mean_replies_reply",
                 "hist_mean_replies_nonreply",
                 "days_since_last",
+                "inbound_replies",
+                "inbound_replies_per_tweet",
+                "inbound_quotes",
+                "hist_dump_mean_replies",
+                "hist_n",
             )
             if c in val_df.columns
         ]
     ].copy()
-    pred_df["y_true_log"] = y_val_abs
-    pred_df["y_pred_log"] = pred
-    pred_df["y_base_log"] = chosen_base_val if residual else np.full(len(val_df), float(y_train_abs.mean()))
-    pred_df["abs_err_log"] = np.abs(pred - y_val_abs)
-    pred_df["err_log"] = pred - y_val_abs
-    pred_df["y_pred_eng"] = np.expm1(np.clip(pred, 0, 20))
+    pred_df["y_true_log"] = y_eval
+    pred_df["y_pred_log"] = pred_primary
+    pred_df["y_base_log"] = (
+        chosen_base_val if residual else np.full(len(val_df), float(y_train_metric.mean()))
+    )
+    pred_df["abs_err_log"] = np.abs(pred_primary - y_eval)
+    pred_df["err_log"] = pred_primary - y_eval
+    if args.exposure_correct and y_val_raw_ref is not None:
+        pred_df["y_true_log_raw"] = y_val_raw_ref
+        pred_df["y_pred_log_raw"] = pred_raw
+        pred_df["exposure_eff_days"] = val_eff_days
+        pred_df["y_pred_eng"] = np.expm1(np.clip(pred_raw, 0, 20))
+    else:
+        pred_df["y_pred_eng"] = np.expm1(np.clip(pred_primary, 0, 20))
     pred_df.to_parquet(VAL_PRED_PATH, index=False)
     print(f"Wrote val predictions: {VAL_PRED_PATH}")
 
@@ -696,6 +1597,7 @@ def main() -> None:
         print(importance.to_string(index=False))
 
     print("\n---")
+    print(f"target_space: {metrics['target_space']}")
     for key in (
         "rmse_log",
         "rmse_log_nonreply",
@@ -704,10 +1606,10 @@ def main() -> None:
         "r2_log",
         "spearman",
         "spearman_nonreply",
+        "rmse_log_raw_dump",
+        "spearman_raw_dump",
         "mae_engagement",
         "baseline_rmse_log",
-        "reply_baseline_rmse_log",
-        "chosen_baseline_rmse_log",
         "breakout_auc",
         "best_iteration",
         "num_features",

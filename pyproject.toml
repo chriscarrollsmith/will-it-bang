@@ -17,4 +17,5 @@ dependencies = [
     "scipy>=1.11",
     "torch>=2.2",
     "transformers>=4.40",
+    "vadersentiment>=3.3.2",
 ]

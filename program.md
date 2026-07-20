@@ -20,15 +20,22 @@ uv run train.py
 Useful knobs:
 
 ```bash
-uv run prepare.py --max-tweets 20000 --min-history 5
-uv run train.py --val-frac 0.2
-uv run train.py --skip-embeddings   # ablation: tabular only
+uv run prepare.py --skip-media          # reuse media flags; skip slow CA API
+uv run prepare.py --parent-only         # re-join reply/quote parents only
+uv run prepare.py --urls-only           # CA expanded URL domains + text-url structure
+uv run modal run label_provoke.py --nonreply-only   # default: Qwen3-8B → provoke_cache_Qwen__*
+uv run train.py --provoke-labels --provoke-cache ~/.cache/will-it-bang/provoke_cache_Qwen__Qwen3-8B.parquet
+uv run train.py --skip-embeddings       # ablation: tabular only
 ```
 
 ## Metric
 
-Primary: **RMSE on log engagement** (`rmse_log`), plus Spearman rank correlation. A train-mean baseline is printed for context.
+Primary (default): **RMSE / Spearman on exposure-adjusted log rate**
+`log1p(eng / (min(age_days, 30) + 1))` — intensity controlling for dump maturity.  
+Diagnostic: `rmse_log_raw_dump` decodes rate predictions back to dump-total `log1p(eng)`.  
+For the older dump-total objective: `uv run train.py --no-exposure-correct --residual`.
 
-## Experiment loop (optional)
+## Experiment log
 
-After the baseline lands, iterate on `train.py` (and feature ideas in `prepare.py` when needed). Keep changes simple; avoid future leakage. Commit training code after a successful run, or roll back after a failed experiment. Always keep an experimental log.
+Curated history, current best, and the **unexplored backlog** live in [`experiments.md`](experiments.md).  
+Raw stdout goes under `logs/`; `results.tsv` is the machine-append metric table (gitignored).
