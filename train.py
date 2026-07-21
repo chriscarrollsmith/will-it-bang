@@ -231,6 +231,13 @@ def feature_matrix(df: pd.DataFrame, skip_embeddings: bool) -> tuple[np.ndarray,
     if pls_cols:
         pls_cols = sorted(pls_cols, key=lambda c: int(c.split("_", 1)[1]))
         cols = cols + pls_cols
+    fail_cols = [c for c in df.columns if c == "fail_min_dist" or re.fullmatch(r"fail_dist_\d+", c)]
+    if fail_cols:
+        fail_cols = sorted(
+            fail_cols,
+            key=lambda c: (-1 if c == "fail_min_dist" else int(c.rsplit("_", 1)[1])),
+        )
+        cols = cols + fail_cols
     if "p_breakout" in df.columns:
         cols = cols + ["p_breakout"]
     x = df[cols].to_numpy(dtype=np.float32)
@@ -632,6 +639,35 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Train-fold PLS of raw MiniLM→target; add this many pls_* dims "
         "(fit before emb PCA; 0 disables). Use with --emb-pca 0 to replace variance PCA",
+    )
+    p.add_argument(
+        "--fail-clusters",
+        action="store_true",
+        help="Cluster train OOF under-prediction MiniLM vectors; add fail_min_dist / fail_dist_*",
+    )
+    p.add_argument(
+        "--fail-clusters-k",
+        type=int,
+        default=4,
+        help="K-means centroids for --fail-clusters",
+    )
+    p.add_argument(
+        "--fail-clusters-quantile",
+        type=float,
+        default=0.1,
+        help="Top under-pred mass used as failure set (0.1 → worst 10%)",
+    )
+    p.add_argument(
+        "--fail-clusters-mode",
+        choices=("oof", "te"),
+        default="oof",
+        help="Under-pred definition: 3-fold LGBM OOF (no emb) or vs account_mean_rate",
+    )
+    p.add_argument(
+        "--fail-clusters-nonreply-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Build failure set from non-replies only (default on; still score all rows)",
     )
     p.add_argument(
         "--exposure-correct",
@@ -1272,6 +1308,157 @@ def add_emb_pls(
     return train_out, val_out
 
 
+def _train_oof_underpred(
+    train_df: pd.DataFrame,
+    *,
+    target_col: str,
+    seed: int,
+    n_splits: int = 3,
+) -> np.ndarray:
+    """3-fold OOF preds from a light LGBM on leakage-safe tabular+TE features (no emb)."""
+    from sklearn.model_selection import KFold
+
+    feat_cols = [
+        c
+        for c in (
+            TABULAR_FEATURES
+            + ACCOUNT_TE_FEATURES
+            + EMB_KNN_TE_FEATURES
+            + URL_DOMAIN_FEATURES
+        )
+        if c in train_df.columns
+    ]
+    if not feat_cols:
+        raise ValueError("No tabular/TE features available for fail-cluster OOF")
+    x = train_df[feat_cols].to_numpy(dtype=np.float32)
+    y = train_df[target_col].to_numpy(dtype=np.float64)
+    oof = np.full(len(train_df), np.nan, dtype=np.float64)
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    params = {
+        "objective": "regression",
+        "metric": "rmse",
+        "learning_rate": 0.05,
+        "num_leaves": 31,
+        "feature_fraction": 0.8,
+        "bagging_fraction": 0.8,
+        "bagging_freq": 1,
+        "verbosity": -1,
+        "seed": seed,
+    }
+    for fold, (tr_ix, va_ix) in enumerate(kf.split(x)):
+        dtr = lgb.Dataset(x[tr_ix], label=y[tr_ix], feature_name=feat_cols)
+        dva = lgb.Dataset(x[va_ix], label=y[va_ix], reference=dtr, feature_name=feat_cols)
+        model = lgb.train(
+            params,
+            dtr,
+            num_boost_round=200,
+            valid_sets=[dva],
+            callbacks=[lgb.early_stopping(30, verbose=False), lgb.log_evaluation(0)],
+        )
+        oof[va_ix] = model.predict(x[va_ix], num_iteration=model.best_iteration)
+    if np.isnan(oof).any():
+        oof = np.where(np.isnan(oof), float(np.nanmean(oof)), oof)
+    return oof
+
+
+def add_fail_clusters(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    *,
+    n_clusters: int = 4,
+    quantile: float = 0.1,
+    mode: str = "oof",
+    nonreply_only: bool = True,
+    target_col: str = "log_engagement",
+    seed: int = 42,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Cluster MiniLM of large train under-predictions; distance-to-centroid features.
+
+    OOF mode fits a light LGBM without embeddings so residual failures are the
+    content-shaped slice the final model still misses (esp. hot non-replies).
+    """
+    from sklearn.cluster import KMeans
+
+    emb_cols = [c for c in train_df.columns if re.fullmatch(r"emb_\d+", c)]
+    if not emb_cols:
+        print("Skipping fail clusters (no emb_* columns)", flush=True)
+        return train_df, val_df
+    emb_cols = sorted(emb_cols, key=lambda c: int(c.split("_", 1)[1]))
+    q = float(np.clip(quantile, 0.01, 0.5))
+    k = max(1, int(n_clusters))
+
+    train_out = train_df.reset_index(drop=True).copy()
+    val_out = val_df.reset_index(drop=True).copy()
+    y = train_out[target_col].to_numpy(dtype=np.float64)
+
+    if mode == "te":
+        if "account_mean_rate" not in train_out.columns:
+            print("Skipping fail clusters (no account_mean_rate for te mode)", flush=True)
+            return train_df, val_df
+        pred = train_out["account_mean_rate"].to_numpy(dtype=np.float64)
+    else:
+        pred = _train_oof_underpred(train_out, target_col=target_col, seed=seed)
+    under = y - pred
+
+    cand = np.ones(len(train_out), dtype=bool)
+    if nonreply_only and "is_reply" in train_out.columns:
+        cand &= train_out["is_reply"].to_numpy(dtype=np.float64) < 0.5
+    if cand.sum() < 50:
+        print("Skipping fail clusters (too few candidate rows)", flush=True)
+        return train_df, val_df
+    thr = float(np.quantile(under[cand], 1.0 - q))
+    fail_mask = cand & (under >= thr)
+    n_fail = int(fail_mask.sum())
+    if n_fail < max(10, k):
+        print(f"Skipping fail clusters (only {n_fail} failure rows)", flush=True)
+        return train_df, val_df
+
+    def _l2_normalize(x: np.ndarray) -> np.ndarray:
+        n = np.linalg.norm(x, axis=1, keepdims=True)
+        return x / np.maximum(n, 1e-12)
+
+    x_fail = _l2_normalize(train_out.loc[fail_mask, emb_cols].to_numpy(dtype=np.float64))
+    kk = min(k, n_fail)
+    km = KMeans(n_clusters=kk, random_state=seed, n_init=10)
+    km.fit(x_fail)
+    centers = km.cluster_centers_
+
+    def _attach(df: pd.DataFrame) -> pd.DataFrame:
+        x = _l2_normalize(df[emb_cols].to_numpy(dtype=np.float64))
+        # Squared euclidean on unit vectors ↔ 2-2cos; report euclidean dist.
+        # (n, k): ||x - c||^2 = 2 - 2 x·c for unit x,c
+        sims = x @ centers.T
+        dists = np.sqrt(np.maximum(2.0 - 2.0 * sims, 0.0))
+        out = df
+        out["fail_min_dist"] = dists.min(axis=1).astype(np.float32)
+        for i in range(dists.shape[1]):
+            out[f"fail_dist_{i}"] = dists[:, i].astype(np.float32)
+        return out
+
+    train_out = _attach(train_out)
+    val_out = _attach(val_out)
+
+    corr = (
+        float(np.corrcoef(train_out["fail_min_dist"].to_numpy(), y)[0, 1])
+        if len(y) > 2
+        else float("nan")
+    )
+    corr_u = (
+        float(np.corrcoef(train_out["fail_min_dist"].to_numpy(), under)[0, 1])
+        if len(y) > 2
+        else float("nan")
+    )
+    oof_rmse = float(np.sqrt(np.mean((y - pred) ** 2)))
+    print(
+        f"Fail clusters: mode={mode} k={kk} q={q:g} nonreply_only={nonreply_only} "
+        f"n_fail={n_fail:,} thr_under={thr:.4f} oof_rmse={oof_rmse:.4f} "
+        f"corr(min_dist,y)={corr:.4f} corr(min_dist,under)={corr_u:.4f} "
+        f"val min_dist p50={float(val_out['fail_min_dist'].median()):.4f}",
+        flush=True,
+    )
+    return train_out, val_out
+
+
 def apply_emb_pca(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
@@ -1480,6 +1667,17 @@ def main() -> None:
     if args.emb_pls > 0 and not args.skip_embeddings:
         # Fit on raw MiniLM before train-fit PCA replaces emb_*.
         train_df, val_df = add_emb_pls(train_df, val_df, args.emb_pls)
+    if args.fail_clusters and not args.skip_embeddings:
+        # Cluster raw MiniLM of OOF under-preds before emb PCA replaces emb_*.
+        train_df, val_df = add_fail_clusters(
+            train_df,
+            val_df,
+            n_clusters=args.fail_clusters_k,
+            quantile=args.fail_clusters_quantile,
+            mode=args.fail_clusters_mode,
+            nonreply_only=args.fail_clusters_nonreply_only,
+            seed=args.seed,
+        )
     if args.emb_pca > 0 and not args.skip_embeddings:
         train_df, val_df = apply_emb_pca(train_df, val_df, args.emb_pca)
     if args.text_svd > 0:

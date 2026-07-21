@@ -54,6 +54,8 @@ Dump-time fav/RT used as author history → optimistic RMSE ~0.82 (v5). Invalid 
 | v23b | 0.613 (rate) | 0.457 | Emb engagement CAV (`μ_hot−μ_cold`, non-reply decile, pre-PCA): train corr(proj,y)=0.143, `emb_cav_proj` mid-gain; **flat / slightly worse** vs v23a; hot NR under-pred 2.22→2.23; leave `--emb-cav` off |
 | v24a | 0.611 (rate) | 0.452 | Emb PLS-8 beside PCA: train corr(pls_0,y)=0.168, `pls_0`/`pls_1` mid-gain; **flat** vs v23a 0.610; hot NR under-pred unchanged (~2.22) |
 | v24b | 0.612 (rate) | 0.448 | Emb PLS-32 **replace** PCA: **flat / slightly worse**; more dims do not help; leave `--emb-pls` off |
+| v25a | 0.611 (rate) | 0.459 | Error-driven fail clusters (OOF emb-free LGBM → k=4 MiniLM): corr(min_dist,y)=−0.04; **flat** vs v23a 0.610; hot NR under-pred unchanged (~2.21); `fail_*` not in top gains; leave `--fail-clusters` off |
+| v25b | 0.612 (rate) | 0.455 | Fail clusters on TE residual: **flat / slightly worse** (0.612); same conclusion |
 
 ## Failure modes (still open)
 
@@ -123,7 +125,7 @@ Cheap first bets (smoke: train-fold corr of 1–8 derived dims vs rate; then ful
 
 Heavier / researchy:
 - [ ] Residual emb after regressing out account TE / reply baseline, then redo direction or PLS (isolates *content* signal from account heat)
-- [ ] Error-driven clusters: cluster only large under-predictions on train OOF; use distance-to-failure-centroid as a feature (mechanism research for hot non-replies)
+- [x] Error-driven clusters: — **v25a/b: flat** (OOF 0.611 / TE 0.612 vs 0.610); failure MiniLM geometry too weak vs account TE + knn; `--fail-clusters` stays opt-in
 - [ ] Supervised manifold (UMAP on RF-leaf similarity, etc.) — usually for analysis, not tabular features; only promote if a cheap projection beats PLS
 
 ### Modeling
