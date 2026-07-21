@@ -52,6 +52,8 @@ Dump-time fav/RT used as author history → optimistic RMSE ~0.82 (v5). Invalid 
 | v22b | **0.606** (rate) | 0.440 | Emb kNN TE (PCA fix): **tiny lift** vs v20a 0.607; `te_minus_knn` / `emb_knn_mean_rate` high gain; hot non-reply under-pred unchanged (~2.24); default on |
 | v23a | 0.610 (rate) | 0.460 | Same-rebuild baseline (`prepare --skip-media`, 0% media flags): fair control for v23b; RMSE slightly above v22b (media gap) |
 | v23b | 0.613 (rate) | 0.457 | Emb engagement CAV (`μ_hot−μ_cold`, non-reply decile, pre-PCA): train corr(proj,y)=0.143, `emb_cav_proj` mid-gain; **flat / slightly worse** vs v23a; hot NR under-pred 2.22→2.23; leave `--emb-cav` off |
+| v24a | 0.611 (rate) | 0.452 | Emb PLS-8 beside PCA: train corr(pls_0,y)=0.168, `pls_0`/`pls_1` mid-gain; **flat** vs v23a 0.610; hot NR under-pred unchanged (~2.22) |
+| v24b | 0.612 (rate) | 0.448 | Emb PLS-32 **replace** PCA: **flat / slightly worse**; more dims do not help; leave `--emb-pls` off |
 
 ## Failure modes (still open)
 
@@ -116,8 +118,8 @@ Discover engagement-related structure in MiniLM (or a larger frozen encoder) fro
 
 Cheap first bets (smoke: train-fold corr of 1–8 derived dims vs rate; then full train):
 - [x] **Engagement direction / difference-of-means CAV:** — **v23b: flat / slightly worse** (0.613 vs v23a 0.610); train corr 0.14 but redundant with emb PCA + knn TE; `--emb-cav` stays opt-in
-- [ ] **PLS / CCA / supervised linear projection:** Partial Least Squares (or CCA) of `emb → rate` on train; keep first *k* components instead of / beside variance-PCA — closest to “PCA that maximizes engagement separation” (next if revisiting emb discovery; CAV’s single axis was too weak)
-- [ ] **Cluster TE:** k-means / spherical k-means on train MiniLM; train-fold LOO mean rate by cluster (+ soft membership or distance-to-centroid); related: cluster→mean-popularity anchors in social popularity work (e.g. AMCFG-style clustering, arXiv:2507.19863)
+- [x] **PLS supervised linear projection:** — **v24a** PLS-8 beside PCA: flat (0.611 vs 0.610); **v24b** PLS-32 replace PCA: flat/worse (0.612); train corr 0.17 + mid-gain but no holdout lift; `--emb-pls` stays opt-in. Linear emb→rate axis family exhausted for now
+- [ ] **Cluster TE:** k-means / spherical k-means on train MiniLM; train-fold LOO mean rate by cluster (+ soft membership or distance-to-centroid); related: cluster→mean-popularity anchors in social popularity work (e.g. AMCFG-style clustering, arXiv:2507.19863) — next emb-discovery bet (non-linear partition)
 
 Heavier / researchy:
 - [ ] Residual emb after regressing out account TE / reply baseline, then redo direction or PLS (isolates *content* signal from account heat)
