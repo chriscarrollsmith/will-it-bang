@@ -56,6 +56,8 @@ Dump-time fav/RT used as author history → optimistic RMSE ~0.82 (v5). Invalid 
 | v24b | 0.612 (rate) | 0.448 | Emb PLS-32 **replace** PCA: **flat / slightly worse**; more dims do not help; leave `--emb-pls` off |
 | v25a | 0.611 (rate) | 0.459 | Error-driven fail clusters (OOF emb-free LGBM → k=4 MiniLM): corr(min_dist,y)=−0.04; **flat** vs v23a 0.610; hot NR under-pred unchanged (~2.21); `fail_*` not in top gains; leave `--fail-clusters` off |
 | v25b | 0.612 (rate) | 0.455 | Fail clusters on TE residual: **flat / slightly worse** (0.612); same conclusion |
+| v26a | 0.624 (rate) | 0.437 | Emb cluster TE k=32: train corr 0.16, `cluster_mean_rate` #3 gain; **regress** vs v23a 0.610; hot NR under-pred worse (2.29); leave `--emb-cluster-te` off |
+| v26b | 0.616 (rate) | 0.444 | Emb cluster TE k=64: **still worse** (0.616); coarser k hurts less but no lift |
 
 ## Failure modes (still open)
 
@@ -121,7 +123,7 @@ Discover engagement-related structure in MiniLM (or a larger frozen encoder) fro
 Cheap first bets (smoke: train-fold corr of 1–8 derived dims vs rate; then full train):
 - [x] **Engagement direction / difference-of-means CAV:** — **v23b: flat / slightly worse** (0.613 vs v23a 0.610); train corr 0.14 but redundant with emb PCA + knn TE; `--emb-cav` stays opt-in
 - [x] **PLS supervised linear projection:** — **v24a** PLS-8 beside PCA: flat (0.611 vs 0.610); **v24b** PLS-32 replace PCA: flat/worse (0.612); train corr 0.17 + mid-gain but no holdout lift; `--emb-pls` stays opt-in. Linear emb→rate axis family exhausted for now
-- [ ] **Cluster TE:** k-means / spherical k-means on train MiniLM; train-fold LOO mean rate by cluster (+ soft membership or distance-to-centroid); related: cluster→mean-popularity anchors in social popularity work (e.g. AMCFG-style clustering, arXiv:2507.19863) — next emb-discovery bet (non-linear partition)
+- [x] **Cluster TE:** — **v26a/b: regress** (k=32 → 0.624, k=64 → 0.616 vs 0.610); high train corr/gain but fights account TE on holdout; `--emb-cluster-te` stays opt-in. Cheap emb-discovery lane exhausted
 
 Heavier / researchy:
 - [ ] Residual emb after regressing out account TE / reply baseline, then redo direction or PLS (isolates *content* signal from account heat)

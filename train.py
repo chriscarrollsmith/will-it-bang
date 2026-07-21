@@ -180,6 +180,15 @@ EMB_CAV_FEATURES = [
     "emb_cav_proj_sq",
 ]
 
+# Train-fold MiniLM k-means cluster target encoding (content neighborhoods).
+EMB_CLUSTER_TE_FEATURES = [
+    "cluster_mean_rate",
+    "log_cluster_n",
+    "cluster_min_dist",
+    "te_minus_cluster",
+    "knn_minus_cluster",
+]
+
 # Added when --author-emb-affinity is set (flat alone in v10).
 AFFINITY_FEATURES = [
     "author_emb_cos",
@@ -211,6 +220,7 @@ def feature_matrix(df: pd.DataFrame, skip_embeddings: bool) -> tuple[np.ndarray,
             + ACCOUNT_TE_FEATURES
             + EMB_KNN_TE_FEATURES
             + EMB_CAV_FEATURES
+            + EMB_CLUSTER_TE_FEATURES
         )
         if c in df.columns
     ]
@@ -668,6 +678,23 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Build failure set from non-replies only (default on; still score all rows)",
+    )
+    p.add_argument(
+        "--emb-cluster-te",
+        action="store_true",
+        help="Train-fold MiniLM k-means + smoothed cluster mean rate (fit before emb PCA)",
+    )
+    p.add_argument(
+        "--emb-cluster-k",
+        type=int,
+        default=32,
+        help="K-means clusters for --emb-cluster-te",
+    )
+    p.add_argument(
+        "--emb-cluster-te-prior",
+        type=float,
+        default=20.0,
+        help="Shrinkage strength toward global mean for --emb-cluster-te",
     )
     p.add_argument(
         "--exposure-correct",
@@ -1459,6 +1486,104 @@ def add_fail_clusters(
     return train_out, val_out
 
 
+def add_emb_cluster_te(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    *,
+    n_clusters: int = 32,
+    prior_strength: float = 20.0,
+    target_col: str = "log_engagement",
+    seed: int = 42,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """K-means on train MiniLM; smoothed LOO mean target by cluster + dist-to-centroid."""
+    from sklearn.cluster import MiniBatchKMeans
+
+    emb_cols = [c for c in train_df.columns if re.fullmatch(r"emb_\d+", c)]
+    if not emb_cols:
+        print("Skipping emb cluster TE (no emb_* columns)", flush=True)
+        return train_df, val_df
+    emb_cols = sorted(emb_cols, key=lambda c: int(c.split("_", 1)[1]))
+    k = max(2, min(int(n_clusters), len(train_df) // 20))
+    m = float(prior_strength)
+
+    train_out = train_df.reset_index(drop=True).copy()
+    val_out = val_df.reset_index(drop=True).copy()
+    y = train_out[target_col].to_numpy(dtype=np.float64)
+    global_mean = float(np.mean(y))
+
+    def _l2_normalize(x: np.ndarray) -> np.ndarray:
+        n = np.linalg.norm(x, axis=1, keepdims=True)
+        return x / np.maximum(n, 1e-12)
+
+    x_tr = _l2_normalize(train_out[emb_cols].to_numpy(dtype=np.float64))
+    x_va = _l2_normalize(val_out[emb_cols].to_numpy(dtype=np.float64))
+
+    km = MiniBatchKMeans(
+        n_clusters=k,
+        random_state=seed,
+        batch_size=min(4096, len(train_out)),
+        n_init=3,
+        max_iter=100,
+    )
+    labels_tr = km.fit_predict(x_tr)
+    labels_va = km.predict(x_va)
+    centers = km.cluster_centers_
+
+    # Per-cluster sums/counts on train.
+    sums = np.bincount(labels_tr, weights=y, minlength=k).astype(np.float64)
+    counts = np.bincount(labels_tr, minlength=k).astype(np.float64)
+    means = np.where(counts > 0, sums / np.maximum(counts, 1.0), global_mean)
+
+    # Train: leave-one-out cluster mean, then shrink.
+    n_i = counts[labels_tr]
+    s_i = sums[labels_tr]
+    loo = np.where(n_i > 1.0, (s_i - y) / (n_i - 1.0), global_mean)
+    n_loo = np.maximum(n_i - 1.0, 0.0)
+    te_tr = (n_loo * loo + m * global_mean) / (n_loo + m)
+
+    # Val: full train cluster mean + same shrink; empty → global.
+    n_va = counts[labels_va]
+    mean_va = means[labels_va]
+    te_va = (n_va * mean_va + m * global_mean) / (n_va + m)
+
+    dist_tr = np.linalg.norm(x_tr - centers[labels_tr], axis=1)
+    dist_va = np.linalg.norm(x_va - centers[labels_va], axis=1)
+
+    train_out["cluster_mean_rate"] = te_tr.astype(np.float32)
+    train_out["log_cluster_n"] = np.log1p(n_i).astype(np.float32)
+    train_out["cluster_min_dist"] = dist_tr.astype(np.float32)
+    val_out["cluster_mean_rate"] = te_va.astype(np.float32)
+    val_out["log_cluster_n"] = np.log1p(n_va).astype(np.float32)
+    val_out["cluster_min_dist"] = dist_va.astype(np.float32)
+
+    if "account_mean_rate" in train_out.columns:
+        train_out["te_minus_cluster"] = (
+            train_out["account_mean_rate"].to_numpy(dtype=np.float64) - te_tr
+        ).astype(np.float32)
+        val_out["te_minus_cluster"] = (
+            val_out["account_mean_rate"].to_numpy(dtype=np.float64) - te_va
+        ).astype(np.float32)
+    if "emb_knn_mean_rate" in train_out.columns:
+        train_out["knn_minus_cluster"] = (
+            train_out["emb_knn_mean_rate"].to_numpy(dtype=np.float64) - te_tr
+        ).astype(np.float32)
+        val_out["knn_minus_cluster"] = (
+            val_out["emb_knn_mean_rate"].to_numpy(dtype=np.float64) - te_va
+        ).astype(np.float32)
+
+    corr = float(np.corrcoef(te_tr, y)[0, 1]) if len(y) > 2 else float("nan")
+    nonempty = int((counts > 0).sum())
+    print(
+        f"Emb cluster TE: k={k} prior_m={m:g} nonempty={nonempty} "
+        f"size p50={float(np.median(counts[counts > 0])):.0f} "
+        f"train corr(cluster_te,y)={corr:.4f} "
+        f"val te p50={float(np.median(te_va)):.4f} "
+        f"val dist p50={float(np.median(dist_va)):.4f}",
+        flush=True,
+    )
+    return train_out, val_out
+
+
 def apply_emb_pca(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
@@ -1676,6 +1801,15 @@ def main() -> None:
             quantile=args.fail_clusters_quantile,
             mode=args.fail_clusters_mode,
             nonreply_only=args.fail_clusters_nonreply_only,
+            seed=args.seed,
+        )
+    if args.emb_cluster_te and not args.skip_embeddings:
+        # Fit on raw MiniLM before train-fit PCA replaces emb_*.
+        train_df, val_df = add_emb_cluster_te(
+            train_df,
+            val_df,
+            n_clusters=args.emb_cluster_k,
+            prior_strength=args.emb_cluster_te_prior,
             seed=args.seed,
         )
     if args.emb_pca > 0 and not args.skip_embeddings:
