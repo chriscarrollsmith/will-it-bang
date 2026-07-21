@@ -123,7 +123,7 @@ Discover engagement-related structure in MiniLM (or a larger frozen encoder) fro
 Cheap first bets (smoke: train-fold corr of 1–8 derived dims vs rate; then full train):
 - [x] **Engagement direction / difference-of-means CAV:** — **v23b: flat / slightly worse** (0.613 vs v23a 0.610); train corr 0.14 but redundant with emb PCA + knn TE; `--emb-cav` stays opt-in
 - [x] **PLS supervised linear projection:** — **v24a** PLS-8 beside PCA: flat (0.611 vs 0.610); **v24b** PLS-32 replace PCA: flat/worse (0.612); train corr 0.17 + mid-gain but no holdout lift; `--emb-pls` stays opt-in. Linear emb→rate axis family exhausted for now
-- [ ] **Cluster TE:** k-means / spherical k-means on train MiniLM; train-fold LOO mean rate by cluster (+ soft membership or distance-to-centroid); related: cluster→mean-popularity anchors in social popularity work (e.g. AMCFG-style clustering, arXiv:2507.19863) — next emb-discovery bet (non-linear partition)
+- [x] **Cluster TE:** — **v26a/b: regress** (k=32 → 0.624, k=64 → 0.616 vs 0.610); high train corr/gain but fights account TE on holdout; `--emb-cluster-te` stays opt-in. Cheap emb-discovery lane exhausted
 
 Heavier / researchy:
 - [ ] Residual emb after regressing out account TE / reply baseline, then redo direction or PLS (isolates *content* signal from account heat)
