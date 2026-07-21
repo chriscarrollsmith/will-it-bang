@@ -1,9 +1,12 @@
 # Experiment log
 
-Two scoreboards (both time holdout, honest / leakage-safe):
+Train/eval target (time holdout, honest / leakage-safe):
 
 1. **Exposure rate (default):** `log1p(eng / (min(age_days, 30) + 1))` — intensity controlling for dump maturity.  
 2. **Dump total (legacy):** `log1p(eng)` — `--no-exposure-correct --residual`.
+
+**Primary metric (locked):** `spearman_nonreply` — rank draft standalone posts.  
+**Guardrails:** overall Spearman, rate RMSE, `mean_underpred_nonreply_top10` (don’t give up much hot-tail calibration vs asymmetric).
 
 Raw run stdout lives in `logs/`; machine-append metrics in `results.tsv` (gitignored).  
 Process retrospective (what moved the scoreboard vs what burned cycles): [`logs/meta_process.md`](logs/meta_process.md).
@@ -12,11 +15,12 @@ Process retrospective (what moved the scoreboard vs what burned cycles): [`logs/
 
 ## Current best
 
-| Objective | Run | rmse_log | spearman | train / val | Notes |
-|---|---|---:|---:|---|---|
-| **Exposure rate** | **v28b** | **0.590** | 0.409 | 88k / 22k | SERA relevance-weighted MSE (default); same-rebuild vs asymmetric 0.610 |
-| Exposure rate (prior) | v22b | 0.606 | 0.440 | 88k / 22k | Emb kNN TE + asymmetric + account TE; ~9% media (not skip-media) |
-| Dump total | v13 | 0.967 | 0.548 | 88k / 22k | Graph + parent + scale + time regimes |
+| Objective | Run | spearman_nr | spearman | rmse_log | train / val | Notes |
+|---|---|---:|---:|---:|---|---|
+| **Rate / rank (default stack)** | **v28a** | **0.508** | 0.460 | 0.610 | 88k / 22k | Asymmetric + account TE + emb kNN TE; same-rebuild control |
+| Rate / magnitude (opt-in SERA) | v28b | 0.474 | 0.409 | **0.590** | 88k / 22k | Better RMSE + hot-NR under-pred; worse ranking — keep `--loss sera` opt-in |
+| Rate (media-rich prior) | v22b | — | 0.440 | 0.606 | 88k / 22k | ~9% media; not skip-media comparable |
+| Dump total | v13 | — | 0.548 | 0.967 | 88k / 22k | Graph + parent + scale + time regimes |
 
 Rebuild: `uv run prepare.py --skip-media` (defaults are the v12 scale knobs).  
 Train: `uv run train.py --description "…"`.
@@ -65,7 +69,8 @@ Dump-time fav/RT used as author history → optimistic RMSE ~0.82 (v5). Invalid 
 | v27c | 0.653 (rate) | 0.376 | GPBoost account RE (`--model gpboost`, no TE, mse): **regress** vs v27b (−0.040) and vs v27a2 (−0.011); RE σ²≈0.010; early-stop @26; hot NR under-pred worse (2.38); leave `--model gpboost` opt-in, LGBM+TE default |
 | v27d | 0.640 (rate) | 0.344 | GPBoost RE **plus** account TE: ≈ loss-matched floor on RMSE, Spearman collapses; double-counting does not help |
 | v28a | 0.610 (rate) | 0.460 | Same-rebuild asymmetric control (`prepare --skip-media`); hot NR under-pred 2.22 |
-| v28b | **0.590** (rate) | 0.409 | SERA (`--loss sera`, floor=0.05, high-only): **RMSE lift** vs v28a (−0.020); hot NR under-pred 2.22→2.04; Spearman −0.051; mean_φ≈0.05; **new default** |
+| v28b | **0.590** (rate) | 0.409 | SERA (`--loss sera`, floor=0.05, high-only): **RMSE lift** vs v28a (−0.020); hot NR under-pred 2.22→2.04; Spearman 0.460→0.409 / NR 0.508→0.474 — keep **opt-in** (rank primary) |
+| v28d | — | — | Policy: lock primary = `spearman_nonreply`; revert default loss to asymmetric; SERA stays `--loss sera` |
 | v28c | 0.642 (rate) | 0.462 | MSE floor: worse RMSE + worse under-pred (2.36) — SERA lift is not “just mse” |
 
 ## Failure modes (still open)
@@ -140,8 +145,9 @@ Heavier / researchy:
 - [ ] Supervised manifold (UMAP on RF-leaf similarity, etc.) — usually for analysis, not tabular features; only promote if a cheap projection beats PLS
 
 ### Modeling
-- [x] Quantile / pinball or underprediction-asymmetric loss — **v20a asymmetric: 0.639→0.607 rate RMSE**; **v20b quantile α=0.65: worse RMSE** (0.647), slight Spearman lift; asymmetric superseded as default by v28b SERA
-- [x] SERA / relevance-weighted extreme loss — **v28b: 0.610→0.590** vs asymmetric same-rebuild; hot NR under-pred 2.22→2.04; Spearman 0.460→0.409; default on (`--loss asymmetric` to ablate)
+- [x] Quantile / pinball or underprediction-asymmetric loss — **v20a asymmetric: 0.639→0.607 rate RMSE** (default); **v20b quantile α=0.65: worse RMSE** (0.647), slight Spearman lift
+- [x] SERA / relevance-weighted extreme loss — **v28b: RMSE 0.610→0.590**, hot NR under-pred 2.22→2.04, but Spearman_nr 0.508→0.474; **opt-in only** once primary locked to non-reply ranking (`--loss sera`)
+- [ ] Rank-oriented training for non-replies (pairwise / listwise / early-stop on Spearman) — next family under rank primary; guardrail hot-NR under-pred vs asymmetric
 - [ ] Larger frozen encoder (Modal credits) vs MiniLM
 - [ ] Further scale (>120k / more accounts with lower `min-account-tweets`)
 - [x] Account-level **target encoding** (train-fold LOO, leakage-safe) — **v19: 0.642 → 0.639 rate RMSE**, Spearman 0.441→0.452; default on (`--no-account-te` to ablate)

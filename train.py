@@ -411,7 +411,7 @@ def train_model(
     seed: int,
     weight_train: np.ndarray | None = None,
     *,
-    loss: str = "sera",
+    loss: str = "asymmetric",
     quantile_alpha: float = 0.65,
     asymmetric_under_weight: float = 3.0,
     sera_floor: float = 0.05,
@@ -894,9 +894,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--loss",
         choices=("huber", "mse", "quantile", "asymmetric", "sera"),
-        default="sera",
-        help="Regression objective (default sera = relevance-weighted MSE for extremes; "
-        "asymmetric upweights under-prediction)",
+        default="asymmetric",
+        help="Regression objective (default asymmetric upweights under-prediction; "
+        "sera = relevance-weighted MSE for extremes)",
     )
     p.add_argument(
         "--quantile-alpha",
@@ -1983,7 +1983,7 @@ def fit_predict_group(
     skip_embeddings: bool,
     seed: int,
     nonreply_weight: float = 1.0,
-    loss: str = "sera",
+    loss: str = "asymmetric",
     quantile_alpha: float = 0.65,
     asymmetric_under_weight: float = 3.0,
     sera_floor: float = 0.05,
@@ -2487,14 +2487,16 @@ def main() -> None:
     print("\n---")
     print(f"target_space: {metrics['target_space']}")
     print(f"model: {metrics['model']} | account_te: {metrics['account_te']} | loss: {metrics['loss']}")
+    print("primary_metric: spearman_nonreply (draft ranking); guardrails: spearman, rmse_log, mean_underpred_nonreply_top10")
     for key in (
+        "spearman_nonreply",
+        "spearman",
         "rmse_log",
+        "mean_underpred_nonreply_top10",
         "rmse_log_nonreply",
         "rmse_log_reply",
         "mae_log",
         "r2_log",
-        "spearman",
-        "spearman_nonreply",
         "rmse_log_raw_dump",
         "spearman_raw_dump",
         "mae_engagement",
@@ -2509,7 +2511,6 @@ def main() -> None:
         "gpboost_re_var",
         "gpboost_error_var",
         "gpboost_n_cold_val_groups",
-        "mean_underpred_nonreply_top10",
         "seconds",
     ):
         if key in metrics:
