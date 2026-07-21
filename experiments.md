@@ -58,6 +58,11 @@ Dump-time fav/RT used as author history → optimistic RMSE ~0.82 (v5). Invalid 
 | v25b | 0.612 (rate) | 0.455 | Fail clusters on TE residual: **flat / slightly worse** (0.612); same conclusion |
 | v26a | 0.624 (rate) | 0.437 | Emb cluster TE k=32: train corr 0.16, `cluster_mean_rate` #3 gain; **regress** vs v23a 0.610; hot NR under-pred worse (2.29); leave `--emb-cluster-te` off |
 | v26b | 0.616 (rate) | 0.444 | Emb cluster TE k=64: **still worse** (0.616); coarser k hurts less but no lift |
+| v27b | 0.613 (rate) | 0.457 | Same-rebuild LGBM+account-TE+asymmetric control (`prepare --skip-media`, 0% media); hot NR under-pred 2.23 |
+| v27a | 0.613 (rate) | 0.431 | LGBM `--no-account-te` (asymmetric): **flat RMSE** vs v27b; Spearman −0.026 — TE mainly helps rank |
+| v27a2 | 0.642 (rate) | 0.434 | LGBM `--no-account-te --loss mse`: loss-matched floor for GPBoost; asymmetric→mse costs ~0.029 RMSE |
+| v27c | 0.653 (rate) | 0.376 | GPBoost account RE (`--model gpboost`, no TE, mse): **regress** vs v27b (−0.040) and vs v27a2 (−0.011); RE σ²≈0.010; early-stop @26; hot NR under-pred worse (2.38); leave `--model gpboost` opt-in, LGBM+TE default |
+| v27d | 0.640 (rate) | 0.344 | GPBoost RE **plus** account TE: ≈ loss-matched floor on RMSE, Spearman collapses; double-counting does not help |
 
 ## Failure modes (still open)
 
@@ -135,7 +140,7 @@ Heavier / researchy:
 - [ ] Larger frozen encoder (Modal credits) vs MiniLM
 - [ ] Further scale (>120k / more accounts with lower `min-account-tweets`)
 - [x] Account-level **target encoding** (train-fold LOO, leakage-safe) — **v19: 0.642 → 0.639 rate RMSE**, Spearman 0.441→0.452; default on (`--no-account-te` to ablate)
-- [ ] **Queued v27:** true account **random effects** via GPBoost (joint RE + trees; Apache-2.0) — replaces/ablates LOO TE; lit: Sigrist GPBoost / high-cardinality RE vs TE ([PRO-7](https://linear.app/promptly-technologies-llc/issue/PRO-7/v27-gpboost-account-random-effects-replace-loo-account-te); [pointer](issues/LINEAR_v27_gpboost_account_re.md))
+- [x] True account **random effects** via GPBoost — **v27c: regress** (0.653 vs v27b 0.613; also worse than mse floor 0.642); custom asymmetric loss unsupported with `gp_model`; RE variance tiny on full stack; keep `--model gpboost` opt-in only ([PRO-7](https://linear.app/promptly-technologies-llc/issue/PRO-7/v27-gpboost-account-random-effects-replace-loo-account-te); [pointer](issues/LINEAR_v27_gpboost_account_re.md))
 - [x] Emb kNN train-fold TE (content prior for cold-start accounts) — **v22b: 0.607 → 0.606**; default on (`--no-emb-knn-te` to ablate); PCA must only transform `emb_\d+`
 
 ### Tried — do not re-litigate without a new angle
