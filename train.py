@@ -402,6 +402,27 @@ def apply_sera_sample_weights(
     return base * sera_w, meta
 
 
+def _spearman_nonreply_feval(is_nonreply: np.ndarray):
+    """LightGBM feval: Spearman on val non-replies (higher is better)."""
+    mask = np.asarray(is_nonreply, dtype=bool)
+
+    def feval(y_pred: np.ndarray, dataset: lgb.Dataset):
+        y_true = np.asarray(dataset.get_label(), dtype=np.float64)
+        pred = np.asarray(y_pred, dtype=np.float64)
+        if mask.shape[0] != y_true.shape[0]:
+            raise ValueError(
+                f"spearman_nonreply feval mask length {mask.shape[0]} != val {y_true.shape[0]}"
+            )
+        if not mask.any():
+            return "spearman_nonreply", 0.0, True
+        corr = spearmanr(y_true[mask], pred[mask]).correlation
+        if corr != corr:  # NaN
+            corr = 0.0
+        return "spearman_nonreply", float(corr), True
+
+    return feval
+
+
 def train_model(
     x_train: np.ndarray,
     y_train: np.ndarray,
@@ -416,6 +437,8 @@ def train_model(
     asymmetric_under_weight: float = 3.0,
     sera_floor: float = 0.05,
     sera_high_only: bool = True,
+    early_stop_metric: str = "rmse",
+    val_is_nonreply: np.ndarray | None = None,
 ) -> tuple[lgb.Booster, dict[str, float]]:
     sera_meta: dict[str, float] = {}
     effective_weight = weight_train
@@ -445,7 +468,6 @@ def train_model(
     )
     val_set = lgb.Dataset(x_val, label=y_val, reference=train_set, feature_name=feature_names)
     params: dict = {
-        "metric": "rmse",
         "learning_rate": 0.04,
         "num_leaves": 47,
         "min_data_in_leaf": 50,
@@ -456,6 +478,18 @@ def train_model(
         "verbosity": -1,
         "seed": seed,
     }
+    feval = None
+    if early_stop_metric == "spearman_nonreply":
+        if val_is_nonreply is None:
+            raise ValueError("early_stop_metric=spearman_nonreply requires val_is_nonreply")
+        # Disable built-in metrics so early stopping uses feval only.
+        params["metric"] = "None"
+        feval = _spearman_nonreply_feval(val_is_nonreply)
+    elif early_stop_metric == "rmse":
+        params["metric"] = "rmse"
+    else:
+        raise ValueError(f"Unknown early_stop_metric={early_stop_metric!r}")
+
     if effective_loss == "huber":
         params["objective"] = "huber"
         params["alpha"] = 1.0
@@ -483,7 +517,8 @@ def train_model(
         f"Loss: {loss}"
         + (f" alpha={quantile_alpha:g}" if loss == "quantile" else "")
         + (f" under_weight={asymmetric_under_weight:g}" if loss == "asymmetric" else "")
-        + (f" floor={sera_floor:g}" if loss == "sera" else ""),
+        + (f" floor={sera_floor:g}" if loss == "sera" else "")
+        + f" | early_stop={early_stop_metric}",
         flush=True,
     )
     booster = lgb.train(
@@ -492,8 +527,9 @@ def train_model(
         num_boost_round=1200,
         valid_sets=[val_set],
         valid_names=["val"],
+        feval=feval,
         callbacks=[
-            lgb.early_stopping(stopping_rounds=60, verbose=False),
+            lgb.early_stopping(stopping_rounds=60, first_metric_only=True, verbose=False),
             lgb.log_evaluation(period=100),
         ],
     )
@@ -921,6 +957,13 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="SERA relevance on high extremes only (default); --no-sera-high-only uses both tails",
+    )
+    p.add_argument(
+        "--early-stop-metric",
+        choices=("rmse", "spearman_nonreply"),
+        default="rmse",
+        help="Val metric for LGBM early stopping / best iteration (default rmse; "
+        "spearman_nonreply aligns selection with draft-ranking primary)",
     )
     p.add_argument(
         "--emb-knn-te",
@@ -1988,6 +2031,7 @@ def fit_predict_group(
     asymmetric_under_weight: float = 3.0,
     sera_floor: float = 0.05,
     sera_high_only: bool = True,
+    early_stop_metric: str = "rmse",
     model_kind: str = "lgbm",
 ) -> tuple[np.ndarray, Any, list[str], dict[str, float]]:
     x_train, feature_names = feature_matrix(train_df, skip_embeddings=skip_embeddings)
@@ -2007,8 +2051,14 @@ def fit_predict_group(
         nonreply_weight,
         1.0,
     ).astype(np.float64)
+    val_is_nonreply = (val_df["is_reply"].to_numpy() == 0)
     extra_metrics: dict[str, float] = {}
     if model_kind == "gpboost":
+        if early_stop_metric != "rmse":
+            print(
+                f"Warning: GPBoost ignores --early-stop-metric={early_stop_metric}; using RMSE",
+                flush=True,
+            )
         group_train = train_df["account_id"].astype(str).to_numpy()
         group_val = val_df["account_id"].astype(str).to_numpy()
         model, _gp_model, extra_metrics = train_gpboost_model(
@@ -2047,6 +2097,8 @@ def fit_predict_group(
             asymmetric_under_weight=asymmetric_under_weight,
             sera_floor=sera_floor,
             sera_high_only=sera_high_only,
+            early_stop_metric=early_stop_metric,
+            val_is_nonreply=val_is_nonreply,
         )
         extra_metrics.update(sera_meta)
         raw = model.predict(x_val, num_iteration=model.best_iteration)
@@ -2259,6 +2311,7 @@ def main() -> None:
             asymmetric_under_weight=args.asymmetric_under_weight,
             sera_floor=args.sera_floor,
             sera_high_only=args.sera_high_only,
+            early_stop_metric=args.early_stop_metric,
             model_kind=args.model,
         )
         # Score full val with the non-reply model, then overwrite replies.
@@ -2309,6 +2362,7 @@ def main() -> None:
                 asymmetric_under_weight=args.asymmetric_under_weight,
                 sera_floor=args.sera_floor,
                 sera_high_only=args.sera_high_only,
+                early_stop_metric=args.early_stop_metric,
                 model_kind=args.model,
             )
             pred[val_df["is_reply"].to_numpy() == mask_val] = p
@@ -2329,6 +2383,7 @@ def main() -> None:
             asymmetric_under_weight=args.asymmetric_under_weight,
             sera_floor=args.sera_floor,
             sera_high_only=args.sera_high_only,
+            early_stop_metric=args.early_stop_metric,
             model_kind=args.model,
         )
 
@@ -2414,6 +2469,7 @@ def main() -> None:
     metrics["loss"] = args.loss
     metrics["sera_floor"] = float(args.sera_floor) if args.loss == "sera" else 0.0
     metrics["sera_high_only"] = float(args.sera_high_only) if args.loss == "sera" else 0.0
+    metrics["early_stop_metric"] = args.early_stop_metric
     metrics.update(gpboost_meta)
     metrics["seconds"] = round(time.time() - t0, 2)
 
@@ -2486,7 +2542,10 @@ def main() -> None:
 
     print("\n---")
     print(f"target_space: {metrics['target_space']}")
-    print(f"model: {metrics['model']} | account_te: {metrics['account_te']} | loss: {metrics['loss']}")
+    print(
+        f"model: {metrics['model']} | account_te: {metrics['account_te']} | "
+        f"loss: {metrics['loss']} | early_stop: {metrics.get('early_stop_metric', 'rmse')}"
+    )
     print("primary_metric: spearman_nonreply (draft ranking); guardrails: spearman, rmse_log, mean_underpred_nonreply_top10")
     for key in (
         "spearman_nonreply",
