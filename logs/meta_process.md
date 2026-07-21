@@ -41,6 +41,7 @@ Post-v14e rate RMSE plateaus ~0.642–0.644 through v17b (VADER / domains / prov
 4. **Regime** — v13 calendar / eras (−0.011).
 5. **Objective** — v14e exposure rate as primary (user clarification after misread “improve RMSE”).
 6. **Flats** — v15–v17b: ~7% domain coverage; provoke corr≈0.06; Spearman-only wiggles.
+7. **v27 GPBoost RE** — account random intercept regresses vs LGBM+TE (and vs mse-matched LGBM floor); library cannot use asymmetric custom loss with `gp_model`; estimated RE variance tiny once tabular/TE features are rich. Stick with LOO account TE + asymmetric LGBM unless a new RE formulation lands.
 
 ## Harness strengths
 
@@ -65,7 +66,7 @@ Highest EV user interventions were intermittent and short: leakage policy, expos
 
 **Do more:** coverage of known levers (media, parents, graph); amortized scale; regime/objective clarity when intent shifts; re-run `analyze.py` after each real lift and pick from residuals; one knob then restore; log outcome on the backlog.
 
-**Do less (until new angle):** loss/weight/breakout stacks without new features (v8); coarse author emb affinity (v10); low-coverage domain means without denser context; provoke-style LM tags without corr smoke; giant rater upgrades when a calibrated smaller model is already flat.
+**Do less (until new angle):** loss/weight/breakout stacks without new features (v8); coarse author emb affinity (v10); low-coverage domain means without denser context; provoke-style LM tags without corr smoke; giant rater upgrades when a calibrated smaller model is already flat; GPBoost account RE as a drop-in TE replacement (v27c).
 
 **Experiment policy (ε-greedy + gate):**
 

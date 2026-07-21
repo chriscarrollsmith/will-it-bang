@@ -14,6 +14,7 @@ Usage:
     uv run train.py
     uv run train.py --no-exposure-correct --residual   # dump-total / v13-style
     uv run train.py --skip-embeddings
+    uv run train.py --model gpboost --no-account-te    # account RE instead of LOO TE
 """
 
 from __future__ import annotations
@@ -21,8 +22,10 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import lightgbm as lgb
 import numpy as np
@@ -366,6 +369,132 @@ def train_model(
     )
 
 
+def _gpboost_response_mean(pred: Any) -> np.ndarray:
+    if isinstance(pred, dict):
+        if "response_mean" in pred:
+            return np.asarray(pred["response_mean"], dtype=np.float64)
+        if "fixed_effect" in pred:
+            fixed = np.asarray(pred["fixed_effect"], dtype=np.float64)
+            re_mean = pred.get("random_effect_mean")
+            if re_mean is not None:
+                return fixed + np.asarray(re_mean, dtype=np.float64)
+            return fixed
+    return np.asarray(pred, dtype=np.float64)
+
+
+def train_gpboost_model(
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    x_val: np.ndarray,
+    y_val: np.ndarray,
+    feature_names: list[str],
+    group_train: np.ndarray,
+    group_val: np.ndarray,
+    seed: int,
+    weight_train: np.ndarray | None = None,
+    *,
+    loss: str = "mse",
+    quantile_alpha: float = 0.65,
+) -> tuple[Any, Any, dict[str, float]]:
+    """Train GPBoost with a grouped Gaussian random intercept on account_id.
+
+    Custom objectives (e.g. asymmetric MSE) are not supported with gp_model;
+    callers should pass a built-in loss (mse / huber / quantile).
+    """
+    import gpboost as gpb
+
+    if loss == "asymmetric":
+        raise ValueError(
+            "GPBoost+RE does not support custom objectives; use --loss mse|huber|quantile"
+        )
+
+    gp_model = gpb.GPModel(group_data=group_train, likelihood="gaussian")
+    gp_model.set_prediction_data(group_data_pred=group_val)
+
+    train_set = gpb.Dataset(
+        data=x_train,
+        label=y_train,
+        weight=weight_train,
+        feature_name=feature_names,
+    )
+    val_set = gpb.Dataset(
+        data=x_val,
+        label=y_val,
+        reference=train_set,
+        feature_name=feature_names,
+    )
+    params: dict = {
+        "metric": "rmse",
+        "learning_rate": 0.04,
+        "num_leaves": 47,
+        "min_data_in_leaf": 50,
+        "feature_fraction": 0.7,
+        # GPBoost algorithm rejects bagging; keep feature_fraction subsample only.
+        "bagging_fraction": 1.0,
+        "bagging_freq": 0,
+        "lambda_l2": 1.0,
+        "verbosity": -1,
+        "verbose": -1,
+        "seed": seed,
+    }
+    if loss == "huber":
+        params["objective"] = "huber"
+        params["alpha"] = 1.0
+    elif loss == "mse":
+        params["objective"] = "regression"
+    elif loss == "quantile":
+        params["objective"] = "quantile"
+        params["alpha"] = float(quantile_alpha)
+    else:
+        raise ValueError(f"Unknown loss={loss!r}")
+
+    print(
+        f"Model: gpboost+RE | Loss: {loss}"
+        + (f" alpha={quantile_alpha:g}" if loss == "quantile" else ""),
+        flush=True,
+    )
+    evals_result: dict = {}
+    bst = gpb.train(
+        params=params,
+        train_set=train_set,
+        gp_model=gp_model,
+        num_boost_round=1200,
+        valid_sets=val_set,
+        valid_names=["val"],
+        early_stopping_rounds=60,
+        evals_result=evals_result,
+        verbose_eval=100,
+        use_gp_model_for_validation=True,
+    )
+
+    re_meta: dict[str, float] = {}
+    try:
+        cov = gp_model.get_cov_pars(format_pandas=True)
+        # Typical columns: Error_var, Group_1 (RE variance).
+        if hasattr(cov, "columns"):
+            if "Error_var" in cov.columns:
+                re_meta["gpboost_error_var"] = float(cov["Error_var"].iloc[0])
+            group_cols = [c for c in cov.columns if c != "Error_var"]
+            if group_cols:
+                re_meta["gpboost_re_var"] = float(cov[group_cols[0]].iloc[0])
+        print(f"GPBoost cov_pars: {re_meta}", flush=True)
+    except Exception as exc:  # noqa: BLE001 — diagnostic only
+        print(f"Warning: could not read GPBoost cov_pars ({exc})", flush=True)
+
+    n_train_groups = int(pd.unique(group_train).size)
+    n_val_groups = int(pd.unique(group_val).size)
+    n_cold = int(len(set(map(str, group_val)) - set(map(str, group_train))))
+    re_meta["gpboost_n_train_groups"] = float(n_train_groups)
+    re_meta["gpboost_n_val_groups"] = float(n_val_groups)
+    re_meta["gpboost_n_cold_val_groups"] = float(n_cold)
+    print(
+        f"GPBoost groups: train={n_train_groups} val={n_val_groups} "
+        f"cold_val={n_cold} (population-level RE for unseen)",
+        flush=True,
+    )
+    return bst, gp_model, re_meta
+
+
 def train_breakout_classifier(
     x_train: np.ndarray,
     y_train: np.ndarray,
@@ -503,6 +632,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset", type=Path, default=DATASET_PATH)
     p.add_argument("--val-frac", type=float, default=0.2)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--model",
+        choices=("lgbm", "gpboost"),
+        default="lgbm",
+        help="Booster backend. gpboost adds a Gaussian random intercept on account_id",
+    )
+    p.add_argument(
+        "--max-rows",
+        type=int,
+        default=0,
+        help="Optional row cap after time-sort (smoke tests); 0 = full dataset",
+    )
     p.add_argument(
         "--residual",
         action=argparse.BooleanOptionalAction,
@@ -729,7 +870,24 @@ def parse_args() -> argparse.Namespace:
         help="Smoothing days added to effective age",
     )
     p.add_argument("--description", type=str, default="exposure-rate hybrid")
-    return p.parse_args()
+    args = p.parse_args()
+    # GPBoost already models account_id as a RE — default off LOO TE to avoid
+    # double-counting author mean unless the user explicitly passes --account-te.
+    if (
+        args.model == "gpboost"
+        and "--account-te" not in sys.argv
+        and "--no-account-te" not in sys.argv
+    ):
+        args.account_te = False
+    # Custom objectives are unsupported with gp_model; fall back to MSE.
+    if args.model == "gpboost" and args.loss == "asymmetric":
+        print(
+            "Note: GPBoost+RE does not support custom objectives; "
+            "using --loss mse instead of asymmetric",
+            flush=True,
+        )
+        args.loss = "mse"
+    return args
 
 
 def _exposure_eff_days(
@@ -1660,7 +1818,8 @@ def fit_predict_group(
     loss: str = "huber",
     quantile_alpha: float = 0.65,
     asymmetric_under_weight: float = 3.0,
-) -> tuple[np.ndarray, lgb.Booster, list[str]]:
+    model_kind: str = "lgbm",
+) -> tuple[np.ndarray, Any, list[str], dict[str, float]]:
     x_train, feature_names = feature_matrix(train_df, skip_embeddings=skip_embeddings)
     x_val, _ = feature_matrix(val_df, skip_embeddings=skip_embeddings)
     y_train_abs = train_df["log_engagement"].to_numpy(dtype=np.float64)
@@ -1678,21 +1837,46 @@ def fit_predict_group(
         nonreply_weight,
         1.0,
     ).astype(np.float64)
-    model = train_model(
-        x_train,
-        y_train,
-        x_val,
-        y_val_model,
-        feature_names,
-        seed=seed,
-        weight_train=weight_train,
-        loss=loss,
-        quantile_alpha=quantile_alpha,
-        asymmetric_under_weight=asymmetric_under_weight,
-    )
-    raw = model.predict(x_val, num_iteration=model.best_iteration)
+    extra_metrics: dict[str, float] = {}
+    if model_kind == "gpboost":
+        group_train = train_df["account_id"].astype(str).to_numpy()
+        group_val = val_df["account_id"].astype(str).to_numpy()
+        model, _gp_model, extra_metrics = train_gpboost_model(
+            x_train,
+            y_train,
+            x_val,
+            y_val_model,
+            feature_names,
+            group_train=group_train,
+            group_val=group_val,
+            seed=seed,
+            weight_train=weight_train,
+            loss=loss,
+            quantile_alpha=quantile_alpha,
+        )
+        raw = _gpboost_response_mean(
+            model.predict(
+                data=x_val,
+                group_data_pred=group_val,
+                pred_latent=False,
+            )
+        )
+    else:
+        model = train_model(
+            x_train,
+            y_train,
+            x_val,
+            y_val_model,
+            feature_names,
+            seed=seed,
+            weight_train=weight_train,
+            loss=loss,
+            quantile_alpha=quantile_alpha,
+            asymmetric_under_weight=asymmetric_under_weight,
+        )
+        raw = model.predict(x_val, num_iteration=model.best_iteration)
     pred = raw + base_val if residual else raw
-    return pred, model, feature_names
+    return pred, model, feature_names, extra_metrics
 
 
 def main() -> None:
@@ -1703,6 +1887,9 @@ def main() -> None:
     t0 = time.time()
     df = pd.read_parquet(args.dataset)
     df["created_at"] = pd.to_datetime(df["created_at"], utc=True)
+    if args.max_rows and args.max_rows > 0 and len(df) > args.max_rows:
+        df = df.sort_values("created_at", kind="mergesort").tail(args.max_rows).reset_index(drop=True)
+        print(f"Smoke subsample: keeping last {len(df):,} rows by created_at", flush=True)
     if "hist_mean_replies" not in df.columns:
         raise SystemExit(
             "Dataset missing hist_mean_replies — re-run prepare.py "
@@ -1854,13 +2041,20 @@ def main() -> None:
     print(
         "Target:",
         "residual" if residual else "absolute",
-        f"| baseline={args.baseline} | split_reply={args.split_reply} "
+        f"| model={args.model} | baseline={args.baseline} | split_reply={args.split_reply} "
         f"| nonreply_weight={args.nonreply_weight} | breakout_head={args.breakout_head} "
+        f"| account_te={args.account_te} "
         f"| exposure={args.exposure_correct}:{args.exposure_mode if args.exposure_correct else 'off'}",
     )
 
     breakout_auc = float("nan")
     if args.breakout_head:
+        if args.model == "gpboost":
+            print(
+                "Warning: --breakout-head still uses LGBM OOF; combining with --model gpboost "
+                "is experimental",
+                flush=True,
+            )
         train_df, val_df, breakout_auc = add_breakout_probs(
             train_df,
             val_df,
@@ -1872,11 +2066,12 @@ def main() -> None:
             quantile=args.breakout_quantile,
         )
 
+    gpboost_meta: dict[str, float] = {}
     if args.nonreply_only:
         tr_nr = train_df[train_df["is_reply"] == 0]
         va_nr = val_df[val_df["is_reply"] == 0]
         print(f"Non-reply-only train: {len(tr_nr):,} / {len(train_df):,} (val NR {len(va_nr):,})")
-        _, model, feature_names = fit_predict_group(
+        _, model, feature_names, gpboost_meta = fit_predict_group(
             tr_nr,
             va_nr,
             residual=residual,
@@ -1887,10 +2082,17 @@ def main() -> None:
             loss=args.loss,
             quantile_alpha=args.quantile_alpha,
             asymmetric_under_weight=args.asymmetric_under_weight,
+            model_kind=args.model,
         )
         # Score full val with the non-reply model, then overwrite replies.
         x_val_full, _ = feature_matrix(val_df, skip_embeddings=args.skip_embeddings)
-        raw_full = model.predict(x_val_full, num_iteration=model.best_iteration)
+        if args.model == "gpboost":
+            group_val = val_df["account_id"].astype(str).to_numpy()
+            raw_full = _gpboost_response_mean(
+                model.predict(data=x_val_full, group_data_pred=group_val, pred_latent=False)
+            )
+        else:
+            raw_full = model.predict(x_val_full, num_iteration=model.best_iteration)
         base_val = author_baseline(val_df, args.baseline)
         pred = raw_full + base_val if residual else raw_full
         tr_r = train_df[train_df["is_reply"] == 1]
@@ -1917,7 +2119,7 @@ def main() -> None:
                 print(f"  skip {label}: train={len(tr)} val={len(va)}")
                 continue
             print(f"  fitting {label}: train={len(tr):,} val={len(va):,}")
-            p, model, feature_names = fit_predict_group(
+            p, model, feature_names, meta = fit_predict_group(
                 tr,
                 va,
                 residual=residual,
@@ -1928,12 +2130,14 @@ def main() -> None:
                 loss=args.loss,
                 quantile_alpha=args.quantile_alpha,
                 asymmetric_under_weight=args.asymmetric_under_weight,
+                model_kind=args.model,
             )
             pred[val_df["is_reply"].to_numpy() == mask_val] = p
             models.append(model)
+            gpboost_meta.update(meta)
         model = models[-1] if models else None
     else:
-        pred, model, feature_names = fit_predict_group(
+        pred, model, feature_names, gpboost_meta = fit_predict_group(
             train_df,
             val_df,
             residual=residual,
@@ -1944,6 +2148,7 @@ def main() -> None:
             loss=args.loss,
             quantile_alpha=args.quantile_alpha,
             asymmetric_under_weight=args.asymmetric_under_weight,
+            model_kind=args.model,
         )
 
     # Primary prediction/label are in training-target space.
@@ -2023,6 +2228,10 @@ def main() -> None:
     metrics["nonreply_weight"] = args.nonreply_weight
     metrics["breakout_head"] = args.breakout_head
     metrics["breakout_auc"] = breakout_auc
+    metrics["model"] = args.model
+    metrics["account_te"] = bool(args.account_te)
+    metrics["loss"] = args.loss
+    metrics.update(gpboost_meta)
     metrics["seconds"] = round(time.time() - t0, 2)
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -2080,21 +2289,21 @@ def main() -> None:
     print(f"Wrote val predictions: {VAL_PRED_PATH}")
 
     if model is not None and feature_names:
-        importance = (
-            pd.DataFrame(
-                {
-                    "feature": feature_names,
-                    "gain": model.feature_importance(importance_type="gain"),
-                }
+        try:
+            gain = model.feature_importance(importance_type="gain")
+            importance = (
+                pd.DataFrame({"feature": feature_names, "gain": gain})
+                .sort_values("gain", ascending=False)
+                .head(15)
             )
-            .sort_values("gain", ascending=False)
-            .head(15)
-        )
-        print("\nTop features by gain:")
-        print(importance.to_string(index=False))
+            print("\nTop features by gain:")
+            print(importance.to_string(index=False))
+        except Exception as exc:  # noqa: BLE001
+            print(f"Warning: feature importance unavailable ({exc})", flush=True)
 
     print("\n---")
     print(f"target_space: {metrics['target_space']}")
+    print(f"model: {metrics['model']} | account_te: {metrics['account_te']} | loss: {metrics['loss']}")
     for key in (
         "rmse_log",
         "rmse_log_nonreply",
@@ -2114,9 +2323,14 @@ def main() -> None:
         "val_rows",
         "n_accounts_train",
         "n_accounts_val",
+        "gpboost_re_var",
+        "gpboost_error_var",
+        "gpboost_n_cold_val_groups",
+        "mean_underpred_nonreply_top10",
         "seconds",
     ):
-        print(f"{key}: {metrics[key]}")
+        if key in metrics:
+            print(f"{key}: {metrics[key]}")
     print(f"model_path: {MODEL_PATH}")
 
 
