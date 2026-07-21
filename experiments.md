@@ -75,6 +75,8 @@ Dump-time fav/RT used as author history → optimistic RMSE ~0.82 (v5). Invalid 
 | v28c | 0.642 (rate) | 0.462 | MSE floor: worse RMSE + worse under-pred (2.36) — SERA lift is not “just mse” |
 | v29a | 0.610 (rate) | 0.460 | RMSE early-stop control (= v28a); spearman_nr 0.508; hot NR under-pred 2.22; best_iter 263 |
 | v29b | 0.611 (rate) | 0.462 | Spearman_nr early-stop: spearman_nr **0.509** (+0.0016); under-pred 2.22 (flat); best_iter 342; **tiny / leave opt-in** |
+| v30a | 0.610 (rate) | 0.460 | Asymmetric control for LambdaRank (= v29a); spearman_nr 0.508; within-account NR Spearman mean 0.161 / wmean 0.187 |
+| v30b | 1.016 (rate) | 0.097 | LambdaRank account groups (non-reply): **global spearman_nr collapses** 0.508→0.051 (scores not cross-account calibrated); within-account NR Spearman mean 0.168 / wmean **0.211** (+0.024); NDCG@10≈0.77; leave **opt-in** / fail on locked global primary |
 
 ## Failure modes (still open)
 
@@ -151,7 +153,8 @@ Heavier / researchy:
 - [x] Quantile / pinball or underprediction-asymmetric loss — **v20a asymmetric: 0.639→0.607 rate RMSE** (default); **v20b quantile α=0.65: worse RMSE** (0.647), slight Spearman lift
 - [x] SERA / relevance-weighted extreme loss — **v28b: RMSE 0.610→0.590**, hot NR under-pred 2.22→2.04, but Spearman_nr 0.508→0.474; **opt-in only** once primary locked to non-reply ranking (`--loss sera`)
 - [x] Early-stop on `spearman_nonreply` — **v29b: tiny lift** (0.508→0.509); guardrails flat; `--early-stop-metric spearman_nonreply` opt-in (default stays rmse)
-- [ ] Pairwise / listwise rank objective on non-replies (stronger than selection-only) — next if rank family continues; guardrail hot-NR under-pred vs asymmetric
+- [x] Pairwise / listwise LambdaRank on non-replies by `account_id` — **v30b: fail on global spearman_nr** (0.051); slight **within-account** rank lift (wmean 0.187→0.211); `--loss lambdarank` opt-in only
+- [ ] Within-account Spearman as scoreboard / hybrid (global calibration head + within-author ranker) — if draft ranking is truly per-author, global `spearman_nonreply` is dominated by account TE
 - [ ] Larger frozen encoder (Modal credits) vs MiniLM
 - [ ] Further scale (>120k / more accounts with lower `min-account-tweets`)
 - [x] Account-level **target encoding** (train-fold LOO, leakage-safe) — **v19: 0.642 → 0.639 rate RMSE**, Spearman 0.441→0.452; default on (`--no-account-te` to ablate)
