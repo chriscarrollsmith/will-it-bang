@@ -30,6 +30,7 @@ from typing import Any
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
+from scipy.interpolate import PchipInterpolator
 from scipy.stats import spearmanr
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
@@ -295,6 +296,112 @@ def evaluate(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
     }
 
 
+def _medcouple(x: np.ndarray, *, max_n: int = 2000, seed: int = 0) -> float:
+    """Medcouple skewness (Hubert & Vandervieren) for adjusted boxplot fences."""
+    x = np.asarray(x, dtype=np.float64)
+    x = x[np.isfinite(x)]
+    if x.size < 3:
+        return 0.0
+    if x.size > max_n:
+        rng = np.random.default_rng(seed)
+        x = rng.choice(x, size=max_n, replace=False)
+    x = np.sort(x)
+    med = float(np.median(x))
+    left = x[x <= med]
+    right = x[x >= med]
+    if left.size == 0 or right.size == 0:
+        return 0.0
+    a = (med - left)[:, None]
+    b = (right - med)[None, :]
+    denom = a + b
+    with np.errstate(invalid="ignore", divide="ignore"):
+        h = np.where(denom > 0.0, (b - a) / denom, np.nan)
+    mc = np.nanmedian(h)
+    return float(mc) if mc == mc else 0.0
+
+
+def relevance_phi_sera(
+    y: np.ndarray,
+    *,
+    high_only: bool = True,
+    seed: int = 0,
+) -> tuple[np.ndarray, dict[str, float]]:
+    """Train-fold SERA relevance φ(y)∈[0,1] via adjusted-boxplot control points + PCHIP.
+
+    High-only (default): extremes above the upper fence are relevant; below the
+    median φ=0. Matches Ribeiro & Moniz (2021) when only high extremes matter.
+    Per-sample contribution to SERA is φ(y)·(ŷ−y)², so φ is the MSE weight.
+    """
+    y = np.asarray(y, dtype=np.float64)
+    finite = y[np.isfinite(y)]
+    if finite.size < 10:
+        phi = np.ones(y.shape[0], dtype=np.float64)
+        return phi, {"sera_med": 0.0, "sera_upper": 1.0, "sera_mc": 0.0, "sera_frac_pos": 1.0}
+
+    q1, med, q3 = np.quantile(finite, [0.25, 0.5, 0.75])
+    iqr = float(q3 - q1)
+    mc = _medcouple(finite, seed=seed)
+    if iqr <= 1e-12:
+        upper = float(np.quantile(finite, 0.95))
+        lower = float(np.quantile(finite, 0.05))
+    elif mc >= 0.0:
+        upper = float(q3 + 1.5 * np.exp(3.0 * mc) * iqr)
+        lower = float(q1 - 1.5 * np.exp(4.0 * mc) * iqr)
+    else:
+        upper = float(q3 + 1.5 * np.exp(4.0 * mc) * iqr)
+        lower = float(q1 - 1.5 * np.exp(-3.0 * mc) * iqr)
+
+    y_min = float(finite.min())
+    y_max = float(finite.max())
+    # Ensure fences are interior enough for a non-degenerate interpolant.
+    upper = min(max(upper, float(med) + 1e-6), y_max)
+    lower = max(min(lower, float(med) - 1e-6), y_min)
+
+    if high_only:
+        xs = np.array([y_min, float(med), upper, y_max], dtype=np.float64)
+        ys = np.array([0.0, 0.0, 1.0, 1.0], dtype=np.float64)
+    else:
+        xs = np.array([y_min, lower, float(med), upper, y_max], dtype=np.float64)
+        ys = np.array([1.0, 1.0, 0.0, 1.0, 1.0], dtype=np.float64)
+    # Drop duplicate x (can happen on discrete / clipped targets).
+    uniq_x, uniq_idx = np.unique(xs, return_index=True)
+    uniq_y = ys[uniq_idx]
+    if uniq_x.size < 2:
+        phi = np.ones(y.shape[0], dtype=np.float64)
+    else:
+        interp = PchipInterpolator(uniq_x, uniq_y, extrapolate=True)
+        phi = np.clip(interp(y), 0.0, 1.0).astype(np.float64)
+    meta = {
+        "sera_med": float(med),
+        "sera_upper": float(upper),
+        "sera_lower": float(lower),
+        "sera_mc": float(mc),
+        "sera_frac_pos": float(np.mean(phi > 1e-6)),
+        "sera_mean_phi": float(np.mean(phi)),
+    }
+    return phi, meta
+
+
+def apply_sera_sample_weights(
+    y_train: np.ndarray,
+    weight_train: np.ndarray | None,
+    *,
+    sera_floor: float = 0.05,
+    high_only: bool = True,
+    seed: int = 0,
+) -> tuple[np.ndarray, dict[str, float]]:
+    """Multiply sample weights by floor+(1−floor)·φ(y) for SERA-weighted MSE."""
+    phi, meta = relevance_phi_sera(y_train, high_only=high_only, seed=seed)
+    floor = float(np.clip(sera_floor, 0.0, 1.0))
+    sera_w = floor + (1.0 - floor) * phi
+    base = np.ones(y_train.shape[0], dtype=np.float64) if weight_train is None else np.asarray(
+        weight_train, dtype=np.float64
+    )
+    meta["sera_floor"] = floor
+    meta["sera_high_only"] = float(high_only)
+    return base * sera_w, meta
+
+
 def train_model(
     x_train: np.ndarray,
     y_train: np.ndarray,
@@ -304,14 +411,36 @@ def train_model(
     seed: int,
     weight_train: np.ndarray | None = None,
     *,
-    loss: str = "huber",
+    loss: str = "asymmetric",
     quantile_alpha: float = 0.65,
     asymmetric_under_weight: float = 3.0,
-) -> lgb.Booster:
+    sera_floor: float = 0.05,
+    sera_high_only: bool = True,
+) -> tuple[lgb.Booster, dict[str, float]]:
+    sera_meta: dict[str, float] = {}
+    effective_weight = weight_train
+    effective_loss = loss
+    if loss == "sera":
+        # SERA ∝ Σ φ(y)·(ŷ−y)² — optimize via MSE + relevance sample weights.
+        effective_weight, sera_meta = apply_sera_sample_weights(
+            y_train,
+            weight_train,
+            sera_floor=sera_floor,
+            high_only=sera_high_only,
+            seed=seed,
+        )
+        effective_loss = "mse"
+        print(
+            f"SERA relevance: med={sera_meta['sera_med']:.4f} upper={sera_meta['sera_upper']:.4f} "
+            f"mc={sera_meta['sera_mc']:.3f} mean_phi={sera_meta['sera_mean_phi']:.3f} "
+            f"frac_pos={sera_meta['sera_frac_pos']:.3f} floor={sera_floor:g}",
+            flush=True,
+        )
+
     train_set = lgb.Dataset(
         x_train,
         label=y_train,
-        weight=weight_train,
+        weight=effective_weight,
         feature_name=feature_names,
     )
     val_set = lgb.Dataset(x_val, label=y_val, reference=train_set, feature_name=feature_names)
@@ -327,15 +456,15 @@ def train_model(
         "verbosity": -1,
         "seed": seed,
     }
-    if loss == "huber":
+    if effective_loss == "huber":
         params["objective"] = "huber"
         params["alpha"] = 1.0
-    elif loss == "mse":
+    elif effective_loss == "mse":
         params["objective"] = "regression"
-    elif loss == "quantile":
+    elif effective_loss == "quantile":
         params["objective"] = "quantile"
         params["alpha"] = float(quantile_alpha)
-    elif loss == "asymmetric":
+    elif effective_loss == "asymmetric":
         under_w = float(asymmetric_under_weight)
 
         def asymmetric_mse(y_pred: np.ndarray, dataset: lgb.Dataset):
@@ -353,10 +482,11 @@ def train_model(
     print(
         f"Loss: {loss}"
         + (f" alpha={quantile_alpha:g}" if loss == "quantile" else "")
-        + (f" under_weight={asymmetric_under_weight:g}" if loss == "asymmetric" else ""),
+        + (f" under_weight={asymmetric_under_weight:g}" if loss == "asymmetric" else "")
+        + (f" floor={sera_floor:g}" if loss == "sera" else ""),
         flush=True,
     )
-    return lgb.train(
+    booster = lgb.train(
         params,
         train_set,
         num_boost_round=1200,
@@ -367,6 +497,7 @@ def train_model(
             lgb.log_evaluation(period=100),
         ],
     )
+    return booster, sera_meta
 
 
 def _gpboost_response_mean(pred: Any) -> np.ndarray:
@@ -395,17 +526,39 @@ def train_gpboost_model(
     *,
     loss: str = "mse",
     quantile_alpha: float = 0.65,
+    sera_floor: float = 0.05,
+    sera_high_only: bool = True,
 ) -> tuple[Any, Any, dict[str, float]]:
     """Train GPBoost with a grouped Gaussian random intercept on account_id.
 
     Custom objectives (e.g. asymmetric MSE) are not supported with gp_model;
-    callers should pass a built-in loss (mse / huber / quantile).
+    callers should pass a built-in loss (mse / huber / quantile) or sera
+    (relevance sample weights + mse).
     """
     import gpboost as gpb
 
     if loss == "asymmetric":
         raise ValueError(
-            "GPBoost+RE does not support custom objectives; use --loss mse|huber|quantile"
+            "GPBoost+RE does not support custom objectives; use --loss mse|huber|quantile|sera"
+        )
+
+    sera_meta: dict[str, float] = {}
+    effective_weight = weight_train
+    effective_loss = loss
+    if loss == "sera":
+        effective_weight, sera_meta = apply_sera_sample_weights(
+            y_train,
+            weight_train,
+            sera_floor=sera_floor,
+            high_only=sera_high_only,
+            seed=seed,
+        )
+        effective_loss = "mse"
+        print(
+            f"SERA relevance: med={sera_meta['sera_med']:.4f} upper={sera_meta['sera_upper']:.4f} "
+            f"mc={sera_meta['sera_mc']:.3f} mean_phi={sera_meta['sera_mean_phi']:.3f} "
+            f"frac_pos={sera_meta['sera_frac_pos']:.3f} floor={sera_floor:g}",
+            flush=True,
         )
 
     gp_model = gpb.GPModel(group_data=group_train, likelihood="gaussian")
@@ -414,7 +567,7 @@ def train_gpboost_model(
     train_set = gpb.Dataset(
         data=x_train,
         label=y_train,
-        weight=weight_train,
+        weight=effective_weight,
         feature_name=feature_names,
     )
     val_set = gpb.Dataset(
@@ -437,12 +590,12 @@ def train_gpboost_model(
         "verbose": -1,
         "seed": seed,
     }
-    if loss == "huber":
+    if effective_loss == "huber":
         params["objective"] = "huber"
         params["alpha"] = 1.0
-    elif loss == "mse":
+    elif effective_loss == "mse":
         params["objective"] = "regression"
-    elif loss == "quantile":
+    elif effective_loss == "quantile":
         params["objective"] = "quantile"
         params["alpha"] = float(quantile_alpha)
     else:
@@ -450,7 +603,8 @@ def train_gpboost_model(
 
     print(
         f"Model: gpboost+RE | Loss: {loss}"
-        + (f" alpha={quantile_alpha:g}" if loss == "quantile" else ""),
+        + (f" alpha={quantile_alpha:g}" if loss == "quantile" else "")
+        + (f" floor={sera_floor:g}" if loss == "sera" else ""),
         flush=True,
     )
     evals_result: dict = {}
@@ -487,6 +641,7 @@ def train_gpboost_model(
     re_meta["gpboost_n_train_groups"] = float(n_train_groups)
     re_meta["gpboost_n_val_groups"] = float(n_val_groups)
     re_meta["gpboost_n_cold_val_groups"] = float(n_cold)
+    re_meta.update(sera_meta)
     print(
         f"GPBoost groups: train={n_train_groups} val={n_val_groups} "
         f"cold_val={n_cold} (population-level RE for unseen)",
@@ -738,9 +893,10 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--loss",
-        choices=("huber", "mse", "quantile", "asymmetric"),
+        choices=("huber", "mse", "quantile", "asymmetric", "sera"),
         default="asymmetric",
-        help="Regression objective (default asymmetric upweights under-prediction)",
+        help="Regression objective (default asymmetric upweights under-prediction; "
+        "sera = relevance-weighted MSE for extremes)",
     )
     p.add_argument(
         "--quantile-alpha",
@@ -753,6 +909,18 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=3.0,
         help="Under-prediction weight when --loss asymmetric",
+    )
+    p.add_argument(
+        "--sera-floor",
+        type=float,
+        default=0.05,
+        help="Minimum relevance weight when --loss sera (φ_eff = floor+(1-floor)·φ)",
+    )
+    p.add_argument(
+        "--sera-high-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="SERA relevance on high extremes only (default); --no-sera-high-only uses both tails",
     )
     p.add_argument(
         "--emb-knn-te",
@@ -1815,9 +1983,11 @@ def fit_predict_group(
     skip_embeddings: bool,
     seed: int,
     nonreply_weight: float = 1.0,
-    loss: str = "huber",
+    loss: str = "asymmetric",
     quantile_alpha: float = 0.65,
     asymmetric_under_weight: float = 3.0,
+    sera_floor: float = 0.05,
+    sera_high_only: bool = True,
     model_kind: str = "lgbm",
 ) -> tuple[np.ndarray, Any, list[str], dict[str, float]]:
     x_train, feature_names = feature_matrix(train_df, skip_embeddings=skip_embeddings)
@@ -1853,6 +2023,8 @@ def fit_predict_group(
             weight_train=weight_train,
             loss=loss,
             quantile_alpha=quantile_alpha,
+            sera_floor=sera_floor,
+            sera_high_only=sera_high_only,
         )
         raw = _gpboost_response_mean(
             model.predict(
@@ -1862,7 +2034,7 @@ def fit_predict_group(
             )
         )
     else:
-        model = train_model(
+        model, sera_meta = train_model(
             x_train,
             y_train,
             x_val,
@@ -1873,7 +2045,10 @@ def fit_predict_group(
             loss=loss,
             quantile_alpha=quantile_alpha,
             asymmetric_under_weight=asymmetric_under_weight,
+            sera_floor=sera_floor,
+            sera_high_only=sera_high_only,
         )
+        extra_metrics.update(sera_meta)
         raw = model.predict(x_val, num_iteration=model.best_iteration)
     pred = raw + base_val if residual else raw
     return pred, model, feature_names, extra_metrics
@@ -2082,6 +2257,8 @@ def main() -> None:
             loss=args.loss,
             quantile_alpha=args.quantile_alpha,
             asymmetric_under_weight=args.asymmetric_under_weight,
+            sera_floor=args.sera_floor,
+            sera_high_only=args.sera_high_only,
             model_kind=args.model,
         )
         # Score full val with the non-reply model, then overwrite replies.
@@ -2130,6 +2307,8 @@ def main() -> None:
                 loss=args.loss,
                 quantile_alpha=args.quantile_alpha,
                 asymmetric_under_weight=args.asymmetric_under_weight,
+                sera_floor=args.sera_floor,
+                sera_high_only=args.sera_high_only,
                 model_kind=args.model,
             )
             pred[val_df["is_reply"].to_numpy() == mask_val] = p
@@ -2148,6 +2327,8 @@ def main() -> None:
             loss=args.loss,
             quantile_alpha=args.quantile_alpha,
             asymmetric_under_weight=args.asymmetric_under_weight,
+            sera_floor=args.sera_floor,
+            sera_high_only=args.sera_high_only,
             model_kind=args.model,
         )
 
@@ -2231,6 +2412,8 @@ def main() -> None:
     metrics["model"] = args.model
     metrics["account_te"] = bool(args.account_te)
     metrics["loss"] = args.loss
+    metrics["sera_floor"] = float(args.sera_floor) if args.loss == "sera" else 0.0
+    metrics["sera_high_only"] = float(args.sera_high_only) if args.loss == "sera" else 0.0
     metrics.update(gpboost_meta)
     metrics["seconds"] = round(time.time() - t0, 2)
 
@@ -2304,14 +2487,16 @@ def main() -> None:
     print("\n---")
     print(f"target_space: {metrics['target_space']}")
     print(f"model: {metrics['model']} | account_te: {metrics['account_te']} | loss: {metrics['loss']}")
+    print("primary_metric: spearman_nonreply (draft ranking); guardrails: spearman, rmse_log, mean_underpred_nonreply_top10")
     for key in (
+        "spearman_nonreply",
+        "spearman",
         "rmse_log",
+        "mean_underpred_nonreply_top10",
         "rmse_log_nonreply",
         "rmse_log_reply",
         "mae_log",
         "r2_log",
-        "spearman",
-        "spearman_nonreply",
         "rmse_log_raw_dump",
         "spearman_raw_dump",
         "mae_engagement",
@@ -2326,7 +2511,6 @@ def main() -> None:
         "gpboost_re_var",
         "gpboost_error_var",
         "gpboost_n_cold_val_groups",
-        "mean_underpred_nonreply_top10",
         "seconds",
     ):
         if key in metrics:
