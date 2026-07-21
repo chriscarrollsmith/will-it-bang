@@ -14,7 +14,8 @@ Process retrospective (what moved the scoreboard vs what burned cycles): [`logs/
 
 | Objective | Run | rmse_log | spearman | train / val | Notes |
 |---|---|---:|---:|---|---|
-| **Exposure rate** | **v22b** | **0.606** | 0.440 | 88k / 22k | Emb kNN TE + asymmetric + account TE; tiny RMSE lift vs v20a |
+| **Exposure rate** | **v28b** | **0.590** | 0.409 | 88k / 22k | SERA relevance-weighted MSE (default); same-rebuild vs asymmetric 0.610 |
+| Exposure rate (prior) | v22b | 0.606 | 0.440 | 88k / 22k | Emb kNN TE + asymmetric + account TE; ~9% media (not skip-media) |
 | Dump total | v13 | 0.967 | 0.548 | 88k / 22k | Graph + parent + scale + time regimes |
 
 Rebuild: `uv run prepare.py --skip-media` (defaults are the v12 scale knobs).  
@@ -63,10 +64,13 @@ Dump-time fav/RT used as author history → optimistic RMSE ~0.82 (v5). Invalid 
 | v27a2 | 0.642 (rate) | 0.434 | LGBM `--no-account-te --loss mse`: loss-matched floor for GPBoost; asymmetric→mse costs ~0.029 RMSE |
 | v27c | 0.653 (rate) | 0.376 | GPBoost account RE (`--model gpboost`, no TE, mse): **regress** vs v27b (−0.040) and vs v27a2 (−0.011); RE σ²≈0.010; early-stop @26; hot NR under-pred worse (2.38); leave `--model gpboost` opt-in, LGBM+TE default |
 | v27d | 0.640 (rate) | 0.344 | GPBoost RE **plus** account TE: ≈ loss-matched floor on RMSE, Spearman collapses; double-counting does not help |
+| v28a | 0.610 (rate) | 0.460 | Same-rebuild asymmetric control (`prepare --skip-media`); hot NR under-pred 2.22 |
+| v28b | **0.590** (rate) | 0.409 | SERA (`--loss sera`, floor=0.05, high-only): **RMSE lift** vs v28a (−0.020); hot NR under-pred 2.22→2.04; Spearman −0.051; mean_φ≈0.05; **new default** |
+| v28c | 0.642 (rate) | 0.462 | MSE floor: worse RMSE + worse under-pred (2.36) — SERA lift is not “just mse” |
 
 ## Failure modes (still open)
 
-- High-engagement **non-replies** (viral under-prediction); often already-hot authors.
+- High-engagement **non-replies** (viral under-prediction); often already-hot authors. Improved by SERA (v28b: mean under-pred 2.22→2.04) but still open.
 - **Media** / short+image posts — API refresh restored ~9% coverage (v18); binary flags still low gain vs interactions/`hist_frac_media`.
 - **Quote** tweets when parent missing from CA dump (~10% quote-parent coverage).
 
@@ -136,7 +140,8 @@ Heavier / researchy:
 - [ ] Supervised manifold (UMAP on RF-leaf similarity, etc.) — usually for analysis, not tabular features; only promote if a cheap projection beats PLS
 
 ### Modeling
-- [x] Quantile / pinball or underprediction-asymmetric loss — **v20a asymmetric: 0.639→0.607 rate RMSE** (default); **v20b quantile α=0.65: worse RMSE** (0.647), slight Spearman lift
+- [x] Quantile / pinball or underprediction-asymmetric loss — **v20a asymmetric: 0.639→0.607 rate RMSE**; **v20b quantile α=0.65: worse RMSE** (0.647), slight Spearman lift; asymmetric superseded as default by v28b SERA
+- [x] SERA / relevance-weighted extreme loss — **v28b: 0.610→0.590** vs asymmetric same-rebuild; hot NR under-pred 2.22→2.04; Spearman 0.460→0.409; default on (`--loss asymmetric` to ablate)
 - [ ] Larger frozen encoder (Modal credits) vs MiniLM
 - [ ] Further scale (>120k / more accounts with lower `min-account-tweets`)
 - [x] Account-level **target encoding** (train-fold LOO, leakage-safe) — **v19: 0.642 → 0.639 rate RMSE**, Spearman 0.441→0.452; default on (`--no-account-te` to ablate)

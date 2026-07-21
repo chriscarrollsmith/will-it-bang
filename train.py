@@ -411,7 +411,7 @@ def train_model(
     seed: int,
     weight_train: np.ndarray | None = None,
     *,
-    loss: str = "huber",
+    loss: str = "sera",
     quantile_alpha: float = 0.65,
     asymmetric_under_weight: float = 3.0,
     sera_floor: float = 0.05,
@@ -894,9 +894,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--loss",
         choices=("huber", "mse", "quantile", "asymmetric", "sera"),
-        default="asymmetric",
-        help="Regression objective (default asymmetric upweights under-prediction; "
-        "sera = relevance-weighted MSE for extreme targets)",
+        default="sera",
+        help="Regression objective (default sera = relevance-weighted MSE for extremes; "
+        "asymmetric upweights under-prediction)",
     )
     p.add_argument(
         "--quantile-alpha",
@@ -1983,7 +1983,7 @@ def fit_predict_group(
     skip_embeddings: bool,
     seed: int,
     nonreply_weight: float = 1.0,
-    loss: str = "huber",
+    loss: str = "sera",
     quantile_alpha: float = 0.65,
     asymmetric_under_weight: float = 3.0,
     sera_floor: float = 0.05,
