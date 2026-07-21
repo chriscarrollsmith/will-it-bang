@@ -134,7 +134,8 @@ Heavier / researchy:
 - [x] Quantile / pinball or underprediction-asymmetric loss — **v20a asymmetric: 0.639→0.607 rate RMSE** (default); **v20b quantile α=0.65: worse RMSE** (0.647), slight Spearman lift
 - [ ] Larger frozen encoder (Modal credits) vs MiniLM
 - [ ] Further scale (>120k / more accounts with lower `min-account-tweets`)
-- [x] Account-level random effects / target encoding (train-fold only, leakage-safe) — **v19: 0.642 → 0.639 rate RMSE**, Spearman 0.441→0.452; default on (`--no-account-te` to ablate)
+- [x] Account-level **target encoding** (train-fold LOO, leakage-safe) — **v19: 0.642 → 0.639 rate RMSE**, Spearman 0.441→0.452; default on (`--no-account-te` to ablate)
+- [ ] **Queued v27:** true account **random effects** via GPBoost (joint RE + trees; Apache-2.0) — replaces/ablates LOO TE; lit: Sigrist GPBoost / high-cardinality RE vs TE ([spec](issues/LINEAR_v27_gpboost_account_re.md))
 - [x] Emb kNN train-fold TE (content prior for cold-start accounts) — **v22b: 0.607 → 0.606**; default on (`--no-emb-knn-te` to ablate); PCA must only transform `emb_\d+`
 
 ### Tried — do not re-litigate without a new angle
