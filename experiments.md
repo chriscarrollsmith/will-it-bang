@@ -50,6 +50,8 @@ Dump-time fav/RT used as author history → optimistic RMSE ~0.82 (v5). Invalid 
 | v21 | 0.609 (rate) | 0.437 | TE × own-corpus novelty (revisit v10 + account TE): **flat / slightly worse**; high gain but no metric lift |
 | v22 | 0.604 (rate) | 0.442 | Emb kNN TE **buggy** (PCA dropped `emb_knn_*`; only crosses survived) — not comparable |
 | v22b | **0.606** (rate) | 0.440 | Emb kNN TE (PCA fix): **tiny lift** vs v20a 0.607; `te_minus_knn` / `emb_knn_mean_rate` high gain; hot non-reply under-pred unchanged (~2.24); default on |
+| v23a | 0.610 (rate) | 0.460 | Same-rebuild baseline (`prepare --skip-media`, 0% media flags): fair control for v23b; RMSE slightly above v22b (media gap) |
+| v23b | 0.613 (rate) | 0.457 | Emb engagement CAV (`μ_hot−μ_cold`, non-reply decile, pre-PCA): train corr(proj,y)=0.143, `emb_cav_proj` mid-gain; **flat / slightly worse** vs v23a; hot NR under-pred 2.22→2.23; leave `--emb-cav` off |
 
 ## Failure modes (still open)
 
@@ -113,8 +115,8 @@ Limited by CA completeness; affinity to own history was flat as coarse v10 mean.
 Discover engagement-related structure in MiniLM (or a larger frozen encoder) from the *data*, not hand-picked labels. Fit only on the train time fold; apply to val. Contrast with v15–v17b descriptive tags and with unsupervised emb PCA (already in the stack).
 
 Cheap first bets (smoke: train-fold corr of 1–8 derived dims vs rate; then full train):
-- [ ] **Engagement direction / difference-of-means CAV:** unit vector `μ_hot − μ_cold` on train (e.g. top vs bottom rate decile, optionally non-reply-only); feature = projection onto that direction (TCAV-style; Kim et al. 2018 adapted to regression)
-- [ ] **PLS / CCA / supervised linear projection:** Partial Least Squares (or CCA) of `emb → rate` on train; keep first *k* components instead of / beside variance-PCA — closest to “PCA that maximizes engagement separation”
+- [x] **Engagement direction / difference-of-means CAV:** — **v23b: flat / slightly worse** (0.613 vs v23a 0.610); train corr 0.14 but redundant with emb PCA + knn TE; `--emb-cav` stays opt-in
+- [ ] **PLS / CCA / supervised linear projection:** Partial Least Squares (or CCA) of `emb → rate` on train; keep first *k* components instead of / beside variance-PCA — closest to “PCA that maximizes engagement separation” (next if revisiting emb discovery; CAV’s single axis was too weak)
 - [ ] **Cluster TE:** k-means / spherical k-means on train MiniLM; train-fold LOO mean rate by cluster (+ soft membership or distance-to-centroid); related: cluster→mean-popularity anchors in social popularity work (e.g. AMCFG-style clustering, arXiv:2507.19863)
 
 Heavier / researchy:

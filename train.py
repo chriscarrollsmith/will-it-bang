@@ -174,6 +174,12 @@ EMB_KNN_TE_FEATURES = [
     "te_minus_knn",
 ]
 
+# Train-fold engagement CAV: projection onto μ_hot − μ_cold (raw MiniLM).
+EMB_CAV_FEATURES = [
+    "emb_cav_proj",
+    "emb_cav_proj_sq",
+]
+
 # Added when --author-emb-affinity is set (flat alone in v10).
 AFFINITY_FEATURES = [
     "author_emb_cos",
@@ -204,6 +210,7 @@ def feature_matrix(df: pd.DataFrame, skip_embeddings: bool) -> tuple[np.ndarray,
             + PROVOKE_FEATURES
             + ACCOUNT_TE_FEATURES
             + EMB_KNN_TE_FEATURES
+            + EMB_CAV_FEATURES
         )
         if c in df.columns
     ]
@@ -597,6 +604,23 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=5.0,
         help="Train account count ≤ this counts as cold for knn_x_cold",
+    )
+    p.add_argument(
+        "--emb-cav",
+        action="store_true",
+        help="Add train-fold MiniLM engagement CAV projection (μ_hot−μ_cold; fit before emb PCA)",
+    )
+    p.add_argument(
+        "--emb-cav-quantile",
+        type=float,
+        default=0.1,
+        help="Tail mass for hot/cold means when --emb-cav (0.1 → top/bottom decile)",
+    )
+    p.add_argument(
+        "--emb-cav-nonreply-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fit CAV direction on non-replies only (default on; still project all rows)",
     )
     p.add_argument(
         "--exposure-correct",
@@ -1118,6 +1142,74 @@ def add_emb_knn_target_encoding(
     return train_out, val_out
 
 
+def add_emb_cav_direction(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    *,
+    quantile: float = 0.1,
+    nonreply_only: bool = True,
+    target_col: str = "log_engagement",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Project MiniLM onto the unit difference-of-means direction μ_hot − μ_cold.
+
+    Fit on the train fold only (optionally non-replies), before emb PCA, so the
+    direction lives in the raw embedding space. Dense feature — every row gets
+    a projection; smoke via train-fold corr(proj, target) before promoting.
+    """
+    emb_cols = [c for c in train_df.columns if re.fullmatch(r"emb_\d+", c)]
+    if not emb_cols:
+        print("Skipping emb CAV (no emb_* columns)", flush=True)
+        return train_df, val_df
+    emb_cols = sorted(emb_cols, key=lambda c: int(c.split("_", 1)[1]))
+    q = float(np.clip(quantile, 0.01, 0.49))
+
+    train_out = train_df.reset_index(drop=True).copy()
+    val_out = val_df.reset_index(drop=True).copy()
+    y = train_out[target_col].to_numpy(dtype=np.float64)
+    fit_mask = np.ones(len(train_out), dtype=bool)
+    if nonreply_only and "is_reply" in train_out.columns:
+        fit_mask &= train_out["is_reply"].to_numpy(dtype=np.float64) < 0.5
+    if fit_mask.sum() < 50:
+        print("Skipping emb CAV (too few fit rows)", flush=True)
+        return train_df, val_df
+
+    y_fit = y[fit_mask]
+    lo = float(np.quantile(y_fit, q))
+    hi = float(np.quantile(y_fit, 1.0 - q))
+    cold_mask = fit_mask & (y <= lo)
+    hot_mask = fit_mask & (y >= hi)
+    if cold_mask.sum() < 10 or hot_mask.sum() < 10:
+        print("Skipping emb CAV (empty hot/cold tails)", flush=True)
+        return train_df, val_df
+
+    x_tr = train_out[emb_cols].to_numpy(dtype=np.float64)
+    mu_hot = x_tr[hot_mask].mean(axis=0)
+    mu_cold = x_tr[cold_mask].mean(axis=0)
+    direction = mu_hot - mu_cold
+    norm = float(np.linalg.norm(direction))
+    if norm < 1e-12:
+        print("Skipping emb CAV (degenerate direction)", flush=True)
+        return train_df, val_df
+    direction = direction / norm
+
+    proj_tr = (x_tr @ direction).astype(np.float32)
+    proj_va = (val_out[emb_cols].to_numpy(dtype=np.float64) @ direction).astype(np.float32)
+    train_out["emb_cav_proj"] = proj_tr
+    train_out["emb_cav_proj_sq"] = (proj_tr * proj_tr).astype(np.float32)
+    val_out["emb_cav_proj"] = proj_va
+    val_out["emb_cav_proj_sq"] = (proj_va * proj_va).astype(np.float32)
+
+    corr = float(np.corrcoef(proj_tr, y)[0, 1]) if len(y) > 2 else float("nan")
+    print(
+        f"Emb CAV: q={q:g} nonreply_only={nonreply_only} "
+        f"hot={int(hot_mask.sum()):,} cold={int(cold_mask.sum()):,} "
+        f"|μh−μc|={norm:.4f} train corr(proj,y)={corr:.4f} "
+        f"val proj p50={float(np.median(proj_va)):.4f}",
+        flush=True,
+    )
+    return train_out, val_out
+
+
 def apply_emb_pca(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
@@ -1314,6 +1406,14 @@ def main() -> None:
             val_df,
             k=args.emb_knn_k,
             cold_max_n=args.emb_knn_cold_max_n,
+        )
+    if args.emb_cav and not args.skip_embeddings:
+        # Fit on raw MiniLM before train-fit PCA replaces emb_*.
+        train_df, val_df = add_emb_cav_direction(
+            train_df,
+            val_df,
+            quantile=args.emb_cav_quantile,
+            nonreply_only=args.emb_cav_nonreply_only,
         )
     if args.emb_pca > 0 and not args.skip_embeddings:
         train_df, val_df = apply_emb_pca(train_df, val_df, args.emb_pca)
