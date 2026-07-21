@@ -56,6 +56,8 @@ Dump-time fav/RT used as author history → optimistic RMSE ~0.82 (v5). Invalid 
 | v24b | 0.612 (rate) | 0.448 | Emb PLS-32 **replace** PCA: **flat / slightly worse**; more dims do not help; leave `--emb-pls` off |
 | v25a | 0.611 (rate) | 0.459 | Error-driven fail clusters (OOF emb-free LGBM → k=4 MiniLM): corr(min_dist,y)=−0.04; **flat** vs v23a 0.610; hot NR under-pred unchanged (~2.21); `fail_*` not in top gains; leave `--fail-clusters` off |
 | v25b | 0.612 (rate) | 0.455 | Fail clusters on TE residual: **flat / slightly worse** (0.612); same conclusion |
+| v26a | 0.624 (rate) | 0.437 | Emb cluster TE k=32: train corr 0.16, `cluster_mean_rate` #3 gain; **regress** vs v23a 0.610; hot NR under-pred worse (2.29); leave `--emb-cluster-te` off |
+| v26b | 0.616 (rate) | 0.444 | Emb cluster TE k=64: **still worse** (0.616); coarser k hurts less but no lift |
 
 ## Failure modes (still open)
 
