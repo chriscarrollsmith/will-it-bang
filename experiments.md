@@ -140,7 +140,7 @@ Heavier / researchy:
 - [ ] Larger frozen encoder (Modal credits) vs MiniLM
 - [ ] Further scale (>120k / more accounts with lower `min-account-tweets`)
 - [x] Account-level **target encoding** (train-fold LOO, leakage-safe) — **v19: 0.642 → 0.639 rate RMSE**, Spearman 0.441→0.452; default on (`--no-account-te` to ablate)
-- [x] True account **random effects** via GPBoost — **v27c: regress** (0.653 vs v27b 0.613; also worse than mse floor 0.642); custom asymmetric loss unsupported with `gp_model`; RE variance tiny on full stack; keep `--model gpboost` opt-in only ([PRO-7](https://linear.app/promptly-technologies-llc/issue/PRO-7/v27-gpboost-account-random-effects-replace-loo-account-te); [pointer](issues/LINEAR_v27_gpboost_account_re.md))
+- [x] True account **random effects** via GPBoost — **v27c: regress** (0.653 vs v27b 0.613; also worse than mse floor 0.642); custom asymmetric loss unsupported with `gp_model`; RE variance tiny on full stack; keep `--model gpboost` opt-in only
 - [x] Emb kNN train-fold TE (content prior for cold-start accounts) — **v22b: 0.607 → 0.606**; default on (`--no-emb-knn-te` to ablate); PCA must only transform `emb_\d+`
 
 ### Tried — do not re-litigate without a new angle
