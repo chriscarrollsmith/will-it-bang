@@ -220,6 +220,10 @@ def feature_matrix(df: pd.DataFrame, skip_embeddings: bool) -> tuple[np.ndarray,
         cols = cols + emb_cols
     tfidf_cols = [c for c in df.columns if c.startswith("tfidf_")]
     cols = cols + tfidf_cols
+    pls_cols = [c for c in df.columns if re.fullmatch(r"pls_\d+", c)]
+    if pls_cols:
+        pls_cols = sorted(pls_cols, key=lambda c: int(c.split("_", 1)[1]))
+        cols = cols + pls_cols
     if "p_breakout" in df.columns:
         cols = cols + ["p_breakout"]
     x = df[cols].to_numpy(dtype=np.float32)
@@ -597,6 +601,13 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=5.0,
         help="Train account count ≤ this counts as cold for knn_x_cold",
+    )
+    p.add_argument(
+        "--emb-pls",
+        type=int,
+        default=0,
+        help="Train-fold PLS of raw MiniLM→target; add this many pls_* dims "
+        "(fit before emb PCA; 0 disables). Use with --emb-pca 0 to replace variance PCA",
     )
     p.add_argument(
         "--exposure-correct",
@@ -1118,6 +1129,57 @@ def add_emb_knn_target_encoding(
     return train_out, val_out
 
 
+def add_emb_pls(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    n_components: int,
+    *,
+    target_col: str = "log_engagement",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Train-fold PLS of MiniLM → target; dense pls_* scores (fit before emb PCA)."""
+    from sklearn.cross_decomposition import PLSRegression
+
+    emb_cols = [c for c in train_df.columns if re.fullmatch(r"emb_\d+", c)]
+    if not emb_cols or n_components <= 0:
+        return train_df, val_df
+    emb_cols = sorted(emb_cols, key=lambda c: int(c.split("_", 1)[1]))
+    k = min(int(n_components), len(emb_cols), len(train_df) - 1)
+    if k < 1:
+        return train_df, val_df
+
+    train_out = train_df.reset_index(drop=True).copy()
+    val_out = val_df.reset_index(drop=True).copy()
+    x_tr = train_out[emb_cols].to_numpy(dtype=np.float64)
+    x_va = val_out[emb_cols].to_numpy(dtype=np.float64)
+    y = train_out[target_col].to_numpy(dtype=np.float64)
+
+    pls = PLSRegression(n_components=k, scale=True)
+    z_tr = np.asarray(pls.fit_transform(x_tr, y)[0], dtype=np.float64)
+    z_va = np.asarray(pls.transform(x_va), dtype=np.float64)
+
+    # Drop any prior pls_* then attach.
+    drop = [c for c in train_out.columns if re.fullmatch(r"pls_\d+", c)]
+    if drop:
+        train_out = train_out.drop(columns=drop)
+        val_out = val_out.drop(columns=[c for c in drop if c in val_out.columns])
+    for i in range(z_tr.shape[1]):
+        train_out[f"pls_{i}"] = z_tr[:, i].astype(np.float32)
+        val_out[f"pls_{i}"] = z_va[:, i].astype(np.float32)
+
+    corr0 = float(np.corrcoef(z_tr[:, 0], y)[0, 1]) if len(y) > 2 else float("nan")
+    # How much of train target linear signal the k scores capture (in-sample R² of PLS).
+    y_hat = np.asarray(pls.predict(x_tr), dtype=np.float64).reshape(-1)
+    ss_res = float(np.sum((y - y_hat) ** 2))
+    ss_tot = float(np.sum((y - y.mean()) ** 2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+    print(
+        f"Emb PLS: k={k} train corr(pls_0,y)={corr0:.4f} in-sample R²={r2:.4f} "
+        f"val pls_0 p50={float(np.median(z_va[:, 0])):.4f}",
+        flush=True,
+    )
+    return train_out, val_out
+
+
 def apply_emb_pca(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
@@ -1315,6 +1377,9 @@ def main() -> None:
             k=args.emb_knn_k,
             cold_max_n=args.emb_knn_cold_max_n,
         )
+    if args.emb_pls > 0 and not args.skip_embeddings:
+        # Fit on raw MiniLM before train-fit PCA replaces emb_*.
+        train_df, val_df = add_emb_pls(train_df, val_df, args.emb_pls)
     if args.emb_pca > 0 and not args.skip_embeddings:
         train_df, val_df = apply_emb_pca(train_df, val_df, args.emb_pca)
     if args.text_svd > 0:
