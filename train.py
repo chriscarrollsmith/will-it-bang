@@ -445,12 +445,16 @@ def prepare_account_rank_order(
     y: np.ndarray,
     *,
     min_group: int = 2,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, float]]:
-    """Sort rows by account and build LightGBM group sizes (drop tiny accounts)."""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, float]]:
+    """Sort by account, build group sizes, and integer within-group relevance ranks.
+
+    LightGBM LambdaRank requires int labels; higher = more relevant. Ranks are
+    computed from continuous ``y`` within each account (draft-ranking groups).
+    """
     account_ids = np.asarray(account_ids)
+    y = np.asarray(y, dtype=np.float64)
     order = np.argsort(account_ids, kind="mergesort")
     ids_sorted = account_ids[order]
-    # Contiguous group sizes
     _, idx_start, counts = np.unique(ids_sorted, return_index=True, return_counts=True)
     keep_acct = counts >= int(min_group)
     if not keep_acct.any():
@@ -461,15 +465,28 @@ def prepare_account_rank_order(
             keep_row[start : start + n] = True
     order_keep = order[keep_row]
     ids_keep = account_ids[order_keep]
+    y_keep = y[order_keep]
     _, _, group = np.unique(ids_keep, return_index=True, return_counts=True)
+    group = group.astype(np.int32)
+    # Dense within-group ranks: higher y → higher relevance label.
+    rel = np.empty(y_keep.shape[0], dtype=np.int32)
+    start = 0
+    for n in group:
+        sl = slice(start, start + int(n))
+        order_y = np.argsort(y_keep[sl], kind="mergesort")
+        ranks = np.empty(int(n), dtype=np.int32)
+        ranks[order_y] = np.arange(int(n), dtype=np.int32)
+        rel[sl] = ranks
+        start += int(n)
     meta = {
         "rank_n_rows": float(order_keep.size),
         "rank_n_groups": float(group.size),
         "rank_min_group": float(min_group),
         "rank_mean_group": float(np.mean(group)),
         "rank_frac_rows_kept": float(order_keep.size / max(account_ids.shape[0], 1)),
+        "rank_label_max": float(rel.max()) if rel.size else 0.0,
     }
-    return x[order_keep], y[order_keep], group.astype(np.int32), meta
+    return x[order_keep], y_keep, rel, group, meta
 
 
 def train_model(
@@ -591,6 +608,9 @@ def train_model(
     elif effective_loss == "lambdarank":
         params["objective"] = "lambdarank"
         params["lambdarank_truncation_level"] = 30
+        # Within-group ranks can exceed LightGBM's default label_gain length.
+        max_lab = int(max(np.max(y_train), np.max(y_val))) if y_val.size else int(np.max(y_train))
+        params["label_gain"] = list(range(max_lab + 1))
     else:
         raise ValueError(f"Unknown loss={loss!r}")
 
@@ -2188,18 +2208,19 @@ def fit_predict_group(
         if rank_nonreply_only:
             tr_mask &= train_df["is_reply"].to_numpy() == 0
             va_mask &= val_df["is_reply"].to_numpy() == 0
-        x_tr_r, y_tr_r, g_tr, meta_tr = prepare_account_rank_order(
+        x_tr_r, y_tr_cont, rel_tr, g_tr, meta_tr = prepare_account_rank_order(
             train_df.loc[tr_mask, "account_id"].astype(str).to_numpy(),
             x_train[tr_mask],
             y_train[tr_mask],
             min_group=rank_min_group,
         )
-        x_va_r, y_va_r, g_va, meta_va = prepare_account_rank_order(
+        x_va_r, y_va_cont, rel_va, g_va, meta_va = prepare_account_rank_order(
             val_df.loc[va_mask, "account_id"].astype(str).to_numpy(),
             x_val[va_mask],
             y_val_model[va_mask],
             min_group=rank_min_group,
         )
+        del y_tr_cont  # continuous kept only to build int ranks
         extra_metrics.update({f"train_{k}": v for k, v in meta_tr.items()})
         extra_metrics.update({f"val_{k}": v for k, v in meta_va.items()})
         print(
@@ -2211,12 +2232,18 @@ def fit_predict_group(
             f"nonreply_only={rank_nonreply_only}",
             flush=True,
         )
-        # Val rank subset is already non-reply → Spearman feval on all rows.
+        # Train on int within-group ranks; Spearman early-stop vs continuous rate.
+        stop = early_stop_metric
+        val_labels = rel_va
+        val_nr_mask = None
+        if stop == "spearman_nonreply":
+            val_labels = y_va_cont
+            val_nr_mask = None  # subset already non-reply → feval_all
         model, sera_meta = train_model(
             x_tr_r,
-            y_tr_r,
+            rel_tr,
             x_va_r,
-            y_va_r,
+            val_labels if stop == "spearman_nonreply" else rel_va,
             feature_names,
             seed=seed,
             weight_train=None,
@@ -2225,8 +2252,8 @@ def fit_predict_group(
             asymmetric_under_weight=asymmetric_under_weight,
             sera_floor=sera_floor,
             sera_high_only=sera_high_only,
-            early_stop_metric=early_stop_metric,
-            val_is_nonreply=None,
+            early_stop_metric=stop,
+            val_is_nonreply=val_nr_mask,
             group_train=g_tr,
             group_val=g_va,
         )
