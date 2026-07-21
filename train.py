@@ -429,8 +429,9 @@ def train_gpboost_model(
         "num_leaves": 47,
         "min_data_in_leaf": 50,
         "feature_fraction": 0.7,
-        "bagging_fraction": 0.8,
-        "bagging_freq": 1,
+        # GPBoost algorithm rejects bagging; keep feature_fraction subsample only.
+        "bagging_fraction": 1.0,
+        "bagging_freq": 0,
         "lambda_l2": 1.0,
         "verbosity": -1,
         "verbose": -1,
