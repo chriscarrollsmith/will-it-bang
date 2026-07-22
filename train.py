@@ -2635,6 +2635,9 @@ def main() -> None:
             sera_floor=args.sera_floor,
             sera_high_only=args.sera_high_only,
             early_stop_metric=args.early_stop_metric,
+            rank_nonreply_only=args.rank_nonreply_only,
+            rank_min_group=args.rank_min_group,
+            hybrid_rank=args.hybrid_rank,
             model_kind=args.model,
         )
         # Score full val with the non-reply model, then overwrite replies.
@@ -2686,6 +2689,9 @@ def main() -> None:
                 sera_floor=args.sera_floor,
                 sera_high_only=args.sera_high_only,
                 early_stop_metric=args.early_stop_metric,
+                rank_nonreply_only=args.rank_nonreply_only,
+                rank_min_group=args.rank_min_group,
+                hybrid_rank=args.hybrid_rank,
                 model_kind=args.model,
             )
             pred[val_df["is_reply"].to_numpy() == mask_val] = p
@@ -2707,6 +2713,9 @@ def main() -> None:
             sera_floor=args.sera_floor,
             sera_high_only=args.sera_high_only,
             early_stop_metric=args.early_stop_metric,
+            rank_nonreply_only=args.rank_nonreply_only,
+            rank_min_group=args.rank_min_group,
+            hybrid_rank=args.hybrid_rank,
             model_kind=args.model,
         )
 
