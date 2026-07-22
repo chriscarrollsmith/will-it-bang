@@ -184,6 +184,11 @@ EMB_CAV_FEATURES = [
     "emb_cav_proj_sq",
 ]
 
+# FWL residual emb after regressing MiniLM on account TE (`--emb-residual-pls`).
+EMB_RESIDUAL_FEATURES = [
+    "emb_res_l2",
+]
+
 # Train-fold MiniLM k-means cluster target encoding (content neighborhoods).
 EMB_CLUSTER_TE_FEATURES = [
     "cluster_mean_rate",
@@ -245,6 +250,13 @@ def feature_matrix(df: pd.DataFrame, skip_embeddings: bool) -> tuple[np.ndarray,
     if pls_cols:
         pls_cols = sorted(pls_cols, key=lambda c: int(c.split("_", 1)[1]))
         cols = cols + pls_cols
+    res_pls_cols = [c for c in df.columns if re.fullmatch(r"res_pls_\d+", c)]
+    if res_pls_cols:
+        res_pls_cols = sorted(res_pls_cols, key=lambda c: int(c.rsplit("_", 1)[1]))
+        cols = cols + res_pls_cols
+    for c in EMB_RESIDUAL_FEATURES:
+        if c in df.columns and c not in cols:
+            cols = cols + [c]
     fail_cols = [c for c in df.columns if c == "fail_min_dist" or re.fullmatch(r"fail_dist_\d+", c)]
     if fail_cols:
         fail_cols = sorted(
@@ -1267,6 +1279,19 @@ def parse_args() -> argparse.Namespace:
         "(fit before emb PCA; 0 disables). Use with --emb-pca 0 to replace variance PCA",
     )
     p.add_argument(
+        "--emb-residual-pls",
+        type=int,
+        default=0,
+        help="FWL: residualize MiniLM on account_mean_rate, PLS→(y−TE); add res_pls_* "
+        "+ emb_res_l2 (fit before emb PCA; 0 disables; needs --account-te)",
+    )
+    p.add_argument(
+        "--emb-residual-pls-nonreply-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Fit residual PLS on non-replies only (default off; still score all rows)",
+    )
+    p.add_argument(
         "--fail-clusters",
         action="store_true",
         help="Cluster train OOF under-prediction MiniLM vectors; add fail_min_dist / fail_dist_*",
@@ -1974,6 +1999,115 @@ def add_emb_pls(
     return train_out, val_out
 
 
+def add_emb_residual_pls(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    n_components: int,
+    *,
+    te_col: str = "account_mean_rate",
+    target_col: str = "log_engagement",
+    nonreply_only: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """FWL residual MiniLM after linear account-TE removal, then PLS → residual target.
+
+    Isolates content geometry orthogonal to account heat. Fit before emb PCA.
+    Requires ``account_mean_rate`` (run after ``--account-te``). Adds ``res_pls_*``
+    and ``emb_res_l2`` (||residual emb||).
+    """
+    from sklearn.cross_decomposition import PLSRegression
+
+    emb_cols = [c for c in train_df.columns if re.fullmatch(r"emb_\d+", c)]
+    if not emb_cols or n_components <= 0:
+        return train_df, val_df
+    if te_col not in train_df.columns or te_col not in val_df.columns:
+        print(f"Skipping emb residual PLS (missing {te_col}; enable --account-te)", flush=True)
+        return train_df, val_df
+    emb_cols = sorted(emb_cols, key=lambda c: int(c.split("_", 1)[1]))
+    k = min(int(n_components), len(emb_cols), len(train_df) - 1)
+    if k < 1:
+        return train_df, val_df
+
+    train_out = train_df.reset_index(drop=True).copy()
+    val_out = val_df.reset_index(drop=True).copy()
+    x_tr = train_out[emb_cols].to_numpy(dtype=np.float64)
+    x_va = val_out[emb_cols].to_numpy(dtype=np.float64)
+    te_tr = train_out[te_col].to_numpy(dtype=np.float64)
+    te_va = val_out[te_col].to_numpy(dtype=np.float64)
+    y = train_out[target_col].to_numpy(dtype=np.float64)
+
+    fit_mask = np.ones(len(train_out), dtype=bool)
+    if nonreply_only and "is_reply" in train_out.columns:
+        fit_mask &= train_out["is_reply"].to_numpy(dtype=np.float64) < 0.5
+    if int(fit_mask.sum()) < max(50, k + 5):
+        print("Skipping emb residual PLS (too few fit rows)", flush=True)
+        return train_df, val_df
+
+    # Per-dim OLS: emb_j ~ a + b · account_TE (train-fit; apply to val).
+    te_fit = te_tr[fit_mask]
+    te_c = te_fit - float(te_fit.mean())
+    te_var = float(np.dot(te_c, te_c))
+    if te_var < 1e-12:
+        print("Skipping emb residual PLS (degenerate account TE)", flush=True)
+        return train_df, val_df
+    x_fit = x_tr[fit_mask]
+    # slope_j = cov(te, emb_j) / var(te); intercept from means.
+    slopes = (te_c @ (x_fit - x_fit.mean(axis=0))) / te_var
+    intercepts = x_fit.mean(axis=0) - slopes * float(te_fit.mean())
+    x_tr_res = x_tr - (intercepts + np.outer(te_tr, slopes))
+    x_va_res = x_va - (intercepts + np.outer(te_va, slopes))
+
+    y_res = y - te_tr
+    y_fit_res = y_res[fit_mask]
+    x_fit_res = x_tr_res[fit_mask]
+
+    pls = PLSRegression(n_components=k, scale=True)
+    z_fit = np.asarray(pls.fit_transform(x_fit_res, y_fit_res)[0], dtype=np.float64)
+    z_tr = np.asarray(pls.transform(x_tr_res), dtype=np.float64)
+    z_va = np.asarray(pls.transform(x_va_res), dtype=np.float64)
+
+    drop = [c for c in train_out.columns if re.fullmatch(r"res_pls_\d+", c) or c == "emb_res_l2"]
+    if drop:
+        train_out = train_out.drop(columns=drop)
+        val_out = val_out.drop(columns=[c for c in drop if c in val_out.columns])
+    for i in range(z_tr.shape[1]):
+        train_out[f"res_pls_{i}"] = z_tr[:, i].astype(np.float32)
+        val_out[f"res_pls_{i}"] = z_va[:, i].astype(np.float32)
+
+    emb_res_l2_tr = np.linalg.norm(x_tr_res, axis=1).astype(np.float32)
+    emb_res_l2_va = np.linalg.norm(x_va_res, axis=1).astype(np.float32)
+    train_out["emb_res_l2"] = emb_res_l2_tr
+    val_out["emb_res_l2"] = emb_res_l2_va
+
+    def _safe_corr(a: np.ndarray, b: np.ndarray) -> float:
+        if a.size < 3 or np.std(a) < 1e-12 or np.std(b) < 1e-12:
+            return float("nan")
+        return float(np.corrcoef(a, b)[0, 1])
+
+    corr_yres = _safe_corr(z_tr[:, 0], y_res)
+    corr_y = _safe_corr(z_tr[:, 0], y)
+    corr_l2 = _safe_corr(emb_res_l2_tr, y_res)
+    # Within-account demeaned target corr (proxy for locked wa_* primary).
+    aid = train_out["account_id"].astype(str).to_numpy()
+    y_demean = y.copy()
+    for a in np.unique(aid):
+        m = aid == a
+        if m.sum() >= 2:
+            y_demean[m] -= float(y_demean[m].mean())
+    corr_wa = _safe_corr(z_tr[:, 0], y_demean)
+    # Fraction of emb variance removed by TE residualization.
+    var_raw = float(np.mean(np.var(x_fit, axis=0)))
+    var_res = float(np.mean(np.var(x_fit_res, axis=0)))
+    frac_kept = var_res / var_raw if var_raw > 0 else float("nan")
+    print(
+        f"Emb residual PLS: k={k} nonreply_only={nonreply_only} "
+        f"corr(res_pls_0,y_res)={corr_yres:.4f} corr(res_pls_0,y)={corr_y:.4f} "
+        f"corr(res_pls_0,y_within)={corr_wa:.4f} corr(emb_res_l2,y_res)={corr_l2:.4f} "
+        f"emb_var_kept={frac_kept:.3f} val res_pls_0 p50={float(np.median(z_va[:, 0])):.4f}",
+        flush=True,
+    )
+    return train_out, val_out
+
+
 def _train_oof_underpred(
     train_df: pd.DataFrame,
     *,
@@ -2597,6 +2731,14 @@ def main() -> None:
     if args.emb_pls > 0 and not args.skip_embeddings:
         # Fit on raw MiniLM before train-fit PCA replaces emb_*.
         train_df, val_df = add_emb_pls(train_df, val_df, args.emb_pls)
+    if args.emb_residual_pls > 0 and not args.skip_embeddings:
+        # Needs account_mean_rate; residualize raw MiniLM before emb PCA.
+        train_df, val_df = add_emb_residual_pls(
+            train_df,
+            val_df,
+            args.emb_residual_pls,
+            nonreply_only=args.emb_residual_pls_nonreply_only,
+        )
     if args.fail_clusters and not args.skip_embeddings:
         # Cluster raw MiniLM of OOF under-preds before emb PCA replaces emb_*.
         train_df, val_df = add_fail_clusters(
@@ -2896,6 +3038,7 @@ def main() -> None:
     metrics["sera_nonreply_only"] = (
         float(args.sera_nonreply_only) if args.loss == "sera" else 0.0
     )
+    metrics["emb_residual_pls"] = float(args.emb_residual_pls)
     metrics["early_stop_metric"] = args.early_stop_metric
     metrics["hybrid_rank"] = float(args.hybrid_rank)
     metrics["rank_nonreply_only"] = (
