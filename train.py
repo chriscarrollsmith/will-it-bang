@@ -296,6 +296,93 @@ def evaluate(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
     }
 
 
+def within_account_spearman(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    account_ids: np.ndarray,
+    *,
+    min_n: int = 2,
+) -> dict[str, float]:
+    """Mean/median/size-weighted Spearman within each account (draft-quality metric)."""
+    y_true = np.asarray(y_true, dtype=np.float64)
+    y_pred = np.asarray(y_pred, dtype=np.float64)
+    account_ids = np.asarray(account_ids)
+    corrs: list[float] = []
+    weights: list[float] = []
+    # Group by sorting accounts (faster than pandas groupby for numpy arrays).
+    order = np.argsort(account_ids, kind="mergesort")
+    ids_sorted = account_ids[order]
+    y_s = y_true[order]
+    p_s = y_pred[order]
+    _, starts, counts = np.unique(ids_sorted, return_index=True, return_counts=True)
+    for start, n in zip(starts, counts, strict=True):
+        if int(n) < min_n:
+            continue
+        sl = slice(start, start + int(n))
+        c = spearmanr(y_s[sl], p_s[sl]).correlation
+        if c == c:
+            corrs.append(float(c))
+            weights.append(float(n))
+    if not corrs:
+        return {
+            "mean": float("nan"),
+            "median": float("nan"),
+            "weighted_mean": float("nan"),
+            "n_accounts": 0.0,
+        }
+    c_arr = np.asarray(corrs, dtype=np.float64)
+    w_arr = np.asarray(weights, dtype=np.float64)
+    return {
+        "mean": float(c_arr.mean()),
+        "median": float(np.median(c_arr)),
+        "weighted_mean": float(np.average(c_arr, weights=w_arr)),
+        "n_accounts": float(c_arr.size),
+    }
+
+
+def blend_level_with_rank_scores(
+    level: np.ndarray,
+    rank_score: np.ndarray,
+    account_ids: np.ndarray,
+    mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """Keep per-account level mean/std; impose ranker's within-account order.
+
+    For each account (optionally masked to a stratum): replace within-account
+    variation with the ranker's z-scored order, scaled to the level model's
+    within-account std. Singleton accounts keep the level prediction.
+    """
+    out = np.asarray(level, dtype=np.float64).copy()
+    rank_score = np.asarray(rank_score, dtype=np.float64)
+    account_ids = np.asarray(account_ids)
+    if mask is None:
+        idx = np.arange(out.shape[0])
+    else:
+        idx = np.flatnonzero(np.asarray(mask, dtype=bool))
+    if idx.size == 0:
+        return out
+    ids = account_ids[idx]
+    order = np.argsort(ids, kind="mergesort")
+    idx_s = idx[order]
+    ids_s = ids[order]
+    _, starts, counts = np.unique(ids_s, return_index=True, return_counts=True)
+    for start, n in zip(starts, counts, strict=True):
+        if int(n) < 2:
+            continue
+        rows = idx_s[start : start + int(n)]
+        lev = out[rows]
+        r = rank_score[rows]
+        r_std = float(r.std())
+        if r_std < 1e-12:
+            continue
+        r_z = (r - float(r.mean())) / r_std
+        lev_std = float(lev.std())
+        if lev_std < 1e-12:
+            lev_std = 1.0
+        out[rows] = float(lev.mean()) + r_z * lev_std
+    return out
+
+
 def _medcouple(x: np.ndarray, *, max_n: int = 2000, seed: int = 0) -> float:
     """Medcouple skewness (Hubert & Vandervieren) for adjusted boxplot fences."""
     x = np.asarray(x, dtype=np.float64)
@@ -389,17 +476,130 @@ def apply_sera_sample_weights(
     sera_floor: float = 0.05,
     high_only: bool = True,
     seed: int = 0,
+    apply_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, float]]:
-    """Multiply sample weights by floor+(1−floor)·φ(y) for SERA-weighted MSE."""
-    phi, meta = relevance_phi_sera(y_train, high_only=high_only, seed=seed)
+    """Multiply sample weights by floor+(1−floor)·φ(y) for SERA-weighted MSE.
+
+    If ``apply_mask`` is set, fit φ on the masked rows only and leave unmasked
+    rows at their base weight (used for non-reply-stratum SERA).
+    """
+    y_train = np.asarray(y_train, dtype=np.float64)
     floor = float(np.clip(sera_floor, 0.0, 1.0))
-    sera_w = floor + (1.0 - floor) * phi
     base = np.ones(y_train.shape[0], dtype=np.float64) if weight_train is None else np.asarray(
         weight_train, dtype=np.float64
     )
+    if apply_mask is None:
+        phi, meta = relevance_phi_sera(y_train, high_only=high_only, seed=seed)
+        sera_w = floor + (1.0 - floor) * phi
+        out = base * sera_w
+    else:
+        mask = np.asarray(apply_mask, dtype=bool)
+        if mask.shape[0] != y_train.shape[0]:
+            raise ValueError(
+                f"SERA apply_mask length {mask.shape[0]} != y_train {y_train.shape[0]}"
+            )
+        if not mask.any():
+            phi, meta = relevance_phi_sera(y_train, high_only=high_only, seed=seed)
+            out = base.copy()
+        else:
+            phi_sub, meta = relevance_phi_sera(y_train[mask], high_only=high_only, seed=seed)
+            sera_w = np.ones(y_train.shape[0], dtype=np.float64)
+            sera_w[mask] = floor + (1.0 - floor) * phi_sub
+            out = base * sera_w
+            meta["sera_frac_pos"] = float(np.mean(phi_sub > 1e-6))
+            meta["sera_mean_phi"] = float(np.mean(phi_sub))
+            meta["sera_n_apply"] = float(mask.sum())
     meta["sera_floor"] = floor
     meta["sera_high_only"] = float(high_only)
-    return base * sera_w, meta
+    meta["sera_nonreply_only"] = float(apply_mask is not None)
+    return out, meta
+
+
+def _spearman_nonreply_feval(is_nonreply: np.ndarray):
+    """LightGBM feval: Spearman on val non-replies (higher is better)."""
+    mask = np.asarray(is_nonreply, dtype=bool)
+
+    def feval(y_pred: np.ndarray, dataset: lgb.Dataset):
+        y_true = np.asarray(dataset.get_label(), dtype=np.float64)
+        pred = np.asarray(y_pred, dtype=np.float64)
+        if mask.shape[0] != y_true.shape[0]:
+            raise ValueError(
+                f"spearman_nonreply feval mask length {mask.shape[0]} != val {y_true.shape[0]}"
+            )
+        if not mask.any():
+            return "spearman_nonreply", 0.0, True
+        corr = spearmanr(y_true[mask], pred[mask]).correlation
+        if corr != corr:  # NaN
+            corr = 0.0
+        return "spearman_nonreply", float(corr), True
+
+    return feval
+
+
+def _spearman_feval_all():
+    """Spearman on the full validation set (e.g. rank subset that is already non-reply)."""
+
+    def feval(y_pred: np.ndarray, dataset: lgb.Dataset):
+        y_true = np.asarray(dataset.get_label(), dtype=np.float64)
+        pred = np.asarray(y_pred, dtype=np.float64)
+        if y_true.size < 2:
+            return "spearman_nonreply", 0.0, True
+        corr = spearmanr(y_true, pred).correlation
+        if corr != corr:
+            corr = 0.0
+        return "spearman_nonreply", float(corr), True
+
+    return feval
+
+
+def prepare_account_rank_order(
+    account_ids: np.ndarray,
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    min_group: int = 2,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, float]]:
+    """Sort by account, build group sizes, and integer within-group relevance ranks.
+
+    LightGBM LambdaRank requires int labels; higher = more relevant. Ranks are
+    computed from continuous ``y`` within each account (draft-ranking groups).
+    """
+    account_ids = np.asarray(account_ids)
+    y = np.asarray(y, dtype=np.float64)
+    order = np.argsort(account_ids, kind="mergesort")
+    ids_sorted = account_ids[order]
+    _, idx_start, counts = np.unique(ids_sorted, return_index=True, return_counts=True)
+    keep_acct = counts >= int(min_group)
+    if not keep_acct.any():
+        raise ValueError(f"No accounts with >={min_group} rows for LambdaRank")
+    keep_row = np.zeros(ids_sorted.shape[0], dtype=bool)
+    for start, n, ok in zip(idx_start, counts, keep_acct, strict=True):
+        if ok:
+            keep_row[start : start + n] = True
+    order_keep = order[keep_row]
+    ids_keep = account_ids[order_keep]
+    y_keep = y[order_keep]
+    _, _, group = np.unique(ids_keep, return_index=True, return_counts=True)
+    group = group.astype(np.int32)
+    # Dense within-group ranks: higher y → higher relevance label.
+    rel = np.empty(y_keep.shape[0], dtype=np.int32)
+    start = 0
+    for n in group:
+        sl = slice(start, start + int(n))
+        order_y = np.argsort(y_keep[sl], kind="mergesort")
+        ranks = np.empty(int(n), dtype=np.int32)
+        ranks[order_y] = np.arange(int(n), dtype=np.int32)
+        rel[sl] = ranks
+        start += int(n)
+    meta = {
+        "rank_n_rows": float(order_keep.size),
+        "rank_n_groups": float(group.size),
+        "rank_min_group": float(min_group),
+        "rank_mean_group": float(np.mean(group)),
+        "rank_frac_rows_kept": float(order_keep.size / max(account_ids.shape[0], 1)),
+        "rank_label_max": float(rel.max()) if rel.size else 0.0,
+    }
+    return x[order_keep], y_keep, rel, group, meta
 
 
 def train_model(
@@ -416,36 +616,66 @@ def train_model(
     asymmetric_under_weight: float = 3.0,
     sera_floor: float = 0.05,
     sera_high_only: bool = True,
+    sera_nonreply_only: bool = False,
+    early_stop_metric: str = "rmse",
+    val_is_nonreply: np.ndarray | None = None,
+    train_is_nonreply: np.ndarray | None = None,
+    group_train: np.ndarray | None = None,
+    group_val: np.ndarray | None = None,
 ) -> tuple[lgb.Booster, dict[str, float]]:
     sera_meta: dict[str, float] = {}
     effective_weight = weight_train
     effective_loss = loss
     if loss == "sera":
         # SERA ∝ Σ φ(y)·(ŷ−y)² — optimize via MSE + relevance sample weights.
+        apply_mask = None
+        if sera_nonreply_only:
+            if train_is_nonreply is None:
+                raise ValueError("sera_nonreply_only requires train_is_nonreply")
+            apply_mask = train_is_nonreply
         effective_weight, sera_meta = apply_sera_sample_weights(
             y_train,
             weight_train,
             sera_floor=sera_floor,
             high_only=sera_high_only,
             seed=seed,
+            apply_mask=apply_mask,
         )
         effective_loss = "mse"
+        scope = "nonreply-only" if sera_nonreply_only else "all"
         print(
-            f"SERA relevance: med={sera_meta['sera_med']:.4f} upper={sera_meta['sera_upper']:.4f} "
+            f"SERA relevance ({scope}): med={sera_meta['sera_med']:.4f} "
+            f"upper={sera_meta['sera_upper']:.4f} "
             f"mc={sera_meta['sera_mc']:.3f} mean_phi={sera_meta['sera_mean_phi']:.3f} "
             f"frac_pos={sera_meta['sera_frac_pos']:.3f} floor={sera_floor:g}",
             flush=True,
         )
 
+    if loss == "lambdarank":
+        if group_train is None or group_val is None:
+            raise ValueError("loss=lambdarank requires group_train and group_val")
+        if int(np.sum(group_train)) != x_train.shape[0]:
+            raise ValueError("sum(group_train) must equal n_train")
+        if int(np.sum(group_val)) != x_val.shape[0]:
+            raise ValueError("sum(group_val) must equal n_val")
+        # Ranking objectives do not use regression sample weights.
+        effective_weight = None
+
     train_set = lgb.Dataset(
         x_train,
         label=y_train,
         weight=effective_weight,
+        group=group_train if loss == "lambdarank" else None,
         feature_name=feature_names,
     )
-    val_set = lgb.Dataset(x_val, label=y_val, reference=train_set, feature_name=feature_names)
+    val_set = lgb.Dataset(
+        x_val,
+        label=y_val,
+        group=group_val if loss == "lambdarank" else None,
+        reference=train_set,
+        feature_name=feature_names,
+    )
     params: dict = {
-        "metric": "rmse",
         "learning_rate": 0.04,
         "num_leaves": 47,
         "min_data_in_leaf": 50,
@@ -456,6 +686,28 @@ def train_model(
         "verbosity": -1,
         "seed": seed,
     }
+    feval = None
+    stop_metric = early_stop_metric
+    if loss == "lambdarank" and early_stop_metric == "rmse":
+        # Ranking scores are not in label units; use NDCG for selection by default.
+        stop_metric = "ndcg"
+        print("Note: lambdarank uses early_stop=ndcg (rmse is not meaningful for rank scores)", flush=True)
+
+    if stop_metric == "spearman_nonreply":
+        params["metric"] = "None"
+        if val_is_nonreply is None:
+            # Rank subset already filtered to non-replies → Spearman on all val rows.
+            feval = _spearman_feval_all()
+        else:
+            feval = _spearman_nonreply_feval(val_is_nonreply)
+    elif stop_metric == "ndcg":
+        params["metric"] = "ndcg"
+        params["eval_at"] = [10, 20]
+    elif stop_metric == "rmse":
+        params["metric"] = "rmse"
+    else:
+        raise ValueError(f"Unknown early_stop_metric={early_stop_metric!r}")
+
     if effective_loss == "huber":
         params["objective"] = "huber"
         params["alpha"] = 1.0
@@ -476,6 +728,12 @@ def train_model(
             return grad, hess
 
         params["objective"] = asymmetric_mse
+    elif effective_loss == "lambdarank":
+        params["objective"] = "lambdarank"
+        params["lambdarank_truncation_level"] = 30
+        # Within-group ranks can exceed LightGBM's default label_gain length.
+        max_lab = int(max(np.max(y_train), np.max(y_val))) if y_val.size else int(np.max(y_train))
+        params["label_gain"] = list(range(max_lab + 1))
     else:
         raise ValueError(f"Unknown loss={loss!r}")
 
@@ -483,7 +741,13 @@ def train_model(
         f"Loss: {loss}"
         + (f" alpha={quantile_alpha:g}" if loss == "quantile" else "")
         + (f" under_weight={asymmetric_under_weight:g}" if loss == "asymmetric" else "")
-        + (f" floor={sera_floor:g}" if loss == "sera" else ""),
+        + (
+            f" floor={sera_floor:g}"
+            + (" nonreply_only" if sera_nonreply_only else "")
+            if loss == "sera"
+            else ""
+        )
+        + f" | early_stop={stop_metric}",
         flush=True,
     )
     booster = lgb.train(
@@ -492,8 +756,9 @@ def train_model(
         num_boost_round=1200,
         valid_sets=[val_set],
         valid_names=["val"],
+        feval=feval,
         callbacks=[
-            lgb.early_stopping(stopping_rounds=60, verbose=False),
+            lgb.early_stopping(stopping_rounds=60, first_metric_only=True, verbose=False),
             lgb.log_evaluation(period=100),
         ],
     )
@@ -528,6 +793,8 @@ def train_gpboost_model(
     quantile_alpha: float = 0.65,
     sera_floor: float = 0.05,
     sera_high_only: bool = True,
+    sera_nonreply_only: bool = False,
+    train_is_nonreply: np.ndarray | None = None,
 ) -> tuple[Any, Any, dict[str, float]]:
     """Train GPBoost with a grouped Gaussian random intercept on account_id.
 
@@ -546,16 +813,24 @@ def train_gpboost_model(
     effective_weight = weight_train
     effective_loss = loss
     if loss == "sera":
+        apply_mask = None
+        if sera_nonreply_only:
+            if train_is_nonreply is None:
+                raise ValueError("sera_nonreply_only requires train_is_nonreply")
+            apply_mask = train_is_nonreply
         effective_weight, sera_meta = apply_sera_sample_weights(
             y_train,
             weight_train,
             sera_floor=sera_floor,
             high_only=sera_high_only,
             seed=seed,
+            apply_mask=apply_mask,
         )
         effective_loss = "mse"
+        scope = "nonreply-only" if sera_nonreply_only else "all"
         print(
-            f"SERA relevance: med={sera_meta['sera_med']:.4f} upper={sera_meta['sera_upper']:.4f} "
+            f"SERA relevance ({scope}): med={sera_meta['sera_med']:.4f} "
+            f"upper={sera_meta['sera_upper']:.4f} "
             f"mc={sera_meta['sera_mc']:.3f} mean_phi={sera_meta['sera_mean_phi']:.3f} "
             f"frac_pos={sera_meta['sera_frac_pos']:.3f} floor={sera_floor:g}",
             flush=True,
@@ -893,10 +1168,29 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--loss",
-        choices=("huber", "mse", "quantile", "asymmetric", "sera"),
+        choices=("huber", "mse", "quantile", "asymmetric", "sera", "lambdarank"),
         default="asymmetric",
-        help="Regression objective (default asymmetric upweights under-prediction; "
-        "sera = relevance-weighted MSE for extremes)",
+        help="Objective (default asymmetric; sera = extreme relevance weights; "
+        "lambdarank = account-grouped listwise rank on non-replies)",
+    )
+    p.add_argument(
+        "--rank-nonreply-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When --loss lambdarank, train on non-replies only (default on)",
+    )
+    p.add_argument(
+        "--rank-min-group",
+        type=int,
+        default=2,
+        help="Min tweets per account_id group for --loss lambdarank / --hybrid-rank",
+    )
+    p.add_argument(
+        "--hybrid-rank",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fit level model + stratum LambdaRank (NR + reply); blend keeps "
+        "per-account level mean/std and imposes ranker order (default on; v31b)",
     )
     p.add_argument(
         "--quantile-alpha",
@@ -921,6 +1215,19 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="SERA relevance on high extremes only (default); --no-sera-high-only uses both tails",
+    )
+    p.add_argument(
+        "--sera-nonreply-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="When --loss sera, fit/apply φ on non-replies only; replies keep base weight",
+    )
+    p.add_argument(
+        "--early-stop-metric",
+        choices=("rmse", "spearman_nonreply", "ndcg"),
+        default="rmse",
+        help="Val metric for LGBM early stopping / best iteration (default rmse; "
+        "spearman_nonreply aligns with draft-ranking primary; ndcg for lambdarank)",
     )
     p.add_argument(
         "--emb-knn-te",
@@ -974,7 +1281,7 @@ def parse_args() -> argparse.Namespace:
         "--fail-clusters-quantile",
         type=float,
         default=0.1,
-        help="Top under-pred mass used as failure set (0.1 → worst 10%)",
+        help="Top under-pred mass used as failure set (0.1 → worst 10%%)",
     )
     p.add_argument(
         "--fail-clusters-mode",
@@ -1055,6 +1362,12 @@ def parse_args() -> argparse.Namespace:
             flush=True,
         )
         args.loss = "mse"
+    if args.model == "gpboost" and args.loss == "lambdarank":
+        raise SystemExit("GPBoost does not support --loss lambdarank; use --model lgbm")
+    if args.model == "gpboost" and args.hybrid_rank:
+        raise SystemExit("GPBoost does not support --hybrid-rank; use --model lgbm")
+    if args.hybrid_rank and args.loss == "lambdarank":
+        raise SystemExit("Use --hybrid-rank with a level loss (e.g. asymmetric), not --loss lambdarank")
     return args
 
 
@@ -1988,6 +2301,11 @@ def fit_predict_group(
     asymmetric_under_weight: float = 3.0,
     sera_floor: float = 0.05,
     sera_high_only: bool = True,
+    sera_nonreply_only: bool = False,
+    early_stop_metric: str = "rmse",
+    rank_nonreply_only: bool = True,
+    rank_min_group: int = 2,
+    hybrid_rank: bool = True,
     model_kind: str = "lgbm",
 ) -> tuple[np.ndarray, Any, list[str], dict[str, float]]:
     x_train, feature_names = feature_matrix(train_df, skip_embeddings=skip_embeddings)
@@ -2007,32 +2325,149 @@ def fit_predict_group(
         nonreply_weight,
         1.0,
     ).astype(np.float64)
+    train_is_nonreply = train_df["is_reply"].to_numpy() == 0
+    val_is_nonreply = val_df["is_reply"].to_numpy() == 0
+    account_train = train_df["account_id"].astype(str).to_numpy()
+    account_val = val_df["account_id"].astype(str).to_numpy()
     extra_metrics: dict[str, float] = {}
+
+    def _fit_stratum_lambdarank(
+        tr_mask: np.ndarray,
+        va_mask: np.ndarray,
+        *,
+        label: str,
+        seed_offset: int,
+    ) -> tuple[Any, np.ndarray]:
+        x_tr_r, _y_tr_cont, rel_tr, g_tr, meta_tr = prepare_account_rank_order(
+            account_train[tr_mask],
+            x_train[tr_mask],
+            y_train[tr_mask],
+            min_group=rank_min_group,
+        )
+        x_va_r, _y_va_cont, rel_va, g_va, meta_va = prepare_account_rank_order(
+            account_val[va_mask],
+            x_val[va_mask],
+            y_val_model[va_mask],
+            min_group=rank_min_group,
+        )
+        extra_metrics.update({f"{label}_train_{k}": v for k, v in meta_tr.items()})
+        extra_metrics.update({f"{label}_val_{k}": v for k, v in meta_va.items()})
+        print(
+            f"LambdaRank[{label}]: train rows={int(meta_tr['rank_n_rows']):,} "
+            f"accounts={int(meta_tr['rank_n_groups']):,} "
+            f"(mean={meta_tr['rank_mean_group']:.1f}); "
+            f"val rows={int(meta_va['rank_n_rows']):,} "
+            f"accounts={int(meta_va['rank_n_groups']):,}",
+            flush=True,
+        )
+        ranker, _meta = train_model(
+            x_tr_r,
+            rel_tr,
+            x_va_r,
+            rel_va,
+            feature_names,
+            seed=seed + seed_offset,
+            weight_train=None,
+            loss="lambdarank",
+            quantile_alpha=quantile_alpha,
+            asymmetric_under_weight=asymmetric_under_weight,
+            sera_floor=sera_floor,
+            sera_high_only=sera_high_only,
+            sera_nonreply_only=False,
+            early_stop_metric="ndcg" if early_stop_metric == "rmse" else early_stop_metric,
+            val_is_nonreply=None,
+            train_is_nonreply=None,
+            group_train=g_tr,
+            group_val=g_va,
+        )
+        scores = ranker.predict(x_val, num_iteration=ranker.best_iteration)
+        return ranker, np.asarray(scores, dtype=np.float64)
+
     if model_kind == "gpboost":
-        group_train = train_df["account_id"].astype(str).to_numpy()
-        group_val = val_df["account_id"].astype(str).to_numpy()
+        if loss == "lambdarank" or hybrid_rank:
+            raise ValueError("GPBoost does not support lambdarank/hybrid-rank; use --model lgbm")
+        if early_stop_metric != "rmse":
+            print(
+                f"Warning: GPBoost ignores --early-stop-metric={early_stop_metric}; using RMSE",
+                flush=True,
+            )
         model, _gp_model, extra_metrics = train_gpboost_model(
             x_train,
             y_train,
             x_val,
             y_val_model,
             feature_names,
-            group_train=group_train,
-            group_val=group_val,
+            group_train=account_train,
+            group_val=account_val,
             seed=seed,
             weight_train=weight_train,
             loss=loss,
             quantile_alpha=quantile_alpha,
             sera_floor=sera_floor,
             sera_high_only=sera_high_only,
+            sera_nonreply_only=sera_nonreply_only,
+            train_is_nonreply=train_is_nonreply,
         )
         raw = _gpboost_response_mean(
             model.predict(
                 data=x_val,
-                group_data_pred=group_val,
+                group_data_pred=account_val,
                 pred_latent=False,
             )
         )
+    elif hybrid_rank:
+        if loss not in ("asymmetric", "mse", "huber", "sera", "quantile"):
+            raise ValueError(f"--hybrid-rank incompatible with --loss {loss}")
+        # 1) Level model (between-author + magnitude calibration).
+        level_loss = loss
+        model, sera_meta = train_model(
+            x_train,
+            y_train,
+            x_val,
+            y_val_model,
+            feature_names,
+            seed=seed,
+            weight_train=weight_train,
+            loss=level_loss,
+            quantile_alpha=quantile_alpha,
+            asymmetric_under_weight=asymmetric_under_weight,
+            sera_floor=sera_floor,
+            sera_high_only=sera_high_only,
+            sera_nonreply_only=sera_nonreply_only,
+            early_stop_metric=early_stop_metric if early_stop_metric != "ndcg" else "rmse",
+            val_is_nonreply=val_is_nonreply,
+            train_is_nonreply=train_is_nonreply,
+        )
+        extra_metrics.update(sera_meta)
+        level_raw = np.asarray(
+            model.predict(x_val, num_iteration=model.best_iteration), dtype=np.float64
+        )
+        level_pred = level_raw + base_val if residual else level_raw
+        # 2) Stratum rankers (within-author order for NR and reply separately).
+        tr_nr = train_df["is_reply"].to_numpy() == 0
+        va_nr = val_df["is_reply"].to_numpy() == 0
+        tr_rp = ~tr_nr
+        va_rp = ~va_nr
+        _nr_model, rank_nr = _fit_stratum_lambdarank(tr_nr, va_nr, label="nr", seed_offset=11)
+        _rp_model, rank_rp = _fit_stratum_lambdarank(tr_rp, va_rp, label="reply", seed_offset=17)
+        rank_score = np.where(va_nr, rank_nr, rank_rp)
+        # 3) Blend per stratum: keep level mean/std, impose ranker order.
+        pred = blend_level_with_rank_scores(level_pred, rank_score, account_val, mask=va_nr)
+        pred = blend_level_with_rank_scores(pred, rank_score, account_val, mask=va_rp)
+        extra_metrics["hybrid_rank"] = 1.0
+        print("Hybrid-rank: blended level + stratum LambdaRank within accounts", flush=True)
+        # LambdaRank scores already in pred; skip residual add below.
+        return pred, model, feature_names, extra_metrics
+    elif loss == "lambdarank":
+        tr_mask = np.ones(len(train_df), dtype=bool)
+        va_mask = np.ones(len(val_df), dtype=bool)
+        if rank_nonreply_only:
+            tr_mask &= train_df["is_reply"].to_numpy() == 0
+            va_mask &= val_df["is_reply"].to_numpy() == 0
+        model, rank_scores = _fit_stratum_lambdarank(
+            tr_mask, va_mask, label="all" if not rank_nonreply_only else "nr", seed_offset=0
+        )
+        raw = rank_scores
     else:
         model, sera_meta = train_model(
             x_train,
@@ -2047,10 +2482,18 @@ def fit_predict_group(
             asymmetric_under_weight=asymmetric_under_weight,
             sera_floor=sera_floor,
             sera_high_only=sera_high_only,
+            sera_nonreply_only=sera_nonreply_only,
+            early_stop_metric=early_stop_metric,
+            val_is_nonreply=val_is_nonreply,
+            train_is_nonreply=train_is_nonreply,
         )
         extra_metrics.update(sera_meta)
         raw = model.predict(x_val, num_iteration=model.best_iteration)
-    pred = raw + base_val if residual else raw
+    # LambdaRank scores are not in label units — do not add residual baseline.
+    if residual and loss != "lambdarank":
+        pred = raw + base_val
+    else:
+        pred = raw
     return pred, model, feature_names, extra_metrics
 
 
@@ -2259,6 +2702,11 @@ def main() -> None:
             asymmetric_under_weight=args.asymmetric_under_weight,
             sera_floor=args.sera_floor,
             sera_high_only=args.sera_high_only,
+            sera_nonreply_only=args.sera_nonreply_only,
+            early_stop_metric=args.early_stop_metric,
+            rank_nonreply_only=args.rank_nonreply_only,
+            rank_min_group=args.rank_min_group,
+            hybrid_rank=args.hybrid_rank,
             model_kind=args.model,
         )
         # Score full val with the non-reply model, then overwrite replies.
@@ -2309,6 +2757,11 @@ def main() -> None:
                 asymmetric_under_weight=args.asymmetric_under_weight,
                 sera_floor=args.sera_floor,
                 sera_high_only=args.sera_high_only,
+                sera_nonreply_only=args.sera_nonreply_only,
+                early_stop_metric=args.early_stop_metric,
+                rank_nonreply_only=args.rank_nonreply_only,
+                rank_min_group=args.rank_min_group,
+                hybrid_rank=args.hybrid_rank,
                 model_kind=args.model,
             )
             pred[val_df["is_reply"].to_numpy() == mask_val] = p
@@ -2329,6 +2782,11 @@ def main() -> None:
             asymmetric_under_weight=args.asymmetric_under_weight,
             sera_floor=args.sera_floor,
             sera_high_only=args.sera_high_only,
+            sera_nonreply_only=args.sera_nonreply_only,
+            early_stop_metric=args.early_stop_metric,
+            rank_nonreply_only=args.rank_nonreply_only,
+            rank_min_group=args.rank_min_group,
+            hybrid_rank=args.hybrid_rank,
             model_kind=args.model,
         )
 
@@ -2341,6 +2799,27 @@ def main() -> None:
     metrics["rmse_log_nonreply"] = evaluate(y_eval[nonreply_mask], pred_primary[nonreply_mask])["rmse_log"]
     metrics["rmse_log_reply"] = evaluate(y_eval[reply_mask], pred_primary[reply_mask])["rmse_log"]
     metrics["spearman_nonreply"] = evaluate(y_eval[nonreply_mask], pred_primary[nonreply_mask])["spearman"]
+    metrics["spearman_reply"] = evaluate(y_eval[reply_mask], pred_primary[reply_mask])["spearman"]
+    acct_val = val_df["account_id"].astype(str).to_numpy()
+    # Primary: within-author ranking by stratum (draft quality, not fame).
+    wa_nr = within_account_spearman(
+        y_eval[nonreply_mask], pred_primary[nonreply_mask], acct_val[nonreply_mask]
+    )
+    wa_rp = within_account_spearman(
+        y_eval[reply_mask], pred_primary[reply_mask], acct_val[reply_mask]
+    )
+    metrics["spearman_within_account_nonreply_mean"] = wa_nr["mean"]
+    metrics["spearman_within_account_nonreply_wmean"] = wa_nr["weighted_mean"]
+    metrics["spearman_within_account_nonreply_n"] = wa_nr["n_accounts"]
+    metrics["spearman_within_account_reply_mean"] = wa_rp["mean"]
+    metrics["spearman_within_account_reply_wmean"] = wa_rp["weighted_mean"]
+    metrics["spearman_within_account_reply_n"] = wa_rp["n_accounts"]
+    print(
+        f"Within-account Spearman NR: mean={wa_nr['mean']:.4f} wmean={wa_nr['weighted_mean']:.4f} "
+        f"(n={int(wa_nr['n_accounts'])}); reply: mean={wa_rp['mean']:.4f} "
+        f"wmean={wa_rp['weighted_mean']:.4f} (n={int(wa_rp['n_accounts'])})",
+        flush=True,
+    )
     # Under-prediction diagnostics on hot non-replies (failure mode of interest).
     if nonreply_mask.any():
         y_nr = y_eval[nonreply_mask]
@@ -2414,6 +2893,17 @@ def main() -> None:
     metrics["loss"] = args.loss
     metrics["sera_floor"] = float(args.sera_floor) if args.loss == "sera" else 0.0
     metrics["sera_high_only"] = float(args.sera_high_only) if args.loss == "sera" else 0.0
+    metrics["sera_nonreply_only"] = (
+        float(args.sera_nonreply_only) if args.loss == "sera" else 0.0
+    )
+    metrics["early_stop_metric"] = args.early_stop_metric
+    metrics["hybrid_rank"] = float(args.hybrid_rank)
+    metrics["rank_nonreply_only"] = (
+        float(args.rank_nonreply_only) if args.loss == "lambdarank" or args.hybrid_rank else 0.0
+    )
+    metrics["rank_min_group"] = (
+        float(args.rank_min_group) if args.loss == "lambdarank" or args.hybrid_rank else 0.0
+    )
     metrics.update(gpboost_meta)
     metrics["seconds"] = round(time.time() - t0, 2)
 
@@ -2486,10 +2976,23 @@ def main() -> None:
 
     print("\n---")
     print(f"target_space: {metrics['target_space']}")
-    print(f"model: {metrics['model']} | account_te: {metrics['account_te']} | loss: {metrics['loss']}")
-    print("primary_metric: spearman_nonreply (draft ranking); guardrails: spearman, rmse_log, mean_underpred_nonreply_top10")
+    print(
+        f"model: {metrics['model']} | account_te: {metrics['account_te']} | "
+        f"loss: {metrics['loss']} | early_stop: {metrics.get('early_stop_metric', 'rmse')} | "
+        f"hybrid_rank: {bool(metrics.get('hybrid_rank', 0))}"
+    )
+    print(
+        "primary_metrics: spearman_within_account_{nonreply,reply}_wmean "
+        "(draft quality within author×stratum); "
+        "guardrails: global spearman_*, rmse_log, mean_underpred_nonreply_top10"
+    )
     for key in (
+        "spearman_within_account_nonreply_wmean",
+        "spearman_within_account_nonreply_mean",
+        "spearman_within_account_reply_wmean",
+        "spearman_within_account_reply_mean",
         "spearman_nonreply",
+        "spearman_reply",
         "spearman",
         "rmse_log",
         "mean_underpred_nonreply_top10",

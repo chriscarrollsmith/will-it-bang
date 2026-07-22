@@ -3,10 +3,12 @@ Summarize validation errors from train.py's val_predictions.parquet.
 
 Usage:
     uv run analyze.py
+    uv run analyze.py --predictions path/to/val_predictions.parquet
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 
@@ -14,6 +16,8 @@ import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr
 from sklearn.metrics import mean_squared_error, r2_score
+
+from train import within_account_spearman
 
 CACHE_DIR = Path.home() / ".cache" / "will-it-bang"
 VAL_PRED_PATH = CACHE_DIR / "val_predictions.parquet"
@@ -54,13 +58,50 @@ def slice_metrics(df: pd.DataFrame, name: str) -> dict:
     }
 
 
-def main() -> None:
-    if not VAL_PRED_PATH.exists():
-        raise SystemExit(f"Missing {VAL_PRED_PATH}. Run: uv run train.py")
+def within_account_primary_metrics(df: pd.DataFrame) -> dict[str, float]:
+    """Locked primaries: within-author Spearman by reply stratum."""
+    y = df["y_true_log"].to_numpy(dtype=np.float64)
+    p = df["y_pred_log"].to_numpy(dtype=np.float64)
+    acct = df["account_id"].astype(str).to_numpy()
+    nr = df["is_reply"].to_numpy() == 0
+    rp = ~nr
+    wa_nr = within_account_spearman(y[nr], p[nr], acct[nr])
+    wa_rp = within_account_spearman(y[rp], p[rp], acct[rp])
+    return {
+        "spearman_within_account_nonreply_mean": wa_nr["mean"],
+        "spearman_within_account_nonreply_wmean": wa_nr["weighted_mean"],
+        "spearman_within_account_nonreply_n": wa_nr["n_accounts"],
+        "spearman_within_account_reply_mean": wa_rp["mean"],
+        "spearman_within_account_reply_wmean": wa_rp["weighted_mean"],
+        "spearman_within_account_reply_n": wa_rp["n_accounts"],
+        "spearman_nonreply": float(spearmanr(y[nr], p[nr]).correlation) if nr.any() else float("nan"),
+        "spearman_reply": float(spearmanr(y[rp], p[rp]).correlation) if rp.any() else float("nan"),
+        "rmse_log": _rmse(y, p),
+    }
 
-    df = pd.read_parquet(VAL_PRED_PATH)
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument(
+        "--predictions",
+        type=Path,
+        default=VAL_PRED_PATH,
+        help="val_predictions.parquet from train.py",
+    )
+    ap.add_argument(
+        "--out",
+        type=Path,
+        default=ANALYSIS_PATH,
+        help="Write JSON analysis here",
+    )
+    args = ap.parse_args()
+    if not args.predictions.exists():
+        raise SystemExit(f"Missing {args.predictions}. Run: uv run train.py")
+
+    df = pd.read_parquet(args.predictions)
     df["created_at"] = pd.to_datetime(df["created_at"], utc=True)
     df["eng_tercile"] = pd.qcut(df["y_true_log"], 3, labels=["low", "mid", "high"], duplicates="drop")
+    primary = within_account_primary_metrics(df)
 
     slices = [
         slice_metrics(df, "all"),
@@ -179,6 +220,7 @@ def main() -> None:
 
     analysis = {
         "n_val": int(len(df)),
+        "primary_within_account": primary,
         "overall": slices[0],
         "slices": slices,
         "frac_overpredict_log_gt_0_5": over,
@@ -190,9 +232,24 @@ def main() -> None:
         "worst_misses": worst_rows,
         "viral_underpredicts": viral_misses,
     }
-    ANALYSIS_PATH.write_text(json.dumps(analysis, indent=2, default=str) + "\n")
+    args.out.write_text(json.dumps(analysis, indent=2, default=str) + "\n")
 
-    print("Slice metrics:")
+    print("Primary (within-account Spearman):")
+    print(
+        f"  NR  wmean={primary['spearman_within_account_nonreply_wmean']:.4f} "
+        f"mean={primary['spearman_within_account_nonreply_mean']:.4f} "
+        f"(n={int(primary['spearman_within_account_nonreply_n'])})"
+    )
+    print(
+        f"  reply wmean={primary['spearman_within_account_reply_wmean']:.4f} "
+        f"mean={primary['spearman_within_account_reply_mean']:.4f} "
+        f"(n={int(primary['spearman_within_account_reply_n'])})"
+    )
+    print(
+        f"  guardrails: global_nr={primary['spearman_nonreply']:.4f} "
+        f"global_reply={primary['spearman_reply']:.4f} rmse={primary['rmse_log']:.4f}"
+    )
+    print("\nSlice metrics:")
     print(pd.DataFrame(slices).to_string(index=False))
     print(f"\nOver-predict (err_log>0.5): {over:.1%}")
     print(f"Under-predict (err_log<-0.5): {under:.1%}")
@@ -202,7 +259,7 @@ def main() -> None:
     print(pd.DataFrame(worst_rows).to_string(index=False))
     print("\nBiggest non-reply underpredicts (viral misses):")
     print(pd.DataFrame(viral_misses).to_string(index=False))
-    print(f"\nWrote {ANALYSIS_PATH}")
+    print(f"\nWrote {args.out}")
 
 
 if __name__ == "__main__":
