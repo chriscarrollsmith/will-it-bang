@@ -22,7 +22,7 @@ Process retrospective (what moved the scoreboard vs what burned cycles): [`logs/
 |---|---|---:|---:|---:|---:|---|
 | **Default stack** | **v31b** | **0.227** | **0.280** | 0.518 | 0.608 | Hybrid level + stratum LambdaRank blend (default) |
 | Level-only (ablation) | v31a | 0.187 | 0.172 | 0.508 | 0.610 | Asymmetric without hybrid blend |
-| Magnitude (opt-in SERA) | v28b | — | — | 0.474 | **0.590** | Better RMSE; worse global rank |
+| Magnitude (opt-in SERA) | v28b / rescore | 0.204 | 0.140 | 0.474 | **0.590** | Level-only rescore: +wa_nr, −wa_rp; better RMSE |
 | Dump total | v13 | — | — | — | 0.967 | Legacy objective |
 
 Rebuild: `uv run prepare.py --skip-media` (defaults are the v12 scale knobs).  
@@ -82,6 +82,20 @@ Dump-time fav/RT used as author history → optimistic RMSE ~0.82 (v5). Invalid 
 | v31a | 0.610 (rate) | 0.460 | Asymmetric control with new primaries: wa_nr_wmean **0.187**, wa_rp_wmean **0.172**; global_nr 0.508; under-pred 2.22 |
 | v31b | 0.608 (rate) | 0.490 | Hybrid `--hybrid-rank`: wa_nr_wmean **0.227** (+0.040), wa_rp_wmean **0.280** (+0.108); global_nr 0.518; under-pred 2.21; **promote / new default** |
 | v31c | — | — | Policy: lock primary = within-account Spearman by stratum (NR + reply); global Spearman secondary |
+| v32 | — | — | Rescore shortlist on level-only stack (`--no-hybrid-rank`) vs control wa_nr **0.187** / wa_rp **0.172** / rmse 0.610 / global_nr 0.508. Artifacts: `logs/rescore_within_account/`. **SERA:** wa_nr **0.204** (+0.017), wa_rp **0.140** (−0.032), rmse **0.590**, global_nr 0.474 — NR within-author + magnitude help, reply within-author and global rank hurt; stay opt-in (consider NR-stratum / hybrid×SERA later). **PLS-8:** wa_nr +0.008 / wa_rp −0.012 / rmse flat — marginal, leave opt-in. **fail-clusters:** noise. **CAV / author affinity:** flat-to-worse. **cluster TE:** still regresses (wa_nr −0.037, wa_rp −0.057). Do not revive CAV/affinity/cluster-TE without a new angle |
+
+### Rescore shortlist (level-only, locked primaries)
+
+Fair revisit of prior ablations after the metric lock. Control = asymmetric level model (`--no-hybrid-rank`), not v31b hybrid.
+
+| Run | Δwa_nr | Δwa_rp | Δrmse | Δglobal_nr | Verdict |
+|---|---:|---:|---:|---:|---|
+| sera | **+0.017** | **−0.032** | **−0.021** | −0.034 | Helps NR within-author + magnitude; hurts reply within-author — opt-in only |
+| emb_pls8 | +0.008 | −0.012 | ~0 | −0.003 | Tiny NR bump; leave opt-in |
+| fail_clusters | +0.003 | −0.003 | ~0 | −0.003 | Noise / flat |
+| emb_cav | −0.004 | −0.006 | +0.002 | −0.008 | Flat/worse — do not revive |
+| author_emb_affinity | −0.009 | −0.012 | +0.002 | −0.007 | Flat/worse — do not revive |
+| emb_cluster_te | **−0.037** | **−0.057** | +0.014 | −0.025 | Still regresses |
 
 ## Failure modes (still open)
 
@@ -138,28 +152,29 @@ Mostly helps replies (not the main under-prediction bucket); still cheap if pare
 
 ### Standalone / author–audience corpus affinity
 Limited by CA completeness; affinity to own history was flat as coarse v10 mean.
-- [x] Richer own-corpus similarity × account TE (novelty, te_x_novelty, 30d, nonreply) — **v21: flat** (0.609 vs 0.607); leave `--author-emb-affinity` off
+- [x] Richer own-corpus similarity × account TE (novelty, te_x_novelty, 30d, nonreply) — **v21: flat** (0.609 vs 0.607); **v32 rescore:** still worse on wa_* — leave `--author-emb-affinity` off
 - [ ] Similarity to corpus of users who previously interacted with you (pre-T reply/mention partners’ mean MiniLM): expect non-linear “not too similar, not too foreign” effect (include quadratic / distance-to-sweet-spot features)
 
 ### Embedding discovery (vs arbitrary LM tags)
 Discover engagement-related structure in MiniLM (or a larger frozen encoder) from the *data*, not hand-picked labels. Fit only on the train time fold; apply to val. Contrast with v15–v17b descriptive tags and with unsupervised emb PCA (already in the stack).
 
 Cheap first bets (smoke: train-fold corr of 1–8 derived dims vs rate; then full train):
-- [x] **Engagement direction / difference-of-means CAV:** — **v23b: flat / slightly worse** (0.613 vs v23a 0.610); train corr 0.14 but redundant with emb PCA + knn TE; `--emb-cav` stays opt-in
-- [x] **PLS supervised linear projection:** — **v24a** PLS-8 beside PCA: flat (0.611 vs 0.610); **v24b** PLS-32 replace PCA: flat/worse (0.612); train corr 0.17 + mid-gain but no holdout lift; `--emb-pls` stays opt-in. Linear emb→rate axis family exhausted for now
-- [x] **Cluster TE:** — **v26a/b: regress** (k=32 → 0.624, k=64 → 0.616 vs 0.610); high train corr/gain but fights account TE on holdout; `--emb-cluster-te` stays opt-in. Cheap emb-discovery lane exhausted
+- [x] **Engagement direction / difference-of-means CAV:** — **v23b: flat / slightly worse** (0.613 vs v23a 0.610); **v32 rescore:** flat/worse on wa_*; `--emb-cav` stays opt-in / do not revive
+- [x] **PLS supervised linear projection:** — **v24a/b** flat on RMSE; **v32 rescore:** PLS-8 wa_nr +0.008 / wa_rp −0.012 — marginal; `--emb-pls` opt-in. Linear emb→rate axis family exhausted for now
+- [x] **Cluster TE:** — **v26a/b: regress**; **v32 rescore:** still regresses on wa_* (−0.037 / −0.057); `--emb-cluster-te` stays off. Cheap emb-discovery lane exhausted
 
 Heavier / researchy:
 - [ ] Residual emb after regressing out account TE / reply baseline, then redo direction or PLS (isolates *content* signal from account heat)
-- [x] Error-driven clusters: — **v25a/b: flat** (OOF 0.611 / TE 0.612 vs 0.610); failure MiniLM geometry too weak vs account TE + knn; `--fail-clusters` stays opt-in
+- [x] Error-driven clusters: — **v25a/b: flat**; **v32 rescore:** noise on wa_*; `--fail-clusters` stays opt-in
 - [ ] Supervised manifold (UMAP on RF-leaf similarity, etc.) — usually for analysis, not tabular features; only promote if a cheap projection beats PLS
 
 ### Modeling
 - [x] Quantile / pinball or underprediction-asymmetric loss — **v20a asymmetric: 0.639→0.607 rate RMSE** (default); **v20b quantile α=0.65: worse RMSE** (0.647), slight Spearman lift
-- [x] SERA / relevance-weighted extreme loss — **v28b: RMSE 0.610→0.590**, hot NR under-pred 2.22→2.04, but Spearman_nr 0.508→0.474; **opt-in only** once primary locked to non-reply ranking (`--loss sera`)
+- [x] SERA / relevance-weighted extreme loss — **v28b** RMSE lift / global rank hurt; **v32 rescore:** wa_nr +0.017, wa_rp −0.032 — stay **opt-in**; next angle: NR-stratum SERA or hybrid×SERA (not blanket default)
 - [x] Early-stop on `spearman_nonreply` — **v29b: tiny lift** (0.508→0.509); guardrails flat; `--early-stop-metric spearman_nonreply` opt-in (default stays rmse)
 - [x] Pairwise / listwise LambdaRank on non-replies by `account_id` — **v30b: fail on global spearman_nr** (0.051); slight **within-account** rank lift (wmean 0.187→0.211); `--loss lambdarank` opt-in only
 - [x] Hybrid level + stratum within-author ranker — **v31b: lift** wa_nr 0.187→0.227, wa_rp 0.172→0.280; guardrails flat/up; **default on** (`--no-hybrid-rank` to ablate)
+- [ ] SERA on NR stratum only / hybrid level=SERA + ranker (follow-up from v32 rescore)
 - [ ] Larger frozen encoder (Modal credits) vs MiniLM
 - [ ] Further scale (>120k / more accounts with lower `min-account-tweets`)
 - [x] Account-level **target encoding** (train-fold LOO, leakage-safe) — **v19: 0.642 → 0.639 rate RMSE**, Spearman 0.441→0.452; default on (`--no-account-te` to ablate)
