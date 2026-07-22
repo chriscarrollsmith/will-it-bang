@@ -5,8 +5,11 @@ Train/eval target (time holdout, honest / leakage-safe):
 1. **Exposure rate (default):** `log1p(eng / (min(age_days, 30) + 1))` — intensity controlling for dump maturity.  
 2. **Dump total (legacy):** `log1p(eng)` — `--no-exposure-correct --residual`.
 
-**Primary metric (locked):** `spearman_nonreply` — rank draft standalone posts.  
-**Guardrails:** overall Spearman, rate RMSE, `mean_underpred_nonreply_top10` (don’t give up much hot-tail calibration vs asymmetric).
+**Primary metrics (locked):** within-account Spearman by stratum  
+- `spearman_within_account_nonreply_wmean` — “is this a good standalone draft?” within author  
+- `spearman_within_account_reply_wmean` — same for replies among replies  
+
+**Guardrails / secondary:** global `spearman_nonreply` / `spearman_reply` (between-author + stratum mix), rate RMSE, `mean_underpred_nonreply_top10`. Reply-vs-NR and account selection are calibration/isolation diagnostics, not promote criteria.
 
 Raw run stdout lives in `logs/`; machine-append metrics in `results.tsv` (gitignored).  
 Process retrospective (what moved the scoreboard vs what burned cycles): [`logs/meta_process.md`](logs/meta_process.md).
@@ -15,13 +18,12 @@ Process retrospective (what moved the scoreboard vs what burned cycles): [`logs/
 
 ## Current best
 
-| Objective | Run | spearman_nr | spearman | rmse_log | train / val | Notes |
-|---|---|---:|---:|---:|---|---|
-| **Rate / rank (default stack)** | **v29a / v28a** | **0.508** | 0.460 | 0.610 | 88k / 22k | Asymmetric + RMSE early-stop + account TE + emb knn TE |
-| Rate / rank (Spearman_nr ES) | v29b | 0.509 | 0.462 | 0.611 | 88k / 22k | Tiny rank lift; `--early-stop-metric spearman_nonreply` opt-in |
-| Rate / magnitude (opt-in SERA) | v28b | 0.474 | 0.409 | **0.590** | 88k / 22k | Better RMSE + hot-NR under-pred; worse ranking — keep `--loss sera` opt-in |
-| Rate (media-rich prior) | v22b | — | 0.440 | 0.606 | 88k / 22k | ~9% media; not skip-media comparable |
-| Dump total | v13 | — | 0.548 | 0.967 | 88k / 22k | Graph + parent + scale + time regimes |
+| Objective | Run | wa_nr_wmean | wa_rp_wmean | global_nr | rmse_log | Notes |
+|---|---|---:|---:|---:|---:|---|
+| **Default stack** | **v31a / v30a** | *(fill)* | *(fill)* | 0.508 | 0.610 | Asymmetric + account TE + emb knn; within-account metrics added in v31 |
+| Global NR rank (diag) | v29a | — | — | 0.508 | 0.610 | Prior primary before within-author lock |
+| Magnitude (opt-in SERA) | v28b | — | — | 0.474 | **0.590** | Better RMSE; worse global rank |
+| Dump total | v13 | — | — | — | 0.967 | Legacy objective |
 
 Rebuild: `uv run prepare.py --skip-media` (defaults are the v12 scale knobs).  
 Train: `uv run train.py --description "…"`.
@@ -154,7 +156,7 @@ Heavier / researchy:
 - [x] SERA / relevance-weighted extreme loss — **v28b: RMSE 0.610→0.590**, hot NR under-pred 2.22→2.04, but Spearman_nr 0.508→0.474; **opt-in only** once primary locked to non-reply ranking (`--loss sera`)
 - [x] Early-stop on `spearman_nonreply` — **v29b: tiny lift** (0.508→0.509); guardrails flat; `--early-stop-metric spearman_nonreply` opt-in (default stays rmse)
 - [x] Pairwise / listwise LambdaRank on non-replies by `account_id` — **v30b: fail on global spearman_nr** (0.051); slight **within-account** rank lift (wmean 0.187→0.211); `--loss lambdarank` opt-in only
-- [ ] Within-account Spearman as scoreboard / hybrid (global calibration head + within-author ranker) — if draft ranking is truly per-author, global `spearman_nonreply` is dominated by account TE
+- [ ] Hybrid level + stratum within-author ranker (`--hybrid-rank`) — v31; primary = within-account Spearman NR + reply
 - [ ] Larger frozen encoder (Modal credits) vs MiniLM
 - [ ] Further scale (>120k / more accounts with lower `min-account-tweets`)
 - [x] Account-level **target encoding** (train-fold LOO, leakage-safe) — **v19: 0.642 → 0.639 rate RMSE**, Spearman 0.441→0.452; default on (`--no-account-te` to ablate)
