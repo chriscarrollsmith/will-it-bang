@@ -20,8 +20,8 @@ Process retrospective (what moved the scoreboard vs what burned cycles): [`logs/
 
 | Objective | Run | wa_nr_wmean | wa_rp_wmean | global_nr | rmse_log | Notes |
 |---|---|---:|---:|---:|---:|---|
-| **Default stack** | **v31a / v30a** | *(fill)* | *(fill)* | 0.508 | 0.610 | Asymmetric + account TE + emb knn; within-account metrics added in v31 |
-| Global NR rank (diag) | v29a | — | — | 0.508 | 0.610 | Prior primary before within-author lock |
+| **Default stack** | **v31b** | **0.227** | **0.280** | 0.518 | 0.608 | Hybrid level + stratum LambdaRank blend (default) |
+| Level-only (ablation) | v31a | 0.187 | 0.172 | 0.508 | 0.610 | Asymmetric without hybrid blend |
 | Magnitude (opt-in SERA) | v28b | — | — | 0.474 | **0.590** | Better RMSE; worse global rank |
 | Dump total | v13 | — | — | — | 0.967 | Legacy objective |
 
@@ -79,6 +79,9 @@ Dump-time fav/RT used as author history → optimistic RMSE ~0.82 (v5). Invalid 
 | v29b | 0.611 (rate) | 0.462 | Spearman_nr early-stop: spearman_nr **0.509** (+0.0016); under-pred 2.22 (flat); best_iter 342; **tiny / leave opt-in** |
 | v30a | 0.610 (rate) | 0.460 | Asymmetric control for LambdaRank (= v29a); spearman_nr 0.508; within-account NR Spearman mean 0.161 / wmean 0.187 |
 | v30b | 1.016 (rate) | 0.097 | LambdaRank account groups (non-reply): **global spearman_nr collapses** 0.508→0.051 (scores not cross-account calibrated); within-account NR Spearman mean 0.168 / wmean **0.211** (+0.024); NDCG@10≈0.77; leave **opt-in** / fail on locked global primary |
+| v31a | 0.610 (rate) | 0.460 | Asymmetric control with new primaries: wa_nr_wmean **0.187**, wa_rp_wmean **0.172**; global_nr 0.508; under-pred 2.22 |
+| v31b | 0.608 (rate) | 0.490 | Hybrid `--hybrid-rank`: wa_nr_wmean **0.227** (+0.040), wa_rp_wmean **0.280** (+0.108); global_nr 0.518; under-pred 2.21; **promote / new default** |
+| v31c | — | — | Policy: lock primary = within-account Spearman by stratum (NR + reply); global Spearman secondary |
 
 ## Failure modes (still open)
 
@@ -156,7 +159,7 @@ Heavier / researchy:
 - [x] SERA / relevance-weighted extreme loss — **v28b: RMSE 0.610→0.590**, hot NR under-pred 2.22→2.04, but Spearman_nr 0.508→0.474; **opt-in only** once primary locked to non-reply ranking (`--loss sera`)
 - [x] Early-stop on `spearman_nonreply` — **v29b: tiny lift** (0.508→0.509); guardrails flat; `--early-stop-metric spearman_nonreply` opt-in (default stays rmse)
 - [x] Pairwise / listwise LambdaRank on non-replies by `account_id` — **v30b: fail on global spearman_nr** (0.051); slight **within-account** rank lift (wmean 0.187→0.211); `--loss lambdarank` opt-in only
-- [ ] Hybrid level + stratum within-author ranker (`--hybrid-rank`) — v31; primary = within-account Spearman NR + reply
+- [x] Hybrid level + stratum within-author ranker — **v31b: lift** wa_nr 0.187→0.227, wa_rp 0.172→0.280; guardrails flat/up; **default on** (`--no-hybrid-rank` to ablate)
 - [ ] Larger frozen encoder (Modal credits) vs MiniLM
 - [ ] Further scale (>120k / more accounts with lower `min-account-tweets`)
 - [x] Account-level **target encoding** (train-fold LOO, leakage-safe) — **v19: 0.642 → 0.639 rate RMSE**, Spearman 0.441→0.452; default on (`--no-account-te` to ablate)

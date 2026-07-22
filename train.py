@@ -1136,9 +1136,10 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--hybrid-rank",
-        action="store_true",
-        help="Fit asymmetric level model, then stratum LambdaRank (NR + reply) and "
-        "blend: keep per-account level mean/std, impose ranker within-account order",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fit level model + stratum LambdaRank (NR + reply); blend keeps "
+        "per-account level mean/std and imposes ranker order (default on; v31b)",
     )
     p.add_argument(
         "--quantile-alpha",
@@ -2246,7 +2247,7 @@ def fit_predict_group(
     early_stop_metric: str = "rmse",
     rank_nonreply_only: bool = True,
     rank_min_group: int = 2,
-    hybrid_rank: bool = False,
+    hybrid_rank: bool = True,
     model_kind: str = "lgbm",
 ) -> tuple[np.ndarray, Any, list[str], dict[str, float]]:
     x_train, feature_names = feature_matrix(train_df, skip_embeddings=skip_embeddings)
