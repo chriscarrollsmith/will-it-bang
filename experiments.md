@@ -87,6 +87,8 @@ Dump-time fav/RT used as author history → optimistic RMSE ~0.82 (v5). Invalid 
 | v33b | **0.584** (rate) | 0.460 | Hybrid × SERA: wa_* **unchanged** (ranker sets within-author order); RMSE −0.024 / under-pred 2.21→2.04; global_nr 0.518→0.483 — magnitude-only; **do not promote** |
 | v33c | 0.601 (rate) | 0.474 | Hybrid × SERA `--sera-nonreply-only`: same frozen wa_*; milder RMSE/global trade vs v33b |
 | v33d | 0.604 (rate) | 0.453 | Level SERA NR-only: wa_nr **0.138** (−0.049 vs level control), wa_rp 0.170 (flat); **regress** on locked primary — NR-stratum SERA fails |
+| v34a | 0.608 (rate) | 0.490 | Hybrid asymmetric control (= v31b/v33a): wa_nr **0.227**, wa_rp **0.280** |
+| v34b | 0.608 (rate) | 0.482 | FWL `--emb-residual-pls 8`: smoke corr(res_pls_0,y_within)=0.17 + high gain, but wa_nr **0.209** (−0.017), wa_rp 0.273 (−0.007); emb_var_kept≈1 (TE⊥emb linearly); **regress / leave off** |
 
 ### Rescore shortlist (level-only, locked primaries)
 
@@ -109,6 +111,13 @@ Fair revisit of prior ablations after the metric lock. Control = asymmetric leve
 | v33b hybrid sera | 0.227 | 0.280 | 0.483 | **0.584** | wa_* frozen; better magnitude |
 | v33c hybrid sera NR | 0.227 | 0.280 | 0.494 | 0.601 | Same; milder tradeoff |
 | v33d level sera NR | **0.138** | 0.170 | 0.469 | 0.604 | Primary regress vs level control 0.187 |
+
+### v34 FWL residual-emb PLS
+
+| Run | wa_nr | wa_rp | global_nr | rmse | Notes |
+|---|---:|---:|---:|---:|---|
+| v34a hybrid control | 0.227 | 0.280 | 0.518 | 0.608 | Control |
+| v34b residual PLS-8 | **0.209** | 0.273 | 0.509 | 0.608 | High gain, worse locked primaries |
 
 ## Failure modes (still open)
 
@@ -155,13 +164,13 @@ Check off when tried; note outcome in one line.
 - Note: CA `followers`/`following` are archive **snapshots** (no follow/unfollow event times) — not usable as pre-T graph history.
 
 ### Reply dyad / parent context
-Mostly helps replies (not the main under-prediction bucket); still cheap if parent/dyad coverage exists.
-- [ ] Prior reciprocal interaction: has this author and the parent author exchanged replies/mentions before *T*? (likely re-interact)
-- [ ] Agree vs disagree with the parent tweet (LM or reply−parent embedding/stance; text-only)
-- [ ] Leakage-safe “size” of parent author (pre-T proxies only: prior tweet count, inbound reply rates — never dump `num_followers`)
-- [ ] Leakage-safe parent-tweet heat (pre-T reply/quote arrivals on the parent — not dump fav/RT; partly in v11 parent_replies)
-- [ ] Reply earliness: hours since parent `created_at` (halo if early on a tweet that later goes viral; parent maturity is post-time observable)
-- [ ] Semantic similarity of reply text to the **parent author’s** pre-T MiniLM corpus mean (distinct from cosine to the single parent tweet)
+Mostly helps replies (wa_rp primary); ~73% of reply rows have a CA parent. Cheap prepare hooks in `_attach_one_parent_prefix`.
+- [ ] Prior reciprocal interaction: has this author and the parent author exchanged replies before *T*? (dump `reply_to_user_id` scan; mentions need handle join)
+- [ ] Agree vs disagree with the parent tweet (LM or reply−parent embedding stance / `1−cos`; text-only)
+- [ ] Leakage-safe “size” of parent author (pre-T tweet count + inbound reply/quote rates — never dump `num_followers`)
+- [ ] Parent-tweet **quote** heat (pre-T quotes on parent; replies already in `*_parent_replies`)
+- [x] Reply earliness — **already in stack** as `*_parent_age_hours` = log1p(hours since parent)
+- [ ] Semantic similarity of reply text to the **parent author’s** pre-T MiniLM corpus mean (distinct from single-parent cosine; own-author affinity was flat)
 
 ### Standalone / author–audience corpus affinity
 Limited by CA completeness; affinity to own history was flat as coarse v10 mean.
@@ -177,9 +186,18 @@ Cheap first bets (smoke: train-fold corr of 1–8 derived dims vs rate; then ful
 - [x] **Cluster TE:** — **v26a/b: regress**; **v32 rescore:** still regresses on wa_* (−0.037 / −0.057); `--emb-cluster-te` stays off. Cheap emb-discovery lane exhausted
 
 Heavier / researchy:
-- [ ] Residual emb after regressing out account TE / reply baseline, then redo direction or PLS (isolates *content* signal from account heat)
+- [x] Residual emb after regressing out account TE, then PLS — **v34b: regress** wa_nr 0.227→0.209 despite smoke corr 0.17; TE nearly orthogonal to MiniLM (emb_var_kept≈1); `--emb-residual-pls` opt-in / leave off
+- [ ] **Account-mean emb demean** (subtract train per-account MiniLM mean, then PLS/CAV) — distinct from v34 TE-linear FWL; closer to “vs author’s typical voice”
 - [x] Error-driven clusters: — **v25a/b: flat**; **v32 rescore:** noise on wa_*; `--fail-clusters` stays opt-in
 - [ ] Supervised manifold (UMAP on RF-leaf similarity, etc.) — usually for analysis, not tabular features; only promote if a cheap projection beats PLS
+
+### Post-hybrid within-author (new — locked primaries)
+Hybrid LambdaRank already sets within-account order; further wa_* lifts need **ranker-facing** signal, not more level losses (v33 SERA froze wa_*).
+- [ ] Content-only feature set for stratum rankers (drop `account_mean_rate` / inbound heat from LambdaRank inputs; keep on level model)
+- [ ] Early-stop / model selection on `spearman_within_account_nonreply_wmean` (and reply), not global Spearman/RMSE
+- [ ] Within-account demeaned target for level head (train on y − account TE; decode by adding TE at predict) — aligns level fit with draft-quality residual
+- [ ] `analyze.py` missing-parent / missing-quote-parent slices (persist `has_*_parent` on val preds; AGENTS lists this exploit target but it is not implemented)
+- [ ] Per-author listwise text contrasts: is this draft more novel / more CTA / shorter than this author’s other pre-T drafts? (ranker-native features)
 
 ### Modeling
 - [x] Quantile / pinball or underprediction-asymmetric loss — **v20a asymmetric: 0.639→0.607 rate RMSE** (default); **v20b quantile α=0.65: worse RMSE** (0.647), slight Spearman lift
@@ -193,6 +211,7 @@ Heavier / researchy:
 - [x] Account-level **target encoding** (train-fold LOO, leakage-safe) — **v19: 0.642 → 0.639 rate RMSE**, Spearman 0.441→0.452; default on (`--no-account-te` to ablate)
 - [x] True account **random effects** via GPBoost — **v27c: regress** (0.653 vs v27b 0.613; also worse than mse floor 0.642); custom asymmetric loss unsupported with `gp_model`; RE variance tiny on full stack; keep `--model gpboost` opt-in only
 - [x] Emb kNN train-fold TE (content prior for cold-start accounts) — **v22b: 0.607 → 0.606**; default on (`--no-emb-knn-te` to ablate); PCA must only transform `emb_\d+`
+- [x] FWL residual-emb PLS after account TE — **v34b: regress** on wa_* (0.227→0.209); leave `--emb-residual-pls` off
 
 ### Tried — do not re-litigate without a new angle
 - [x] Non-reply sample weight / breakout OOF head / nonreply-only train (v8: no lift)

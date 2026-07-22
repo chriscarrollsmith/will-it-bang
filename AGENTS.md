@@ -37,6 +37,7 @@ Any time you have to look up how to do something you might want to do again, add
 - Prefer many accounts with a per-account tweet cap over a few fat accounts — otherwise the time-split barely tests generalization. Scale defaults: `--max-tweets 120000 --min-account-tweets 50 --max-account-tweets 8000 --per-account-cap 180` (~110k rows / ~900 accounts).
 - Attachment flags: page `tweet_media` / `tweet_urls` with `tweet_id=in.(...)` batches (~80 ids); coverage is sparse but leakage-safe. Refresh on an existing dataset: `uv run prepare.py --media-only` (v18: ~9% media / ~7% ca_url on the scaled set).
 - Train-fit emb PCA (~96) on MiniLM; residualize only against leakage-safe baselines (e.g. pre-T reply-received rates), never against dump-time fav/RT history.
+- Opt-in FWL residual emb: `--emb-residual-pls N` residualizes MiniLM on `account_mean_rate`, PLS→(y−TE), adds `res_pls_*`/`emb_res_l2`. **v34b:** smoke corr≈0.17 but hybrid wa_nr 0.227→0.209 — leave off.
 - Optional train-fit TF-IDF→SVD on `full_text` (default 128 dims) adds a small honest lift once fav/RT history is banned.
 - Denser leakage-safe popularity: scan full dump for replies/quotes to all tweets by sampled `account_id`s (`reply_to_tweet_id` / `quoted_tweet_id` / `reply_to_user_id` with `created_at < T`); `user_mentions` lacks timestamps unless joined.
 - Rebuild features with `uv run prepare.py --skip-media` to reuse media flags from an existing `dataset.parquet` and skip the slow CA attachment API.

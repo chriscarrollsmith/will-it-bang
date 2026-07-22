@@ -16,3 +16,4 @@ results.tsv
 logs/*.log
 logs/rescore_within_account/
 logs/v33_sera/
+logs/v34_residual_pls/
