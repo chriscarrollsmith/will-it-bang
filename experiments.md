@@ -22,7 +22,7 @@ Process retrospective (what moved the scoreboard vs what burned cycles): [`logs/
 |---|---|---:|---:|---:|---:|---|
 | **Default stack** | **v31b** | **0.227** | **0.280** | 0.518 | 0.608 | Hybrid level + stratum LambdaRank blend (default) |
 | Level-only (ablation) | v31a | 0.187 | 0.172 | 0.508 | 0.610 | Asymmetric without hybrid blend |
-| Magnitude (opt-in SERA) | v28b / rescore | 0.204 | 0.140 | 0.474 | **0.590** | Level-only rescore: +wa_nr, −wa_rp; better RMSE |
+| Magnitude (opt-in SERA) | v28b / v33b | 0.227† | 0.280† | 0.483 | **0.584** | †wa_* frozen by hybrid ranker; level SERA only moves RMSE/global |
 | Dump total | v13 | — | — | — | 0.967 | Legacy objective |
 
 Rebuild: `uv run prepare.py --skip-media` (defaults are the v12 scale knobs).  
@@ -82,7 +82,11 @@ Dump-time fav/RT used as author history → optimistic RMSE ~0.82 (v5). Invalid 
 | v31a | 0.610 (rate) | 0.460 | Asymmetric control with new primaries: wa_nr_wmean **0.187**, wa_rp_wmean **0.172**; global_nr 0.508; under-pred 2.22 |
 | v31b | 0.608 (rate) | 0.490 | Hybrid `--hybrid-rank`: wa_nr_wmean **0.227** (+0.040), wa_rp_wmean **0.280** (+0.108); global_nr 0.518; under-pred 2.21; **promote / new default** |
 | v31c | — | — | Policy: lock primary = within-account Spearman by stratum (NR + reply); global Spearman secondary |
-| v32 | — | — | Rescore shortlist on level-only stack (`--no-hybrid-rank`) vs control wa_nr **0.187** / wa_rp **0.172** / rmse 0.610 / global_nr 0.508. Artifacts: `logs/rescore_within_account/`. **SERA:** wa_nr **0.204** (+0.017), wa_rp **0.140** (−0.032), rmse **0.590**, global_nr 0.474 — NR within-author + magnitude help, reply within-author and global rank hurt; stay opt-in (consider NR-stratum / hybrid×SERA later). **PLS-8:** wa_nr +0.008 / wa_rp −0.012 / rmse flat — marginal, leave opt-in. **fail-clusters:** noise. **CAV / author affinity:** flat-to-worse. **cluster TE:** still regresses (wa_nr −0.037, wa_rp −0.057). Do not revive CAV/affinity/cluster-TE without a new angle |
+| v32 | — | — | Rescore shortlist on level-only stack (`--no-hybrid-rank`) vs control wa_nr **0.187** / wa_rp **0.172** / rmse 0.610 / global_nr 0.508. Artifacts: `logs/rescore_within_account/`. **SERA:** wa_nr **0.204** (+0.017), wa_rp **0.140** (−0.032), rmse **0.590**, global_nr 0.474 — NR within-author + magnitude help, reply within-author and global rank hurt; stay opt-in. **PLS-8:** wa_nr +0.008 / wa_rp −0.012 / rmse flat — marginal, leave opt-in. **fail-clusters:** noise. **CAV / author affinity:** flat-to-worse. **cluster TE:** still regresses (wa_nr −0.037, wa_rp −0.057). Do not revive CAV/affinity/cluster-TE without a new angle |
+| v33a | 0.608 (rate) | 0.490 | Hybrid asymmetric control (= v31b): wa_nr **0.227**, wa_rp **0.280**, global_nr 0.518 |
+| v33b | **0.584** (rate) | 0.460 | Hybrid × SERA: wa_* **unchanged** (ranker sets within-author order); RMSE −0.024 / under-pred 2.21→2.04; global_nr 0.518→0.483 — magnitude-only; **do not promote** |
+| v33c | 0.601 (rate) | 0.474 | Hybrid × SERA `--sera-nonreply-only`: same frozen wa_*; milder RMSE/global trade vs v33b |
+| v33d | 0.604 (rate) | 0.453 | Level SERA NR-only: wa_nr **0.138** (−0.049 vs level control), wa_rp 0.170 (flat); **regress** on locked primary — NR-stratum SERA fails |
 
 ### Rescore shortlist (level-only, locked primaries)
 
@@ -96,6 +100,15 @@ Fair revisit of prior ablations after the metric lock. Control = asymmetric leve
 | emb_cav | −0.004 | −0.006 | +0.002 | −0.008 | Flat/worse — do not revive |
 | author_emb_affinity | −0.009 | −0.012 | +0.002 | −0.007 | Flat/worse — do not revive |
 | emb_cluster_te | **−0.037** | **−0.057** | +0.014 | −0.025 | Still regresses |
+
+### v33 SERA × hybrid / NR-stratum
+
+| Run | wa_nr | wa_rp | global_nr | rmse | Notes |
+|---|---:|---:|---:|---:|---|
+| v33a hybrid asym | 0.227 | 0.280 | 0.518 | 0.608 | Control |
+| v33b hybrid sera | 0.227 | 0.280 | 0.483 | **0.584** | wa_* frozen; better magnitude |
+| v33c hybrid sera NR | 0.227 | 0.280 | 0.494 | 0.601 | Same; milder tradeoff |
+| v33d level sera NR | **0.138** | 0.170 | 0.469 | 0.604 | Primary regress vs level control 0.187 |
 
 ## Failure modes (still open)
 
@@ -170,11 +183,11 @@ Heavier / researchy:
 
 ### Modeling
 - [x] Quantile / pinball or underprediction-asymmetric loss — **v20a asymmetric: 0.639→0.607 rate RMSE** (default); **v20b quantile α=0.65: worse RMSE** (0.647), slight Spearman lift
-- [x] SERA / relevance-weighted extreme loss — **v28b** RMSE lift / global rank hurt; **v32 rescore:** wa_nr +0.017, wa_rp −0.032 — stay **opt-in**; next angle: NR-stratum SERA or hybrid×SERA (not blanket default)
+- [x] SERA / relevance-weighted extreme loss — **v28b/v32** level: +wa_nr/−wa_rp; **v33b** hybrid×SERA: wa_* frozen, RMSE↑/global↓; stay **opt-in** for magnitude only
 - [x] Early-stop on `spearman_nonreply` — **v29b: tiny lift** (0.508→0.509); guardrails flat; `--early-stop-metric spearman_nonreply` opt-in (default stays rmse)
 - [x] Pairwise / listwise LambdaRank on non-replies by `account_id` — **v30b: fail on global spearman_nr** (0.051); slight **within-account** rank lift (wmean 0.187→0.211); `--loss lambdarank` opt-in only
 - [x] Hybrid level + stratum within-author ranker — **v31b: lift** wa_nr 0.187→0.227, wa_rp 0.172→0.280; guardrails flat/up; **default on** (`--no-hybrid-rank` to ablate)
-- [ ] SERA on NR stratum only / hybrid level=SERA + ranker (follow-up from v32 rescore)
+- [x] SERA on NR stratum / hybrid×SERA — **v33:** hybrid freezes wa_*; level `--sera-nonreply-only` **regress** wa_nr 0.187→0.138; leave opt-in, no promote
 - [ ] Larger frozen encoder (Modal credits) vs MiniLM
 - [ ] Further scale (>120k / more accounts with lower `min-account-tweets`)
 - [x] Account-level **target encoding** (train-fold LOO, leakage-safe) — **v19: 0.642 → 0.639 rate RMSE**, Spearman 0.441→0.452; default on (`--no-account-te` to ablate)
