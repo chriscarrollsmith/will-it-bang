@@ -26,8 +26,8 @@ Process retrospective (what moved the scoreboard vs what burned cycles): [`logs/
 | Magnitude (opt-in SERA) | v28b / v33b | 0.227† | 0.280† | 0.483 | **0.584** | †wa_* frozen by hybrid ranker; level SERA only moves RMSE/global |
 | Dump total | v13 | — | — | — | 0.967 | Legacy objective |
 
-Rebuild: `uv run prepare.py --skip-media` (defaults are the v12 scale knobs; mentions via `--mentions-only` on an existing dataset).  
-Train: `uv run train.py --description "…"`.
+Rebuild: `uv run prepare.py --skip-media` (defaults are the v12 scale knobs; mentions + provenance included).  
+Train: `uv run train.py --description "…"`. Patch older datasets with `--mentions-only` / `--provenance-only`.
 
 ## Timeline (curated)
 
