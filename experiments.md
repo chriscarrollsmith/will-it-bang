@@ -129,7 +129,10 @@ Check off when tried; note outcome in one line.
 - [x] Explicit “CA corpus quality over time” proxies (upload density, archive coverage) — **audit 2026-07-24:** stream (`archive_upload_id` null) is 62% of 2025 / 98% of 2026 dump rows; latest time-quintile on eligible accounts is ~100% stream with ~73% replies missing `reply_to_user_id` (breaks inbound `reply_to_user` hist). Likes/followers only from archive uploads (extension does not capture). Report: `logs/ca_data_quality_audit.md`; re-run `uv run audit_ca_quality.py`. Still open: provenance stratum in `analyze.py`, parent-author backfill for reply uid, holdout/label policy per regime.
 - [ ] Provenance-aware eval/train: slice wa_* by upload-linked vs stream; optional feature `is_stream` / hours since account’s last upload `end_date`
 - [ ] Backfill `reply_to_user_id` from parent `account_id` when parent ∈ dump; rebuild hist graph features
+- [ ] Holdout / train policy by ingestion regime: cap eval at last upload-complete era, require min pre-T upload-linked history, and/or train+eval within stream-only once history is long enough (today’s global time split ≈ pure stream val)
+- [ ] Label honesty for stream eng: treat fav/RT as as-observed (not eventual); provenance×age interactions or down-weight very fresh stream rows on top of exposure-rate
 - [ ] Fixed-horizon labels if CA/X ever provide time-series engagement (cleaner maturity control)
+- [ ] Do **not** build liker / likes-graph features until CA streams likes with usable timestamps (extension omits likes; upload likes undated) — revisit only if #427 lands or a dated source appears
 
 ### Language-model labels (post-time text only)
 - Prefer descriptive tags of tweet text (sentiment, humor, controversy, narrative, CTA, gender presentation). Avoid fame/quality/influence scores on text or handles — cutoff/reputation leakage risk.
