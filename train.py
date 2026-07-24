@@ -909,9 +909,16 @@ def train_model(
         under_w = float(asymmetric_under_weight)
 
         def asymmetric_mse(y_pred: np.ndarray, dataset: lgb.Dataset):
+            # Custom objectives must apply Dataset weights themselves (LightGBM
+            # does not multiply them into grad/hess for Python objectives).
             y_true = dataset.get_label()
+            sw = dataset.get_weight()
+            if sw is None:
+                sw = np.ones_like(y_true, dtype=np.float64)
+            else:
+                sw = np.asarray(sw, dtype=np.float64)
             resid = y_true - y_pred
-            w = np.where(resid > 0.0, under_w, 1.0)
+            w = np.where(resid > 0.0, under_w, 1.0) * sw
             grad = -2.0 * w * resid
             hess = 2.0 * w
             return grad, hess
