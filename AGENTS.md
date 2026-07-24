@@ -62,3 +62,12 @@ Any time you have to look up how to do something you might want to do again, add
 - Opt-in GPBoost account RE: `uv run train.py --model gpboost` (Apache-2.0; defaults `--no-account-te`; forces MSE — custom objectives unsupported with `gp_model`; set `bagging_freq=0`); **v27c regress** vs LGBM+TE — leave LGBM default.
 - Link/domain features: `uv run prepare.py --urls-only` caches CA `tweet_urls` domains in `~/.cache/will-it-bang/url_cache.parquet`; train adds train-fold `domain_mean_rate` (min_count=30). Flat on rate RMSE in v16 (~7% expanded-domain coverage).
 - LM tone labels (wrongheaded/infuriating): `uv run modal run label_provoke.py --nonreply-only` → `provoke_cache_Qwen__Qwen3-8B.parquet`; train with `--provoke-labels --provoke-cache …`. Default rater Qwen3-8B (Apache-2.0); Qwen3.6-27B works on A100 but ~20× slower without batched multimodal gen. Flat rate RMSE in v17b.
+
+## Cursor Cloud specific instructions
+
+- Environment is **CPU-only** (no CUDA). MiniLM embedding in `prepare.py` runs on CPU at ~150 tweets/s; the full `--max-tweets 120000` default therefore takes a while — for a quick sanity run use a small scale, e.g. `uv run prepare.py --max-tweets 6000 --per-account-cap 60 --skip-media`.
+- The full `prepare.py` first downloads the ~900MB `enriched_tweets.parquet` dump to `~/.cache/will-it-bang/` (cached across runs; re-fetch with `--force-download`). All artifacts (`dataset.parquet`, `embed_cache.parquet`, `model.txt`, `val_predictions.parquet`, caches) live under `~/.cache/will-it-bang/` and are gitignored.
+- `prepare.py` (default flow) does **not** add inbound-mention columns; the v35b default stack needs them, so after a fresh build run `uv run prepare.py --mentions-only` (fast; reuses the mention cache) before `uv run train.py`.
+- `--skip-media` reuses media flags from any existing `dataset.parquet` (0% if none) and skips the slow CA media API — good for cloud runs where the media join dominates wall time.
+- There is **no test suite and no configured linter** (nothing in `pyproject.toml`); "running the app" means the `prepare.py` → `train.py` (→ optional `analyze.py`) pipeline. `train.py` on a prepared `dataset.parquet` finishes in seconds.
+- Metrics on a small scaled sample will not match the full-scale `experiments.md` numbers (fewer accounts/rows); that is expected — use full scale for real comparisons.
