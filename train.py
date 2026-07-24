@@ -2934,6 +2934,8 @@ def main() -> None:
                 "log_engagement",
                 "is_reply",
                 "is_quote",
+                "is_stream",
+                "archive_upload_id",
                 "has_media",
                 "has_url",
                 "text_len",

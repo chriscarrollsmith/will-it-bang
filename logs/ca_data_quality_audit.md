@@ -145,15 +145,13 @@ So today:
 
 ---
 
-## Recommended follow-ups (not implemented)
+## Recommended follow-ups
 
-Prioritized for discussion before code changes:
-
-1. **Provenance features / stratum:** expose `archive_upload_id IS NULL` (and/or upload `end_date` vs tweet time) as a feature and as an `analyze.py` slice; report wa_* / Spearman separately for upload-linked vs stream rows.
-2. **Repair `reply_to_user_id`:** backfill from parent tweet’s `account_id` when parent ∈ dump (upstream suggestion); recompute hist graph features.
+1. ~~**Provenance stratum in analyze:**~~ **done** — prepare carries `archive_upload_id` / `is_stream`; `analyze.py` reports wa_* by upload vs stream (optional train feature / upload `end_date` still open).
+2. ~~**Repair `reply_to_user_id`:**~~ **done** — `load_author_graph` coalesces null uid from parent `account_id` when parent ∈ dump; sampled rows get the same for `is_self_reply`. Rebuild features to densify `inbound_replies*`.
 3. **Holdout policy:** consider capping eval at last-upload-complete era, or requiring min pre-T upload-linked history; or train/eval only within stream regime once enough stream history exists.
 4. **Label honesty:** treat stream eng as “as-observed”; optionally down-weight very fresh stream rows; keep exposure-rate but add provenance×age interactions.
 5. **Don’t build on likes** until extension or a new source captures them with timestamps.
 6. **Refresh awareness:** re-run `audit_ca_quality.py` when CA changes stream policy (opt-in-only threshold in their FAQ) or fixes #404/#427.
 
-Backlog checkbox in `experiments.md`: “CA corpus quality over time” — this audit is the first pass; feature/holdout work still open.
+Backlog in `experiments.md`: audit + reply-uid backfill + provenance eval slices landed; holdout/label-policy and optional `is_stream` train feature still open.
