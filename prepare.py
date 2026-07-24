@@ -36,6 +36,7 @@ RAW_PARQUET = CACHE_DIR / "enriched_tweets.parquet"
 DATASET_PATH = CACHE_DIR / "dataset.parquet"
 EMBED_CACHE_PATH = CACHE_DIR / "embed_cache.parquet"
 MENTION_CACHE_PATH = CACHE_DIR / "mention_cache.parquet"
+UPLOAD_CACHE_PATH = CACHE_DIR / "archive_upload_cache.parquet"
 EMBED_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"  # Apache-2.0
 PARQUET_URL = (
     "https://fabxmporizzqflnftavs.supabase.co/storage/v1/object/public/"
@@ -1447,7 +1448,131 @@ def backfill_reply_user_from_dump(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def attach_provenance(df: pd.DataFrame) -> pd.DataFrame:
+def fetch_archive_uploads(*, force: bool = False) -> pd.DataFrame:
+    """Page CA archive_upload rows (id, account_id, end_date, phase, created_at)."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    if UPLOAD_CACHE_PATH.exists() and not force:
+        cached = pd.read_parquet(UPLOAD_CACHE_PATH)
+        print(f"Using cached archive_upload rows: {len(cached):,}", flush=True)
+        return cached
+
+    print("Fetching archive_upload rows from CA…", flush=True)
+    session = requests.Session()
+    rows: list[dict[str, object]] = []
+    last_id = 0
+    while True:
+        resp = session.get(
+            f"{CA_API}/archive_upload",
+            headers=_ca_headers(),
+            params={
+                "select": "id,account_id,end_date,upload_phase,created_at",
+                "id": f"gt.{last_id}",
+                "order": "id.asc",
+                "limit": "1000",
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        batch = resp.json()
+        if not batch:
+            break
+        for row in batch:
+            rows.append(
+                {
+                    "id": int(row["id"]),
+                    "account_id": str(row["account_id"]),
+                    "end_date": row.get("end_date"),
+                    "upload_phase": row.get("upload_phase"),
+                    "created_at": row.get("created_at"),
+                }
+            )
+            last_id = max(last_id, int(row["id"]))
+        if len(batch) < 1000:
+            break
+    out = pd.DataFrame(rows)
+    if out.empty:
+        out = pd.DataFrame(
+            columns=["id", "account_id", "end_date", "upload_phase", "created_at"]
+        )
+    else:
+        out["created_at"] = pd.to_datetime(out["created_at"], utc=True, errors="coerce")
+        # end_date is a calendar date from CA; treat as UTC midnight.
+        out["end_date"] = pd.to_datetime(out["end_date"], utc=True, errors="coerce")
+    out.to_parquet(UPLOAD_CACHE_PATH, index=False)
+    print(f"  cached {len(out):,} archive_upload rows → {UPLOAD_CACHE_PATH}", flush=True)
+    return out
+
+
+def attach_upload_end_features(df: pd.DataFrame, *, force: bool = False) -> pd.DataFrame:
+    """Leakage-safe hours since account's latest archive upload end_date before T.
+
+    Only uploads with created_at < tweet.created_at are eligible (upload event
+    observed before the tweet). Prefer completed phases when present.
+    """
+    out = df.copy()
+    out["tweet_id"] = out["tweet_id"].astype(str)
+    out["account_id"] = out["account_id"].astype(str)
+    out["created_at"] = pd.to_datetime(out["created_at"], utc=True)
+    uploads = fetch_archive_uploads(force=force)
+    drop = [c for c in ("hours_since_upload_end", "has_upload_end", "upload_end_date") if c in out.columns]
+    if drop:
+        out = out.drop(columns=drop)
+
+    hours = np.full(len(out), np.nan, dtype=np.float64)
+    has = np.zeros(len(out), dtype=np.int8)
+    end_dates = np.full(len(out), np.datetime64("NaT"), dtype="datetime64[ns]")
+    if not uploads.empty:
+        up = uploads.copy()
+        up["account_id"] = up["account_id"].astype(str)
+        up["created_at"] = pd.to_datetime(up["created_at"], utc=True, errors="coerce")
+        up["end_date"] = pd.to_datetime(up["end_date"], utc=True, errors="coerce")
+        up = up.dropna(subset=["created_at", "end_date"])
+        # Prefer completed; keep failed/other as fallback when no completed exists.
+        up["_pref"] = (up["upload_phase"].astype(str) == "completed").astype(np.int8)
+        up = up.sort_values(["account_id", "created_at", "end_date"], kind="mergesort")
+        # Parallel arrays of upload-created / end / pref, keyed by account.
+        by_acct: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        for aid, g in up.groupby("account_id", sort=False):
+            by_acct[str(aid)] = (
+                g["created_at"].astype("int64").to_numpy(),
+                g["end_date"].astype("int64").to_numpy(),
+                g["_pref"].to_numpy(dtype=np.int8),
+            )
+        tweet_ns = pd.to_datetime(out["created_at"], utc=True).astype("int64").to_numpy()
+        for i, (aid, t_ns) in enumerate(
+            zip(out["account_id"].to_numpy(), tweet_ns, strict=True)
+        ):
+            pack = by_acct.get(str(aid))
+            if pack is None:
+                continue
+            created_u, ends_u, pref_u = pack
+            n_before = int(np.searchsorted(created_u, t_ns, side="left"))
+            if n_before <= 0:
+                continue
+            ends = ends_u[:n_before]
+            prefs = pref_u[:n_before]
+            if prefs.max() > 0:
+                ends = ends[prefs == 1]
+            end_ns = int(ends.max())
+            hours[i] = float(t_ns - end_ns) / 3.6e12
+            has[i] = 1
+            end_dates[i] = np.datetime64(end_ns, "ns")
+
+    out["hours_since_upload_end"] = np.where(has == 1, hours, 0.0).astype(np.float32)
+    out["has_upload_end"] = has
+    out["upload_end_date"] = pd.to_datetime(end_dates, utc=True)
+    if has.any():
+        print(
+            f"Upload-end features: has_upload_end={has.mean():.1%} "
+            f"hours p50={np.nanmedian(hours):.1f}",
+            flush=True,
+        )
+    else:
+        print("Upload-end features: has_upload_end=0.0%", flush=True)
+    return out
+
+
+def attach_provenance(df: pd.DataFrame, *, force_uploads: bool = False) -> pd.DataFrame:
     """Attach archive_upload_id / is_stream from the dump (stream ⇒ null upload id)."""
     out = df.copy()
     out["tweet_id"] = out["tweet_id"].astype(str)
@@ -1483,6 +1608,7 @@ def attach_provenance(df: pd.DataFrame) -> pd.DataFrame:
         f"(upload-linked={(1.0 - out['is_stream'].mean()):.1%})",
         flush=True,
     )
+    out = attach_upload_end_features(out, force=force_uploads)
     return out
 
 
@@ -1599,7 +1725,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--provenance-only",
         action="store_true",
-        help="Attach archive_upload_id / is_stream onto an existing dataset.parquet",
+        help="Attach archive_upload_id / is_stream / upload-end features onto an existing dataset.parquet",
     )
     p.add_argument(
         "--force-urls",
@@ -1610,6 +1736,11 @@ def parse_args() -> argparse.Namespace:
         "--force-mentions",
         action="store_true",
         help="Refetch user_mentions even when mention_cache.parquet has the account_id",
+    )
+    p.add_argument(
+        "--force-uploads",
+        action="store_true",
+        help="Refetch archive_upload even when archive_upload_cache.parquet exists",
     )
     return p.parse_args()
 
@@ -1641,7 +1772,7 @@ def main() -> None:
         if not DATASET_PATH.exists():
             raise SystemExit(f"Missing {DATASET_PATH} for --provenance-only")
         dataset = pd.read_parquet(DATASET_PATH)
-        dataset = attach_provenance(dataset)
+        dataset = attach_provenance(dataset, force_uploads=args.force_uploads)
         dataset.to_parquet(DATASET_PATH, index=False)
         print(f"Wrote {DATASET_PATH} ({len(dataset):,} rows, {dataset.shape[1]} cols)")
         print(f"Done in {time.time() - t0:.1f}s")
@@ -1757,6 +1888,7 @@ def main() -> None:
     del featured
     dataset = attach_parent_context(dataset, batch_size=args.embed_batch_size)
     dataset = attach_url_domains(dataset, force=args.force_urls)
+    dataset = attach_upload_end_features(dataset, force=args.force_uploads)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     dataset.to_parquet(DATASET_PATH, index=False)
     print(f"Wrote {DATASET_PATH} ({len(dataset):,} rows, {dataset.shape[1]} cols)")

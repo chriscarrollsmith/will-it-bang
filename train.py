@@ -133,6 +133,16 @@ TABULAR_FEATURES = [
     "era_musk_late",
 ]
 
+# Opt-in CA provenance / upload-regime features (--provenance-features).
+PROVENANCE_FEATURES = [
+    "is_stream",
+    "has_upload_end",
+    "hours_since_upload_end",
+    "log_hours_since_upload_end",
+    "stream_x_log_age",
+    "stream_x_inbound_replies",
+]
+
 # Opt-in descriptive text tags (--descriptive-text); flat on rate RMSE in v15.
 DESCRIPTIVE_TEXT_FEATURES = [
     "sent_neg",
@@ -219,6 +229,11 @@ BREAKOUT_FEATURES = [
 
 
 def feature_matrix(df: pd.DataFrame, skip_embeddings: bool) -> tuple[np.ndarray, list[str]]:
+    # Provenance raw cols (is_stream, …) live on the dataset for holdout/analyze;
+    # only include them when --provenance-features has built the derived marker col.
+    provenance_cols = (
+        PROVENANCE_FEATURES if "log_hours_since_upload_end" in df.columns else []
+    )
     extra = [
         c
         for c in (
@@ -231,6 +246,7 @@ def feature_matrix(df: pd.DataFrame, skip_embeddings: bool) -> tuple[np.ndarray,
             + EMB_KNN_TE_FEATURES
             + EMB_CAV_FEATURES
             + EMB_CLUSTER_TE_FEATURES
+            + provenance_cols
         )
         if c in df.columns
     ]
@@ -281,7 +297,164 @@ def time_split(df: pd.DataFrame, val_frac: float) -> tuple[pd.DataFrame, pd.Data
         f"val={val['account_id'].nunique():,} "
         f"overlap={len(set(train['account_id']) & set(val['account_id'])):,}"
     )
+    if "is_stream" in train.columns:
+        print(
+            f"Provenance: train stream={train['is_stream'].mean():.1%} "
+            f"val stream={val['is_stream'].mean():.1%}",
+            flush=True,
+        )
     return train, val
+
+
+def prior_upload_hist_counts(df: pd.DataFrame) -> np.ndarray:
+    """Per-row count of earlier upload-linked tweets by the same account (pre-T)."""
+    if "is_stream" not in df.columns:
+        return np.zeros(len(df), dtype=np.int32)
+    ordered = df.sort_values(["account_id", "created_at"], kind="mergesort")
+    is_upload = (ordered["is_stream"].to_numpy() == 0).astype(np.int32)
+    # Cumsum within account, then subtract current row ⇒ strictly earlier uploads.
+    prior = (
+        pd.Series(is_upload, index=ordered.index)
+        .groupby(ordered["account_id"], sort=False)
+        .cumsum()
+        .to_numpy(dtype=np.int32)
+        - is_upload
+    )
+    out = np.zeros(len(df), dtype=np.int32)
+    out[ordered.index.to_numpy()] = prior
+    return out
+
+
+def apply_holdout_policy(
+    df: pd.DataFrame,
+    *,
+    policy: str,
+    min_upload_hist: int = 0,
+) -> pd.DataFrame:
+    """Filter rows before the global time split by CA ingestion regime.
+
+    Policies:
+      time         — no regime filter (default global time holdout)
+      upload_era   — cap at the latest upload-linked created_at (drop pure-stream tail)
+      stream_only  — keep only browser-extension stream rows (null archive_upload_id)
+    """
+    out = df.copy()
+    if policy not in {"time", "upload_era", "stream_only"}:
+        raise SystemExit(f"Unknown holdout policy: {policy}")
+    if policy != "time" or min_upload_hist > 0:
+        if "is_stream" not in out.columns:
+            raise SystemExit(
+                "Holdout policy requires is_stream; run: uv run prepare.py --provenance-only"
+            )
+
+    if min_upload_hist > 0:
+        prior = prior_upload_hist_counts(out)
+        keep = prior >= int(min_upload_hist)
+        print(
+            f"min_upload_hist={min_upload_hist}: kept {int(keep.sum()):,}/{len(out):,} "
+            f"(mean prior upload-linked={float(prior.mean()):.2f})",
+            flush=True,
+        )
+        out = out.loc[keep].reset_index(drop=True)
+
+    if policy == "upload_era":
+        upload_times = out.loc[out["is_stream"].to_numpy() == 0, "created_at"]
+        if upload_times.empty:
+            raise SystemExit("upload_era holdout: no upload-linked rows in dataset")
+        cap = upload_times.max()
+        before = len(out)
+        out = out.loc[out["created_at"] <= cap].reset_index(drop=True)
+        print(
+            f"Holdout policy=upload_era: cap created_at≤{cap} "
+            f"kept {len(out):,}/{before:,} "
+            f"(stream after filter={out['is_stream'].mean():.1%})",
+            flush=True,
+        )
+    elif policy == "stream_only":
+        before = len(out)
+        out = out.loc[out["is_stream"].to_numpy() == 1].reset_index(drop=True)
+        print(
+            f"Holdout policy=stream_only: kept {len(out):,}/{before:,} stream rows",
+            flush=True,
+        )
+    else:
+        print("Holdout policy=time (global time split, no regime filter)", flush=True)
+
+    if len(out) < 50:
+        raise SystemExit(f"Holdout policy left only {len(out)} rows; need a denser dataset")
+    return out
+
+
+def add_provenance_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Build opt-in is_stream / upload-end features + light interactions."""
+    if "is_stream" not in df.columns:
+        raise SystemExit(
+            "Missing is_stream; run: uv run prepare.py --provenance-only"
+        )
+    out = df.copy()
+    out["is_stream"] = out["is_stream"].fillna(0).astype(np.int8)
+    if "has_upload_end" not in out.columns:
+        out["has_upload_end"] = np.int8(0)
+    if "hours_since_upload_end" not in out.columns:
+        out["hours_since_upload_end"] = np.float32(0.0)
+    hours = out["hours_since_upload_end"].to_numpy(dtype=np.float64)
+    # log1p of non-negative hours; negative ⇒ still inside prior archive coverage window.
+    out["log_hours_since_upload_end"] = np.log1p(np.clip(hours, 0.0, None)).astype(np.float32)
+    if "exposure_age_days" in out.columns:
+        age = out["exposure_age_days"].to_numpy(dtype=np.float64)
+    else:
+        # Fallback: age vs dataset max (same dump-time proxy as exposure rate).
+        dump_time = pd.Timestamp(out["created_at"].max())
+        age = (dump_time - pd.to_datetime(out["created_at"], utc=True)).dt.total_seconds().to_numpy()
+        age = np.clip(age / 86400.0, 0.0, None)
+    out["stream_x_log_age"] = (
+        out["is_stream"].to_numpy(dtype=np.float64) * np.log1p(age)
+    ).astype(np.float32)
+    if "inbound_replies" in out.columns:
+        out["stream_x_inbound_replies"] = (
+            out["is_stream"].to_numpy(dtype=np.float64)
+            * out["inbound_replies"].to_numpy(dtype=np.float64)
+        ).astype(np.float32)
+    else:
+        out["stream_x_inbound_replies"] = np.float32(0.0)
+    print(
+        f"Provenance features: stream={out['is_stream'].mean():.1%} "
+        f"has_upload_end={out['has_upload_end'].mean():.1%}",
+        flush=True,
+    )
+    return out
+
+
+def stream_fresh_sample_weights(
+    train_df: pd.DataFrame,
+    base_weights: np.ndarray,
+    *,
+    fresh_days: float,
+    floor: float = 0.25,
+) -> np.ndarray:
+    """Down-weight very fresh stream rows (as-observed eng; maturity still uncertain)."""
+    w = np.asarray(base_weights, dtype=np.float64).copy()
+    if fresh_days <= 0 or "is_stream" not in train_df.columns:
+        return w
+    if "exposure_age_days" in train_df.columns:
+        age = train_df["exposure_age_days"].to_numpy(dtype=np.float64)
+    else:
+        dump_time = pd.Timestamp(train_df["created_at"].max())
+        age = (
+            dump_time - pd.to_datetime(train_df["created_at"], utc=True)
+        ).dt.total_seconds().to_numpy() / 86400.0
+        age = np.clip(age, 0.0, None)
+    stream = train_df["is_stream"].to_numpy() == 1
+    # Linear ramp: age=0 → floor, age≥fresh_days → 1.
+    ramp = np.clip(age / float(fresh_days), 0.0, 1.0)
+    mult = floor + (1.0 - floor) * ramp
+    w[stream] *= mult[stream]
+    print(
+        f"Stream-fresh weights: days={fresh_days:g} floor={floor:g} "
+        f"n_stream={int(stream.sum()):,} mean_mult={float(mult[stream].mean()) if stream.any() else 1.0:.3f}",
+        flush=True,
+    )
+    return w
 
 
 def evaluate(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
@@ -1079,6 +1252,37 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Optional row cap after time-sort (smoke tests); 0 = full dataset",
+    )
+    p.add_argument(
+        "--holdout-policy",
+        choices=("time", "upload_era", "stream_only"),
+        default="time",
+        help="Regime filter before the global time split: upload_era caps at the "
+        "latest upload-linked tweet; stream_only trains/evals on extension rows only",
+    )
+    p.add_argument(
+        "--min-upload-hist",
+        type=int,
+        default=0,
+        help="Drop rows whose author has fewer than N prior upload-linked tweets (0=off)",
+    )
+    p.add_argument(
+        "--provenance-features",
+        action="store_true",
+        help="Add is_stream / upload-end / provenance×age features (off by default)",
+    )
+    p.add_argument(
+        "--stream-fresh-days",
+        type=float,
+        default=0.0,
+        help="Down-weight stream rows younger than this many days (0=off); "
+        "linear ramp from --stream-fresh-floor to 1.0",
+    )
+    p.add_argument(
+        "--stream-fresh-floor",
+        type=float,
+        default=0.25,
+        help="Minimum sample-weight multiplier for brand-new stream rows",
     )
     p.add_argument(
         "--residual",
@@ -2313,6 +2517,8 @@ def fit_predict_group(
     rank_min_group: int = 2,
     hybrid_rank: bool = True,
     model_kind: str = "lgbm",
+    stream_fresh_days: float = 0.0,
+    stream_fresh_floor: float = 0.25,
 ) -> tuple[np.ndarray, Any, list[str], dict[str, float]]:
     x_train, feature_names = feature_matrix(train_df, skip_embeddings=skip_embeddings)
     x_val, _ = feature_matrix(val_df, skip_embeddings=skip_embeddings)
@@ -2331,6 +2537,13 @@ def fit_predict_group(
         nonreply_weight,
         1.0,
     ).astype(np.float64)
+    if stream_fresh_days > 0:
+        weight_train = stream_fresh_sample_weights(
+            train_df,
+            weight_train,
+            fresh_days=stream_fresh_days,
+            floor=stream_fresh_floor,
+        )
     train_is_nonreply = train_df["is_reply"].to_numpy() == 0
     val_is_nonreply = val_df["is_reply"].to_numpy() == 0
     account_train = train_df["account_id"].astype(str).to_numpy()
@@ -2532,6 +2745,12 @@ def main() -> None:
 
     df = add_time_regime_features(df)
 
+    df = apply_holdout_policy(
+        df,
+        policy=args.holdout_policy,
+        min_upload_hist=args.min_upload_hist,
+    )
+
     dump_time = pd.Timestamp(df["created_at"].max())
     y_train_raw_ref: np.ndarray | None = None
     y_val_raw_ref: np.ndarray | None = None
@@ -2546,6 +2765,9 @@ def main() -> None:
             beta=args.exposure_beta,
             eps=args.exposure_eps,
         )
+
+    if args.provenance_features:
+        df = add_provenance_features(df)
 
     train_df, val_df = time_split(df, args.val_frac)
     if args.exposure_correct and args.exposure_mode == "resid":
@@ -2714,6 +2936,8 @@ def main() -> None:
             rank_min_group=args.rank_min_group,
             hybrid_rank=args.hybrid_rank,
             model_kind=args.model,
+            stream_fresh_days=args.stream_fresh_days,
+            stream_fresh_floor=args.stream_fresh_floor,
         )
         # Score full val with the non-reply model, then overwrite replies.
         x_val_full, _ = feature_matrix(val_df, skip_embeddings=args.skip_embeddings)
@@ -2769,6 +2993,8 @@ def main() -> None:
                 rank_min_group=args.rank_min_group,
                 hybrid_rank=args.hybrid_rank,
                 model_kind=args.model,
+                stream_fresh_days=args.stream_fresh_days,
+                stream_fresh_floor=args.stream_fresh_floor,
             )
             pred[val_df["is_reply"].to_numpy() == mask_val] = p
             models.append(model)
@@ -2794,6 +3020,8 @@ def main() -> None:
             rank_min_group=args.rank_min_group,
             hybrid_rank=args.hybrid_rank,
             model_kind=args.model,
+            stream_fresh_days=args.stream_fresh_days,
+            stream_fresh_floor=args.stream_fresh_floor,
         )
 
     # Primary prediction/label are in training-target space.
@@ -2910,6 +3138,10 @@ def main() -> None:
     metrics["rank_min_group"] = (
         float(args.rank_min_group) if args.loss == "lambdarank" or args.hybrid_rank else 0.0
     )
+    metrics["holdout_policy"] = args.holdout_policy
+    metrics["min_upload_hist"] = float(args.min_upload_hist)
+    metrics["provenance_features"] = float(args.provenance_features)
+    metrics["stream_fresh_days"] = float(args.stream_fresh_days)
     metrics.update(gpboost_meta)
     metrics["seconds"] = round(time.time() - t0, 2)
 
