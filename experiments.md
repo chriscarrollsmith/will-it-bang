@@ -126,7 +126,9 @@ Check off when tried; note outcome in one line.
 - [x] Calendar / era features (year, month seasonality, platform eras) — **v13: 0.978 → 0.967**
 - [x] Exposure-rate target as default objective — **v14e: rate rmse 0.642** (vs train-mean 0.701); dump-total decode intentionally weaker
 - [ ] Train-fit regime-specific baselines or separate heads by era
-- [ ] Explicit “CA corpus quality over time” proxies (upload density, archive coverage)
+- [x] Explicit “CA corpus quality over time” proxies (upload density, archive coverage) — **audit 2026-07-24:** stream (`archive_upload_id` null) is 62% of 2025 / 98% of 2026 dump rows; latest time-quintile on eligible accounts is ~100% stream with ~73% replies missing `reply_to_user_id` (breaks inbound `reply_to_user` hist). Likes/followers only from archive uploads (extension does not capture). Report: `logs/ca_data_quality_audit.md`; re-run `uv run audit_ca_quality.py`. Still open: provenance stratum in `analyze.py`, parent-author backfill for reply uid, holdout/label policy per regime.
+- [ ] Provenance-aware eval/train: slice wa_* by upload-linked vs stream; optional feature `is_stream` / hours since account’s last upload `end_date`
+- [ ] Backfill `reply_to_user_id` from parent `account_id` when parent ∈ dump; rebuild hist graph features
 - [ ] Fixed-horizon labels if CA/X ever provide time-series engagement (cleaner maturity control)
 
 ### Language-model labels (post-time text only)
