@@ -4,8 +4,9 @@ Predict a tweet's engagement from Community Archive data available at post time.
 
 ## Approach
 
-1. **`prepare.py`** — download the CA `enriched_tweets` parquet dump, sample accounts, build leakage-safe author/structure features, embed `full_text` with frozen MiniLM, write `~/.cache/will-it-bang/dataset.parquet`.
-2. **`train.py`** — time-split the dataset, train LightGBM on tabular features + embeddings to regress `log1p(favorite_count + retweet_count)`.
+1. **`prepare.py`** — download the CA `enriched_tweets` parquet dump, sample accounts, build leakage-safe author/structure features (inbound replies/quotes/mentions, parent context, provenance), embed `full_text` with frozen MiniLM, write `~/.cache/will-it-bang/dataset.parquet`.
+2. **`train.py`** — time-split the dataset, train LightGBM (default hybrid level + within-author ranker) on tabular features + embeddings.
+3. **`analyze.py`** (optional) — re-score val preds on locked primaries and failure slices, including upload vs stream provenance.
 
 Retweets (`full_text` starting with `RT @`) are excluded from labels/training rows. Author history uses only strictly earlier tweets; dump-time fav/RT are **labels only**, never history inputs (use pre-T reply arrivals instead). Current follower counts are **not** used.
 
@@ -13,8 +14,9 @@ Retweets (`full_text` starting with `RT @`) are excluded from labels/training ro
 
 ```bash
 uv sync
-uv run prepare.py          # ~1GB download + embed; cached thereafter
+uv run prepare.py --skip-media   # default stack; skip slow CA media API on cloud
 uv run train.py
+uv run analyze.py                # locked primaries + provenance slices
 ```
 
 Useful knobs:
@@ -23,7 +25,8 @@ Useful knobs:
 uv run prepare.py --skip-media          # reuse media flags; skip slow CA API
 uv run prepare.py --parent-only         # re-join reply/quote parents only
 uv run prepare.py --urls-only           # CA expanded URL domains + text-url structure
-uv run prepare.py --mentions-only       # timestamped inbound @-mentions (user_mentions ⋊ tweet time)
+uv run prepare.py --mentions-only       # patch inbound @-mentions onto an older dataset
+uv run prepare.py --provenance-only     # patch archive_upload_id / is_stream onto an older dataset
 uv run modal run label_provoke.py --nonreply-only   # default: Qwen3-8B → provoke_cache_Qwen__*
 uv run train.py --provoke-labels --provoke-cache ~/.cache/will-it-bang/provoke_cache_Qwen__Qwen3-8B.parquet
 uv run train.py --skip-embeddings       # ablation: tabular only
@@ -31,10 +34,17 @@ uv run train.py --skip-embeddings       # ablation: tabular only
 
 ## Metric
 
-Primary (default): **RMSE / Spearman on exposure-adjusted log rate**
-`log1p(eng / (min(age_days, 30) + 1))` — intensity controlling for dump maturity.  
-Diagnostic: `rmse_log_raw_dump` decodes rate predictions back to dump-total `log1p(eng)`.  
-For the older dump-total objective: `uv run train.py --no-exposure-correct --residual`.
+**Primary (locked):** within-account Spearman by stratum —
+`spearman_within_account_nonreply_wmean` and `spearman_within_account_reply_wmean`
+(draft quality within author; NR and replies ranked separately).
+
+**Guardrails / secondary:** global `spearman_nonreply` / `spearman_reply`, rate RMSE,
+`mean_underpred_nonreply_top10`. `analyze.py` also reports these within upload-linked vs
+stream (`is_stream`) when provenance is available.
+
+Train target (default): exposure-adjusted log rate
+`log1p(eng / (min(age_days, 30) + 1))`. Diagnostic dump-total decode: `rmse_log_raw_dump`.
+Legacy dump-total objective: `uv run train.py --no-exposure-correct --residual`.
 
 ## Experiment log
 

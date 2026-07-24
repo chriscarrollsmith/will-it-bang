@@ -116,6 +116,8 @@ def sample_accounts(
         "reply_to_user_id": "reply_to_user_id",
         "quoted_tweet_id": "quoted_tweet_id",
         "username": "username",
+        # Provenance: null ⇒ browser-extension stream (see audit_ca_quality.py).
+        "archive_upload_id": "archive_upload_id",
     }
     select_bits = [
         "tweet_id",
@@ -682,15 +684,30 @@ def load_author_graph(account_ids: pd.Series) -> dict:
         """
     ).fetchdf()
 
+    # Prefer dump reply_to_user_id; when null (common on stream-era rows), recover
+    # from parent tweet's account_id if that parent is by a sampled author.
     reply_to_user_df = con.execute(
         f"""
-        SELECT
-          CAST(r.reply_to_user_id AS VARCHAR) AS account_id,
-          r.created_at
-        FROM read_parquet('{path}') r
+        WITH resolved AS (
+          SELECT
+            COALESCE(
+              CAST(r.reply_to_user_id AS VARCHAR),
+              p.account_id
+            ) AS account_id,
+            r.created_at,
+            (r.reply_to_user_id IS NULL AND p.account_id IS NOT NULL) AS from_parent
+          FROM read_parquet('{path}') r
+          LEFT JOIN author_tweets p
+            ON CAST(r.reply_to_tweet_id AS VARCHAR) = p.tweet_id
+          WHERE COALESCE(
+            CAST(r.reply_to_user_id AS VARCHAR),
+            p.account_id
+          ) IS NOT NULL
+        )
+        SELECT account_id, created_at, from_parent
+        FROM resolved
         SEMI JOIN target_accounts a
-          ON CAST(r.reply_to_user_id AS VARCHAR) = a.account_id
-        WHERE r.reply_to_user_id IS NOT NULL
+          ON resolved.account_id = a.account_id
         """
     ).fetchdf()
 
@@ -724,9 +741,13 @@ def load_author_graph(account_ids: pd.Series) -> dict:
             g["created_at"].to_numpy(dtype="datetime64[ns]"),
         )
 
+    n_reply_user = len(reply_to_user_df)
+    n_from_parent = (
+        int(reply_to_user_df["from_parent"].sum()) if n_reply_user and "from_parent" in reply_to_user_df else 0
+    )
     print(
         f"  reply→tweet events: {len(reply_to_tweet_df):,} | "
-        f"reply→user: {len(reply_to_user_df):,} | "
+        f"reply→user: {n_reply_user:,} ({n_from_parent:,} via parent account_id) | "
         f"quote→user: {len(quote_to_user_df):,}"
     )
     mention_to_user = load_mention_times(accounts["account_id"])
@@ -781,6 +802,10 @@ def build_features(
 
     df["is_reply"] = df["reply_to_tweet_id"].notna().astype(np.int8)
     df["is_quote"] = df["quoted_tweet_id"].notna().astype(np.int8)
+    if "archive_upload_id" in df.columns:
+        df["is_stream"] = df["archive_upload_id"].isna().astype(np.int8)
+    else:
+        df["is_stream"] = np.int8(0)
     df["is_self_reply"] = (
         df["reply_to_user_id"].notna()
         & (df["reply_to_user_id"].astype(str) == df["account_id"].astype(str))
@@ -899,6 +924,12 @@ def build_features(
                     "quoted_tweet_id": (
                         None if pd.isna(row["quoted_tweet_id"]) else str(row["quoted_tweet_id"])
                     ),
+                    "archive_upload_id": (
+                        None
+                        if "archive_upload_id" not in row.index or pd.isna(row["archive_upload_id"])
+                        else str(row["archive_upload_id"])
+                    ),
+                    "is_stream": int(row["is_stream"]),
                     "engagement": int(row["engagement"]),
                     "log_engagement": float(row["log_engagement"]),
                     "text_len": int(row["text_len"]),
@@ -1369,6 +1400,92 @@ def backfill_ref_ids_from_dump(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def backfill_reply_user_from_dump(df: pd.DataFrame) -> pd.DataFrame:
+    """Fill null reply_to_user_id from parent account_id when the parent is in the dump."""
+    out = df.copy()
+    out["tweet_id"] = out["tweet_id"].astype(str)
+    if "reply_to_tweet_id" not in out.columns:
+        return out
+    if "reply_to_user_id" not in out.columns:
+        out["reply_to_user_id"] = pd.NA
+    need = out["reply_to_tweet_id"].notna() & out["reply_to_user_id"].isna()
+    if not need.any():
+        return out
+    parent_ids = out.loc[need, "reply_to_tweet_id"].astype(str).unique()
+    tmp = CACHE_DIR / "_reply_parent_ids.parquet"
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"tweet_id": parent_ids}).to_parquet(tmp, index=False)
+    path = str(RAW_PARQUET)
+    print(f"Backfilling reply_to_user_id for {int(need.sum()):,} replies via parent…", flush=True)
+    con = duckdb.connect()
+    con.execute(f"SET threads TO {max(1, os.cpu_count() or 4)}")
+    parents = con.execute(
+        f"""
+        SELECT
+          CAST(t.tweet_id AS VARCHAR) AS reply_to_tweet_id,
+          CAST(t.account_id AS VARCHAR) AS parent_account_id
+        FROM read_parquet('{path}') t
+        SEMI JOIN read_parquet('{tmp}') p
+          ON CAST(t.tweet_id AS VARCHAR) = p.tweet_id
+        """
+    ).fetchdf()
+    con.close()
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+    parents = parents.drop_duplicates("reply_to_tweet_id", keep="first")
+    merged = out.loc[need, ["tweet_id", "reply_to_tweet_id"]].merge(
+        parents, on="reply_to_tweet_id", how="left"
+    )
+    fill = merged.set_index("tweet_id")["parent_account_id"]
+    filled = int(fill.notna().sum())
+    out.loc[need, "reply_to_user_id"] = out.loc[need, "tweet_id"].map(fill).fillna(
+        out.loc[need, "reply_to_user_id"]
+    )
+    print(f"  recovered reply_to_user_id on {filled:,}/{int(need.sum()):,} null-uid replies", flush=True)
+    return out
+
+
+def attach_provenance(df: pd.DataFrame) -> pd.DataFrame:
+    """Attach archive_upload_id / is_stream from the dump (stream ⇒ null upload id)."""
+    out = df.copy()
+    out["tweet_id"] = out["tweet_id"].astype(str)
+    ids = pd.DataFrame({"tweet_id": out["tweet_id"].unique()})
+    tmp = CACHE_DIR / "_provenance_tweet_ids.parquet"
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    ids.to_parquet(tmp, index=False)
+    path = str(RAW_PARQUET)
+    print(f"Attaching provenance for {len(ids):,} tweets…", flush=True)
+    con = duckdb.connect()
+    con.execute(f"SET threads TO {max(1, os.cpu_count() or 4)}")
+    prov = con.execute(
+        f"""
+        SELECT
+          CAST(t.tweet_id AS VARCHAR) AS tweet_id,
+          CAST(t.archive_upload_id AS VARCHAR) AS archive_upload_id
+        FROM read_parquet('{path}') t
+        SEMI JOIN read_parquet('{tmp}') c
+          ON CAST(t.tweet_id AS VARCHAR) = c.tweet_id
+        """
+    ).fetchdf()
+    con.close()
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+    prov = prov.drop_duplicates("tweet_id", keep="first")
+    out = out.drop(columns=[c for c in ("archive_upload_id", "is_stream") if c in out.columns], errors="ignore")
+    out = out.merge(prov, on="tweet_id", how="left")
+    out["is_stream"] = out["archive_upload_id"].isna().astype(np.int8)
+    print(
+        f"  is_stream={out['is_stream'].mean():.1%} "
+        f"(upload-linked={(1.0 - out['is_stream'].mean()):.1%})",
+        flush=True,
+    )
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1480,6 +1597,11 @@ def parse_args() -> argparse.Namespace:
         help="Add timestamped inbound @-mention features onto an existing dataset.parquet",
     )
     p.add_argument(
+        "--provenance-only",
+        action="store_true",
+        help="Attach archive_upload_id / is_stream onto an existing dataset.parquet",
+    )
+    p.add_argument(
         "--force-urls",
         action="store_true",
         help="Refetch tweet_urls even when url_cache.parquet has the tweet_id",
@@ -1510,6 +1632,16 @@ def main() -> None:
             raise SystemExit(f"Missing {DATASET_PATH} for --mentions-only")
         dataset = pd.read_parquet(DATASET_PATH)
         dataset = attach_inbound_mentions(dataset, force=args.force_mentions)
+        dataset.to_parquet(DATASET_PATH, index=False)
+        print(f"Wrote {DATASET_PATH} ({len(dataset):,} rows, {dataset.shape[1]} cols)")
+        print(f"Done in {time.time() - t0:.1f}s")
+        return
+
+    if args.provenance_only:
+        if not DATASET_PATH.exists():
+            raise SystemExit(f"Missing {DATASET_PATH} for --provenance-only")
+        dataset = pd.read_parquet(DATASET_PATH)
+        dataset = attach_provenance(dataset)
         dataset.to_parquet(DATASET_PATH, index=False)
         print(f"Wrote {DATASET_PATH} ({len(dataset):,} rows, {dataset.shape[1]} cols)")
         print(f"Done in {time.time() - t0:.1f}s")
@@ -1616,6 +1748,7 @@ def main() -> None:
             print("No prior dataset for media reuse; media flags default to 0")
     else:
         sampled = attach_media_flags(sampled)
+    sampled = backfill_reply_user_from_dump(sampled)
     graph = load_author_graph(sampled["account_id"])
     featured = build_features(sampled, min_history=args.min_history, graph=graph)
     del sampled, graph

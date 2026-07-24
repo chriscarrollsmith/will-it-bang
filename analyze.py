@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
+import duckdb
 import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr
@@ -20,12 +22,52 @@ from sklearn.metrics import mean_squared_error, r2_score
 from train import within_account_spearman
 
 CACHE_DIR = Path.home() / ".cache" / "will-it-bang"
+RAW_PARQUET = CACHE_DIR / "enriched_tweets.parquet"
 VAL_PRED_PATH = CACHE_DIR / "val_predictions.parquet"
 ANALYSIS_PATH = CACHE_DIR / "error_analysis.json"
 
 
 def _rmse(y, p) -> float:
     return float(np.sqrt(mean_squared_error(y, p)))
+
+
+def ensure_is_stream(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure is_stream is present; join dump archive_upload_id when missing."""
+    out = df.copy()
+    if "is_stream" in out.columns:
+        return out
+    if "archive_upload_id" in out.columns:
+        out["is_stream"] = out["archive_upload_id"].isna().astype(np.int8)
+        return out
+    if not RAW_PARQUET.exists() or "tweet_id" not in out.columns:
+        return out
+    ids = pd.DataFrame({"tweet_id": out["tweet_id"].astype(str).unique()})
+    tmp = CACHE_DIR / "_analyze_prov_ids.parquet"
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    ids.to_parquet(tmp, index=False)
+    path = str(RAW_PARQUET)
+    con = duckdb.connect()
+    con.execute(f"SET threads TO {max(1, os.cpu_count() or 4)}")
+    prov = con.execute(
+        f"""
+        SELECT
+          CAST(t.tweet_id AS VARCHAR) AS tweet_id,
+          CAST(t.archive_upload_id AS VARCHAR) AS archive_upload_id
+        FROM read_parquet('{path}') t
+        SEMI JOIN read_parquet('{tmp}') c
+          ON CAST(t.tweet_id AS VARCHAR) = c.tweet_id
+        """
+    ).fetchdf()
+    con.close()
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+    prov = prov.drop_duplicates("tweet_id", keep="first")
+    out["tweet_id"] = out["tweet_id"].astype(str)
+    out = out.merge(prov, on="tweet_id", how="left")
+    out["is_stream"] = out["archive_upload_id"].isna().astype(np.int8)
+    return out
 
 
 def slice_metrics(df: pd.DataFrame, name: str) -> dict:
@@ -60,6 +102,20 @@ def slice_metrics(df: pd.DataFrame, name: str) -> dict:
 
 def within_account_primary_metrics(df: pd.DataFrame) -> dict[str, float]:
     """Locked primaries: within-author Spearman by reply stratum."""
+    if len(df) == 0:
+        nan = float("nan")
+        return {
+            "spearman_within_account_nonreply_mean": nan,
+            "spearman_within_account_nonreply_wmean": nan,
+            "spearman_within_account_nonreply_n": 0.0,
+            "spearman_within_account_reply_mean": nan,
+            "spearman_within_account_reply_wmean": nan,
+            "spearman_within_account_reply_n": 0.0,
+            "spearman_nonreply": nan,
+            "spearman_reply": nan,
+            "rmse_log": nan,
+            "n": 0.0,
+        }
     y = df["y_true_log"].to_numpy(dtype=np.float64)
     p = df["y_pred_log"].to_numpy(dtype=np.float64)
     acct = df["account_id"].astype(str).to_numpy()
@@ -77,7 +133,27 @@ def within_account_primary_metrics(df: pd.DataFrame) -> dict[str, float]:
         "spearman_nonreply": float(spearmanr(y[nr], p[nr]).correlation) if nr.any() else float("nan"),
         "spearman_reply": float(spearmanr(y[rp], p[rp]).correlation) if rp.any() else float("nan"),
         "rmse_log": _rmse(y, p),
+        "n": float(len(df)),
     }
+
+
+def _print_primary(label: str, primary: dict[str, float]) -> None:
+    print(f"{label}:")
+    print(
+        f"  NR  wmean={primary['spearman_within_account_nonreply_wmean']:.4f} "
+        f"mean={primary['spearman_within_account_nonreply_mean']:.4f} "
+        f"(n={int(primary['spearman_within_account_nonreply_n'])})"
+    )
+    print(
+        f"  reply wmean={primary['spearman_within_account_reply_wmean']:.4f} "
+        f"mean={primary['spearman_within_account_reply_mean']:.4f} "
+        f"(n={int(primary['spearman_within_account_reply_n'])})"
+    )
+    print(
+        f"  guardrails: global_nr={primary['spearman_nonreply']:.4f} "
+        f"global_reply={primary['spearman_reply']:.4f} rmse={primary['rmse_log']:.4f} "
+        f"rows={int(primary.get('n', float('nan')))}"
+    )
 
 
 def main() -> None:
@@ -100,8 +176,16 @@ def main() -> None:
 
     df = pd.read_parquet(args.predictions)
     df["created_at"] = pd.to_datetime(df["created_at"], utc=True)
+    df = ensure_is_stream(df)
     df["eng_tercile"] = pd.qcut(df["y_true_log"], 3, labels=["low", "mid", "high"], duplicates="drop")
     primary = within_account_primary_metrics(df)
+
+    provenance_primary: dict[str, dict[str, float]] = {}
+    if "is_stream" in df.columns:
+        upload = df[df["is_stream"] == 0]
+        stream = df[df["is_stream"] == 1]
+        provenance_primary["upload"] = within_account_primary_metrics(upload)
+        provenance_primary["stream"] = within_account_primary_metrics(stream)
 
     slices = [
         slice_metrics(df, "all"),
@@ -114,6 +198,9 @@ def main() -> None:
     if "has_media" in df.columns:
         slices.append(slice_metrics(df[df["has_media"] == 1], "has_media"))
         slices.append(slice_metrics(df[df["has_media"] == 0], "no_media"))
+    if "is_stream" in df.columns:
+        slices.append(slice_metrics(df[df["is_stream"] == 0], "upload"))
+        slices.append(slice_metrics(df[df["is_stream"] == 1], "stream"))
     for label in df["eng_tercile"].dropna().unique():
         slices.append(slice_metrics(df[df["eng_tercile"] == label], f"eng_{label}"))
 
@@ -150,6 +237,7 @@ def main() -> None:
                 "mean_eng": float(np.expm1(g["y_true_log"]).mean()),
                 "mean_inbound": float(g["inbound_replies"].mean()) if "inbound_replies" in g else float("nan"),
                 "frac_nonreply": float((g["is_reply"] == 0).mean()),
+                "frac_stream": float(g["is_stream"].mean()) if "is_stream" in g else float("nan"),
             }
         )
     acct = pd.DataFrame(rows).sort_values("rmse_log")
@@ -170,6 +258,7 @@ def main() -> None:
                     "abs_err_log",
                     "has_media",
                     "is_quote",
+                    "is_stream",
                     "text_len",
                     "inbound_replies",
                     "inbound_replies_per_tweet",
@@ -195,6 +284,7 @@ def main() -> None:
                 "err_log",
                 "is_reply",
                 "is_quote",
+                "is_stream",
                 "has_media",
                 "text_len",
                 "inbound_replies",
@@ -221,6 +311,7 @@ def main() -> None:
     analysis = {
         "n_val": int(len(df)),
         "primary_within_account": primary,
+        "primary_within_account_by_provenance": provenance_primary,
         "overall": slices[0],
         "slices": slices,
         "frac_overpredict_log_gt_0_5": over,
@@ -232,23 +323,18 @@ def main() -> None:
         "worst_misses": worst_rows,
         "viral_underpredicts": viral_misses,
     }
+    if "is_stream" in df.columns:
+        analysis["frac_stream"] = float(df["is_stream"].mean())
     args.out.write_text(json.dumps(analysis, indent=2, default=str) + "\n")
 
-    print("Primary (within-account Spearman):")
-    print(
-        f"  NR  wmean={primary['spearman_within_account_nonreply_wmean']:.4f} "
-        f"mean={primary['spearman_within_account_nonreply_mean']:.4f} "
-        f"(n={int(primary['spearman_within_account_nonreply_n'])})"
-    )
-    print(
-        f"  reply wmean={primary['spearman_within_account_reply_wmean']:.4f} "
-        f"mean={primary['spearman_within_account_reply_mean']:.4f} "
-        f"(n={int(primary['spearman_within_account_reply_n'])})"
-    )
-    print(
-        f"  guardrails: global_nr={primary['spearman_nonreply']:.4f} "
-        f"global_reply={primary['spearman_reply']:.4f} rmse={primary['rmse_log']:.4f}"
-    )
+    _print_primary("Primary (within-account Spearman)", primary)
+    if provenance_primary:
+        print(
+            f"\nProvenance mix: stream={df['is_stream'].mean():.1%} "
+            f"upload-linked={(1.0 - df['is_stream'].mean()):.1%}"
+        )
+        for name, metrics in provenance_primary.items():
+            _print_primary(f"Primary within-account ({name})", metrics)
     print("\nSlice metrics:")
     print(pd.DataFrame(slices).to_string(index=False))
     print(f"\nOver-predict (err_log>0.5): {over:.1%}")
