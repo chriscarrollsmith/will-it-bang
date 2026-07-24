@@ -20,14 +20,16 @@ Process retrospective (what moved the scoreboard vs what burned cycles): [`logs/
 
 | Objective | Run | wa_nr_wmean | wa_rp_wmean | global_nr | rmse_log | Notes |
 |---|---|---:|---:|---:|---:|---|
-| **Default stack** | **v35b** | **0.242** | 0.266 | **0.579** | **0.605** | Hybrid + timestamped inbound mentions (default prepare) |
-| Prior hybrid (no mentions) | v31b / v35a | 0.227 / 0.237 | **0.280** / 0.275 | 0.518 | 0.608 / 0.620 | v35a = same-rebuild control for v35b |
+| **Default stack** | **v36c** | **0.249** | **0.276** | 0.569 | **0.602** | Hybrid + mentions + provenance features (`stream_x_log_age` #21 gain) |
+| Prior (no provenance feats) | v36a / v35b | 0.225 / 0.242 | 0.251 / 0.266 | **0.593** / **0.579** | 0.602 / 0.605 | v36a = same-rebuild control (0% media); v35b had refreshed media |
+| Prior hybrid (no mentions) | v31b / v35a | 0.227 / 0.237 | 0.280 / 0.275 | 0.518 | 0.608 / 0.620 | v35a = same-rebuild control for v35b |
 | Level-only (ablation) | v31a | 0.187 | 0.172 | 0.508 | 0.610 | Asymmetric without hybrid blend |
 | Magnitude (opt-in SERA) | v28b / v33b | 0.227† | 0.280† | 0.483 | **0.584** | †wa_* frozen by hybrid ranker; level SERA only moves RMSE/global |
 | Dump total | v13 | — | — | — | 0.967 | Legacy objective |
 
-Rebuild: `uv run prepare.py --skip-media` (defaults are the v12 scale knobs; mentions + provenance included).  
-Train: `uv run train.py --description "…"`. Patch older datasets with `--mentions-only` / `--provenance-only`.
+Rebuild: `uv run prepare.py --skip-media` (defaults are the v12 scale knobs; mentions + provenance/upload-end included).  
+Train: `uv run train.py --description "…"`. Patch older datasets with `--mentions-only` / `--provenance-only`.  
+Ablate provenance feats with `--no-provenance-features`. Regime holdouts: `--holdout-policy upload_era|stream_only` (opt-in; do not change locked scoreboard lightly).
 
 ## Timeline (curated)
 
@@ -90,6 +92,19 @@ Dump-time fav/RT used as author history → optimistic RMSE ~0.82 (v5). Invalid 
 | v33d | 0.604 (rate) | 0.453 | Level SERA NR-only: wa_nr **0.138** (−0.049 vs level control), wa_rp 0.170 (flat); **regress** on locked primary — NR-stratum SERA fails |
 | v35a | 0.620 (rate) | 0.503 | Same-rebuild hybrid control **without** mention cols (0% media): wa_nr **0.237**, wa_rp **0.275**, global_nr 0.518; under-pred 2.22 |
 | v35b | **0.605** (rate) | **0.521** | Timestamped inbound @-mentions (`user_mentions` ⋊ tweet time; 99.7% accounts / 98.7% rows): wa_nr **0.242** (+0.006), wa_rp **0.266** (−0.009), global_nr **0.579** (+0.061), under-pred 2.15; smoke NR spearman(mentions,rate)≈0.55; `reply_x_inbound_mentions` / `inbound_mentions_per_tweet` top gains; **keep default** (NR + magnitude/global win; mild reply within-author cost) |
+| v36a | **0.602** (rate) | **0.521** | Same-rebuild control after reply-uid backfill + upload-end cols (0% media via `--skip-media`): wa_nr **0.225**, wa_rp **0.251**, global_nr **0.593**; val 100% stream |
+| v36b | 0.482† (rate) | 0.459† | `--holdout-policy upload_era` (cap ≤ last upload-linked `created_at` 2026-03-22): wa_nr **0.143** (−0.082), wa_rp **0.299** (+0.049); †different val — **do not promote** / keep `time` default |
+| v36c | **0.602** (rate) | **0.521** | `--provenance-features` on time holdout: wa_nr **0.249** (+0.024), wa_rp **0.276** (+0.025), global_nr 0.569 (−0.024); `stream_x_log_age` #21 gain; raw `is_stream` zero gain on ~pure-stream val; **promote / default on** |
+| v36d | 0.615† (rate) | 0.516† | `--holdout-policy stream_only`: wa_nr 0.239 / wa_rp 0.276; †near-identical corpus (dataset already 96.7% stream) — diagnostic only |
+
+### v36 regime holdout / provenance features (same rebuild)
+
+| Run | wa_nr | wa_rp | global_nr | rmse | Notes |
+|---|---:|---:|---:|---:|---|
+| v36a time control | 0.225 | 0.251 | **0.593** | 0.602 | Reply-uid densification + upload-end metadata |
+| v36b upload_era | **0.143** | **0.299** | 0.590 | 0.482† | Caps timeline; val still ~100% stream; hurts wa_nr |
+| v36c + provenance feats | **0.249** | **0.276** | 0.569 | 0.602 | Promote; `--no-provenance-features` to ablate |
+| v36d stream_only | 0.239 | 0.276 | 0.567 | 0.615† | Diagnostic (dataset already stream-dominated) |
 
 ### v35 inbound mentions (same rebuild)
 
@@ -136,11 +151,12 @@ Check off when tried; note outcome in one line.
 - [x] Calendar / era features (year, month seasonality, platform eras) — **v13: 0.978 → 0.967**
 - [x] Exposure-rate target as default objective — **v14e: rate rmse 0.642** (vs train-mean 0.701); dump-total decode intentionally weaker
 - [ ] Train-fit regime-specific baselines or separate heads by era
-- [x] Explicit “CA corpus quality over time” proxies (upload density, archive coverage) — **audit 2026-07-24:** stream (`archive_upload_id` null) is 62% of 2025 / 98% of 2026 dump rows; latest time-quintile on eligible accounts is ~100% stream with ~73% replies missing `reply_to_user_id` (breaks inbound `reply_to_user` hist). Likes/followers only from archive uploads (extension does not capture). Report: `logs/ca_data_quality_audit.md`; re-run `uv run audit_ca_quality.py`. Still open: holdout/label policy per regime; optional train feature on `is_stream`.
-- [x] Provenance-aware eval: `analyze.py` slices wa_* by upload-linked vs stream (`is_stream` from null `archive_upload_id`; carried in prepare / joined from dump if missing). Optional train feature `is_stream` / hours since account’s last upload `end_date` still open.
-- [x] Backfill `reply_to_user_id` from parent `account_id` when parent ∈ dump — in `load_author_graph` (inbound hist) + sampled-row coalesce for `is_self_reply`; ~171k dump null-uid replies have parent in dump. Rebuild features to pick up denser `inbound_replies*`.
-- [ ] Holdout / train policy by ingestion regime: cap eval at last upload-complete era, require min pre-T upload-linked history, and/or train+eval within stream-only once history is long enough (today’s global time split ≈ pure stream val)
-- [ ] Label honesty for stream eng: treat fav/RT as as-observed (not eventual); provenance×age interactions or down-weight very fresh stream rows on top of exposure-rate
+- [x] Explicit “CA corpus quality over time” proxies (upload density, archive coverage) — **audit 2026-07-24:** stream (`archive_upload_id` null) is 62% of 2025 / 98% of 2026 dump rows; latest time-quintile on eligible accounts is ~100% stream with ~73% replies missing `reply_to_user_id` (breaks inbound `reply_to_user` hist). Likes/followers only from archive uploads (extension does not capture). Report: `logs/ca_data_quality_audit.md`; re-run `uv run audit_ca_quality.py`.
+- [x] Provenance-aware eval: `analyze.py` slices wa_* by upload-linked vs stream (`is_stream` from null `archive_upload_id`; carried in prepare / joined from dump if missing).
+- [x] Backfill `reply_to_user_id` from parent `account_id` when parent ∈ dump — in `load_author_graph` (inbound hist) + sampled-row coalesce for `is_self_reply`; rebuild densifies `inbound_replies*` (v36a).
+- [x] Holdout / train policy by ingestion regime — **v36b `upload_era`:** wa_nr regresses on new val (still ~stream); **v36d `stream_only`:** ≈ time on today’s corpus; keep `--holdout-policy time` default; knobs remain for regime-specific scoreboards. `--min-upload-hist` still unused.
+- [x] Optional train feature `is_stream` / hours since pre-T `archive_upload.end_date` — **v36c: promote / default on** (`stream_x_log_age` #21; wa_nr +0.024 / wa_rp +0.025 / global_nr −0.024 vs v36a); `--no-provenance-features` to ablate
+- [ ] Label honesty for stream eng: treat fav/RT as as-observed (not eventual); `--stream-fresh-days` harness exists but untested as scoreboard bet
 - [ ] Fixed-horizon labels if CA/X ever provide time-series engagement (cleaner maturity control)
 - [ ] Do **not** build liker / likes-graph features until CA streams likes with usable timestamps (extension omits likes; upload likes undated) — revisit only if #427 lands or a dated source appears
 

@@ -149,9 +149,10 @@ So today:
 
 1. ~~**Provenance stratum in analyze:**~~ **done** — prepare carries `archive_upload_id` / `is_stream`; `analyze.py` reports wa_* by upload vs stream (optional train feature / upload `end_date` still open).
 2. ~~**Repair `reply_to_user_id`:**~~ **done** — `load_author_graph` coalesces null uid from parent `account_id` when parent ∈ dump; sampled rows get the same for `is_self_reply`. Rebuild features to densify `inbound_replies*`.
-3. **Holdout policy:** consider capping eval at last-upload-complete era, or requiring min pre-T upload-linked history; or train/eval only within stream regime once enough stream history exists.
-4. **Label honesty:** treat stream eng as “as-observed”; optionally down-weight very fresh stream rows; keep exposure-rate but add provenance×age interactions.
-5. **Don’t build on likes** until extension or a new source captures them with timestamps.
-6. **Refresh awareness:** re-run `audit_ca_quality.py` when CA changes stream policy (opt-in-only threshold in their FAQ) or fixes #404/#427.
+3. ~~**Holdout policy:**~~ **tried (v36b/d)** — `upload_era` / `stream_only` knobs in `train.py`; upload_era still leaves val ~stream and hurts wa_nr; keep `time` default.
+4. ~~**Provenance×age features:**~~ **done (v36c)** — default `--provenance-features` (`stream_x_log_age` carries the lift).
+5. **Label honesty:** treat stream eng as “as-observed”; `--stream-fresh-days` exists but untested as a scoreboard bet.
+6. **Don’t build on likes** until extension or a new source captures them with timestamps.
+7. **Refresh awareness:** re-run `audit_ca_quality.py` when CA changes stream policy (opt-in-only threshold in their FAQ) or fixes #404/#427.
 
-Backlog in `experiments.md`: audit + reply-uid backfill + provenance eval slices landed; holdout/label-policy and optional `is_stream` train feature still open.
+Backlog in `experiments.md`: holdout knobs + provenance features landed; stream-fresh down-weight still open.

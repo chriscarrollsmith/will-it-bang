@@ -120,7 +120,12 @@ If (2)–(3) fail, treat as mechanism research — not a scoreboard bet. ε is a
 
 ## Still open (high EV)
 
-- Holdout / label policy by ingestion regime (val is ~pure stream today)
-- Optional `is_stream` train feature / upload `end_date` interactions (eval slices already land)
+- Label honesty for stream eng (`--stream-fresh-days` untested; fixed-horizon labels if CA/X ever provide them)
 - Viral non-reply under-prediction (improved by SERA magnitude, still open on rank)
 - Quote parents missing from CA; media beyond binary flags
+- Regime-specific heads / min-upload-hist once stream history is long enough for a stable stream-only scoreboard
+
+### v36 note (regime holdout + provenance features)
+
+- **`upload_era` holdout** truncates the timeline but val remains ~stream → new scoreboard, wa_nr regresses; leave opt-in.
+- **`--provenance-features`** (default on): same time holdout; `stream_x_log_age` carries the lift; raw `is_stream` is useless when val is constant-stream.

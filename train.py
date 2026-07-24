@@ -1268,8 +1268,10 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--provenance-features",
-        action="store_true",
-        help="Add is_stream / upload-end / provenance×age features (off by default)",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Add is_stream / upload-end / provenance×age features (default on; "
+        "v36c: +wa_nr/+wa_rp vs same-rebuild; --no-provenance-features to ablate)",
     )
     p.add_argument(
         "--stream-fresh-days",
@@ -2767,7 +2769,14 @@ def main() -> None:
         )
 
     if args.provenance_features:
-        df = add_provenance_features(df)
+        if "is_stream" not in df.columns:
+            print(
+                "Warning: --provenance-features on but is_stream missing; "
+                "skipping (run: uv run prepare.py --provenance-only)",
+                flush=True,
+            )
+        else:
+            df = add_provenance_features(df)
 
     train_df, val_df = time_split(df, args.val_frac)
     if args.exposure_correct and args.exposure_mode == "resid":

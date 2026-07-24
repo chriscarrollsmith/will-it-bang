@@ -32,7 +32,7 @@ uv run train.py --provoke-labels --provoke-cache ~/.cache/will-it-bang/provoke_c
 uv run train.py --skip-embeddings       # ablation: tabular only
 uv run train.py --holdout-policy upload_era   # cap at last upload-linked created_at before time split
 uv run train.py --holdout-policy stream_only  # train/eval on extension-stream rows only
-uv run train.py --provenance-features         # is_stream / upload-end / provenance×age features
+uv run train.py --no-provenance-features      # ablate is_stream / upload-end / provenance×age (default on)
 uv run train.py --stream-fresh-days 30        # down-weight very fresh stream labels
 ```
 
