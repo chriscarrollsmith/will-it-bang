@@ -35,6 +35,7 @@ CACHE_DIR = Path(os.path.expanduser("~/.cache/will-it-bang"))
 RAW_PARQUET = CACHE_DIR / "enriched_tweets.parquet"
 DATASET_PATH = CACHE_DIR / "dataset.parquet"
 EMBED_CACHE_PATH = CACHE_DIR / "embed_cache.parquet"
+MENTION_CACHE_PATH = CACHE_DIR / "mention_cache.parquet"
 EMBED_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"  # Apache-2.0
 PARQUET_URL = (
     "https://fabxmporizzqflnftavs.supabase.co/storage/v1/object/public/"
@@ -451,6 +452,177 @@ def _count_window(times: np.ndarray | None, cutoff, days: float) -> int:
     return max(0, right - left)
 
 
+def _fetch_mention_events_api(account_ids: list[str], batch_size: int = 40) -> pd.DataFrame:
+    """Page CA user_mentions for mentioned_user_id ∈ accounts; join tweet created_at."""
+    if not account_ids:
+        return pd.DataFrame(columns=["mentioned_user_id", "tweet_id", "created_at"])
+    session = requests.Session()
+    rows: list[dict[str, object]] = []
+    for start in range(0, len(account_ids), batch_size):
+        batch = account_ids[start : start + batch_size]
+        joined = ",".join(f'"{aid}"' for aid in batch)
+        last_id = 0
+        page = 0
+        while True:
+            params = {
+                "select": "id,tweet_id,mentioned_user_id,tweets(created_at,account_id)",
+                "mentioned_user_id": f"in.({joined})",
+                "id": f"gt.{last_id}",
+                "order": "id.asc",
+                "limit": "1000",
+            }
+            resp = session.get(
+                f"{CA_API}/user_mentions",
+                headers=_ca_headers(),
+                params=params,
+                timeout=120,
+            )
+            resp.raise_for_status()
+            chunk = resp.json()
+            if not chunk:
+                break
+            for row in chunk:
+                last_id = max(last_id, int(row["id"]))
+                tw = row.get("tweets") or {}
+                # Drop self-mentions when the mentioning author is known.
+                author = tw.get("account_id")
+                mentioned = str(row["mentioned_user_id"])
+                if author is not None and str(author) == mentioned:
+                    continue
+                created = tw.get("created_at")
+                rows.append(
+                    {
+                        "mentioned_user_id": mentioned,
+                        "tweet_id": str(row["tweet_id"]),
+                        "created_at": created,
+                    }
+                )
+            page += 1
+            if len(chunk) < 1000:
+                break
+            if page % 20 == 0:
+                print(
+                    f"  user_mentions batch {min(start + batch_size, len(account_ids)):,}/"
+                    f"{len(account_ids):,}: {len(rows):,} events (id>{last_id})",
+                    flush=True,
+                )
+        if start == 0 or (start // batch_size) % 5 == 0:
+            print(
+                f"  user_mentions: {min(start + batch_size, len(account_ids)):,}/"
+                f"{len(account_ids):,} accounts → {len(rows):,} events",
+                flush=True,
+            )
+    return pd.DataFrame(rows)
+
+
+def _backfill_mention_times_from_dump(events: pd.DataFrame) -> pd.DataFrame:
+    """Fill missing mention created_at from the enriched_tweets dump when present."""
+    if events.empty or not RAW_PARQUET.exists():
+        return events
+    out = events.copy()
+    out["tweet_id"] = out["tweet_id"].astype(str)
+    need = out["created_at"].isna() if "created_at" in out.columns else pd.Series(True, index=out.index)
+    if not need.any():
+        # Normalize dtype even when complete.
+        out["created_at"] = pd.to_datetime(out["created_at"], utc=True, errors="coerce")
+        return out
+    ids = out.loc[need, "tweet_id"].drop_duplicates()
+    tmp = CACHE_DIR / "_mention_tweet_ids.parquet"
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    ids.to_frame("tweet_id").to_parquet(tmp, index=False)
+    con = duckdb.connect()
+    con.execute(f"SET threads TO {max(1, os.cpu_count() or 4)}")
+    times = con.execute(
+        f"""
+        SELECT CAST(t.tweet_id AS VARCHAR) AS tweet_id, t.created_at
+        FROM read_parquet('{RAW_PARQUET}') t
+        SEMI JOIN read_parquet('{tmp}') i
+          ON CAST(t.tweet_id AS VARCHAR) = i.tweet_id
+        """
+    ).fetchdf()
+    con.close()
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+    if times.empty:
+        out["created_at"] = pd.to_datetime(out["created_at"], utc=True, errors="coerce")
+        return out
+    times["tweet_id"] = times["tweet_id"].astype(str)
+    times["created_at"] = pd.to_datetime(times["created_at"], utc=True, errors="coerce")
+    fill = out.loc[need, ["tweet_id"]].merge(times, on="tweet_id", how="left")["created_at"]
+    out.loc[need, "created_at"] = fill.to_numpy()
+    out["created_at"] = pd.to_datetime(out["created_at"], utc=True, errors="coerce")
+    n_filled = int(out["created_at"].notna().sum())
+    print(
+        f"  mention dump backfill: {n_filled:,}/{len(out):,} events have created_at "
+        f"({out['created_at'].notna().mean():.1%})",
+        flush=True,
+    )
+    return out
+
+
+def load_mention_times(account_ids: pd.Series, *, force: bool = False) -> dict[str, np.ndarray]:
+    """Pre-T mention arrivals: user_mentions ⋊ tweet created_at, cached by mentioned user."""
+    accounts = sorted({str(a) for a in account_ids.astype(str).tolist()})
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cached = pd.DataFrame(columns=["mentioned_user_id", "tweet_id", "created_at"])
+    if MENTION_CACHE_PATH.exists() and not force:
+        cached = pd.read_parquet(MENTION_CACHE_PATH)
+        cached["mentioned_user_id"] = cached["mentioned_user_id"].astype(str)
+        cached["tweet_id"] = cached["tweet_id"].astype(str)
+        print(f"Mention cache: {len(cached):,} rows ({MENTION_CACHE_PATH.name})")
+    have = set(cached["mentioned_user_id"].unique()) if len(cached) else set()
+    missing = [a for a in accounts if a not in have]
+    if missing:
+        print(f"Fetching user_mentions for {len(missing):,} accounts…", flush=True)
+        fresh = _fetch_mention_events_api(missing)
+        pieces = [cached] if len(cached) else []
+        if not fresh.empty:
+            fresh = _backfill_mention_times_from_dump(fresh)
+            pieces.append(fresh)
+        seen = set(fresh["mentioned_user_id"].astype(str).unique()) if not fresh.empty else set()
+        still_empty = [a for a in missing if a not in seen]
+        if still_empty:
+            # Sentinel rows so zero-mention accounts are not refetched every run.
+            pieces.append(
+                pd.DataFrame(
+                    {
+                        "mentioned_user_id": still_empty,
+                        "tweet_id": [""] * len(still_empty),
+                        "created_at": pd.to_datetime([pd.NaT] * len(still_empty), utc=True),
+                    }
+                )
+            )
+        cached = pd.concat(pieces, ignore_index=True) if pieces else cached
+        if not fresh.empty:
+            cached = cached.drop_duplicates(["mentioned_user_id", "tweet_id"], keep="last")
+        cached.to_parquet(MENTION_CACHE_PATH, index=False)
+        print(
+            f"Wrote mention cache: {len(cached):,} rows → {MENTION_CACHE_PATH} "
+            f"({len(still_empty):,} zero-mention accounts marked)",
+            flush=True,
+        )
+    else:
+        # Still try dump backfill for cached rows missing timestamps.
+        need_fill = cached["created_at"].isna() & (cached["tweet_id"].astype(str) != "")
+        if need_fill.any():
+            cached = _backfill_mention_times_from_dump(cached)
+            cached.to_parquet(MENTION_CACHE_PATH, index=False)
+
+    usable = cached[
+        cached["mentioned_user_id"].isin(accounts)
+        & cached["tweet_id"].astype(str).ne("")
+        & cached["created_at"].notna()
+    ].copy()
+    print(
+        f"  usable mention events: {len(usable):,} for {usable['mentioned_user_id'].nunique():,}/"
+        f"{len(accounts):,} accounts ({(usable['mentioned_user_id'].nunique() / max(len(accounts), 1)):.1%} coverage)",
+        flush=True,
+    )
+    return _sorted_time_map(usable, "mentioned_user_id")
+
+
 def load_author_graph(account_ids: pd.Series) -> dict:
     """Leakage-safe inbound graph events from the full dump for sampled authors.
 
@@ -458,6 +630,7 @@ def load_author_graph(account_ids: pd.Series) -> dict:
       reply_to_tweet: parent tweet_id → reply times (all author tweets in dump)
       reply_to_user: account_id → times of replies addressed to that user
       quote_to_user: account_id → times of quotes of that user's tweets
+      mention_to_user: account_id → times of @-mentions of that user (CA user_mentions ⋊ tweet time)
       author_timeline: account_id → (tweet_ids, created_at ns) for all dump tweets
     """
     accounts = pd.DataFrame({"account_id": account_ids.astype(str).unique()})
@@ -556,10 +729,12 @@ def load_author_graph(account_ids: pd.Series) -> dict:
         f"reply→user: {len(reply_to_user_df):,} | "
         f"quote→user: {len(quote_to_user_df):,}"
     )
+    mention_to_user = load_mention_times(accounts["account_id"])
     return {
         "reply_to_tweet": reply_to_tweet,
         "reply_to_user": reply_to_user,
         "quote_to_user": quote_to_user,
+        "mention_to_user": mention_to_user,
         "author_timeline": author_timeline,
     }
 
@@ -579,6 +754,7 @@ def build_features(
     reply_times = graph.get("reply_to_tweet", {})
     reply_to_user = graph.get("reply_to_user", {})
     quote_to_user = graph.get("quote_to_user", {})
+    mention_to_user = graph.get("mention_to_user", {})
     author_timeline: dict[str, tuple[np.ndarray, np.ndarray]] = graph.get("author_timeline", {})
     df["favorite_count"] = pd.to_numeric(df["favorite_count"], errors="coerce").fillna(0).astype(np.int64)
     df["retweet_count"] = pd.to_numeric(df["retweet_count"], errors="coerce").fillna(0).astype(np.int64)
@@ -641,6 +817,7 @@ def build_features(
         dump_ptr = 0
         user_reply_times = reply_to_user.get(aid)
         user_quote_times = quote_to_user.get(aid)
+        user_mention_times = mention_to_user.get(aid)
 
         for i in range(len(g)):
             if i < min_history:
@@ -697,14 +874,18 @@ def build_features(
 
             inbound_replies = _count_before(user_reply_times, cutoff)
             inbound_quotes = _count_before(user_quote_times, cutoff)
+            inbound_mentions = _count_before(user_mention_times, cutoff)
             inbound_replies_7d = _count_window(user_reply_times, cutoff, 7.0)
             inbound_replies_30d = _count_window(user_reply_times, cutoff, 30.0)
             inbound_quotes_7d = _count_window(user_quote_times, cutoff, 7.0)
             inbound_quotes_30d = _count_window(user_quote_times, cutoff, 30.0)
+            inbound_mentions_7d = _count_window(user_mention_times, cutoff, 7.0)
+            inbound_mentions_30d = _count_window(user_mention_times, cutoff, 30.0)
 
             row = g.iloc[i]
             log_in_r = float(np.log1p(inbound_replies))
             log_in_q = float(np.log1p(inbound_quotes))
+            log_in_m = float(np.log1p(inbound_mentions))
             rows.append(
                 {
                     "tweet_id": row["tweet_id"],
@@ -778,8 +959,16 @@ def build_features(
                     "inbound_quotes_7d": float(np.log1p(inbound_quotes_7d)),
                     "inbound_quotes_30d": float(np.log1p(inbound_quotes_30d)),
                     "inbound_quotes_per_tweet": float(np.log1p(inbound_quotes / max(n_prior_dump, 1))),
+                    "inbound_mentions": log_in_m,
+                    "inbound_mentions_7d": float(np.log1p(inbound_mentions_7d)),
+                    "inbound_mentions_30d": float(np.log1p(inbound_mentions_30d)),
+                    "inbound_mentions_per_tweet": float(
+                        np.log1p(inbound_mentions / max(n_prior_dump, 1))
+                    ),
                     "media_x_inbound_replies": float(row["has_media"]) * log_in_r,
                     "reply_x_inbound_replies": float(row["is_reply"]) * log_in_r,
+                    "media_x_inbound_mentions": float(row["has_media"]) * log_in_m,
+                    "reply_x_inbound_mentions": float(row["is_reply"]) * log_in_m,
                 }
             )
 
@@ -1184,6 +1373,81 @@ def backfill_ref_ids_from_dump(df: pd.DataFrame) -> pd.DataFrame:
 # Main
 # ---------------------------------------------------------------------------
 
+def attach_inbound_mentions(df: pd.DataFrame, *, force: bool = False) -> pd.DataFrame:
+    """Add pre-T inbound @-mention features onto an existing feature table."""
+    out = df.copy()
+    out["tweet_id"] = out["tweet_id"].astype(str)
+    out["account_id"] = out["account_id"].astype(str)
+    out["created_at"] = pd.to_datetime(out["created_at"], utc=True)
+    mention_to_user = load_mention_times(out["account_id"], force=force)
+
+    drop_cols = [
+        c
+        for c in (
+            "inbound_mentions",
+            "inbound_mentions_7d",
+            "inbound_mentions_30d",
+            "inbound_mentions_per_tweet",
+            "media_x_inbound_mentions",
+            "reply_x_inbound_mentions",
+        )
+        if c in out.columns
+    ]
+    if drop_cols:
+        out = out.drop(columns=drop_cols)
+
+    n = len(out)
+    inbound = np.zeros(n, dtype=np.float64)
+    inbound_7d = np.zeros(n, dtype=np.float64)
+    inbound_30d = np.zeros(n, dtype=np.float64)
+    inbound_per = np.zeros(n, dtype=np.float64)
+    has_media = (
+        out["has_media"].to_numpy(dtype=np.float64)
+        if "has_media" in out.columns
+        else np.zeros(n, dtype=np.float64)
+    )
+    is_reply = (
+        out["is_reply"].to_numpy(dtype=np.float64)
+        if "is_reply" in out.columns
+        else np.zeros(n, dtype=np.float64)
+    )
+    denom = (
+        out["hist_dump_n"].to_numpy(dtype=np.float64)
+        if "hist_dump_n" in out.columns
+        else (
+            out["hist_n"].to_numpy(dtype=np.float64)
+            if "hist_n" in out.columns
+            else np.ones(n, dtype=np.float64)
+        )
+    )
+
+    for aid, g in out.groupby("account_id", sort=False):
+        ix = g.index.to_numpy()
+        times = mention_to_user.get(str(aid))
+        cutoffs = g["created_at"].to_numpy()
+        for j, cutoff in enumerate(cutoffs):
+            row_i = ix[j]
+            c = _count_before(times, cutoff)
+            inbound[row_i] = float(np.log1p(c))
+            inbound_7d[row_i] = float(np.log1p(_count_window(times, cutoff, 7.0)))
+            inbound_30d[row_i] = float(np.log1p(_count_window(times, cutoff, 30.0)))
+            inbound_per[row_i] = float(np.log1p(c / max(float(denom[row_i]), 1.0)))
+
+    out["inbound_mentions"] = inbound
+    out["inbound_mentions_7d"] = inbound_7d
+    out["inbound_mentions_30d"] = inbound_30d
+    out["inbound_mentions_per_tweet"] = inbound_per
+    out["media_x_inbound_mentions"] = has_media * inbound
+    out["reply_x_inbound_mentions"] = is_reply * inbound
+    nonzero = float((inbound > 0).mean())
+    print(
+        f"Inbound mentions: {(inbound > 0).mean():.1%} rows with pre-T mentions; "
+        f"mean log1p={inbound.mean():.3f}; account coverage proxy={nonzero:.1%}",
+        flush=True,
+    )
+    return out
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--max-tweets", type=int, default=120000, help="Cap on sampled original tweets")
@@ -1211,9 +1475,19 @@ def parse_args() -> argparse.Namespace:
         help="Refetch CA tweet_media/tweet_urls flags onto an existing dataset.parquet",
     )
     p.add_argument(
+        "--mentions-only",
+        action="store_true",
+        help="Add timestamped inbound @-mention features onto an existing dataset.parquet",
+    )
+    p.add_argument(
         "--force-urls",
         action="store_true",
         help="Refetch tweet_urls even when url_cache.parquet has the tweet_id",
+    )
+    p.add_argument(
+        "--force-mentions",
+        action="store_true",
+        help="Refetch user_mentions even when mention_cache.parquet has the account_id",
     )
     return p.parse_args()
 
@@ -1230,6 +1504,16 @@ def main() -> None:
         pass
 
     download_parquet(force=args.force_download)
+
+    if args.mentions_only:
+        if not DATASET_PATH.exists():
+            raise SystemExit(f"Missing {DATASET_PATH} for --mentions-only")
+        dataset = pd.read_parquet(DATASET_PATH)
+        dataset = attach_inbound_mentions(dataset, force=args.force_mentions)
+        dataset.to_parquet(DATASET_PATH, index=False)
+        print(f"Wrote {DATASET_PATH} ({len(dataset):,} rows, {dataset.shape[1]} cols)")
+        print(f"Done in {time.time() - t0:.1f}s")
+        return
 
     if args.media_only:
         if not DATASET_PATH.exists():

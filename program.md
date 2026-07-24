@@ -23,6 +23,7 @@ Useful knobs:
 uv run prepare.py --skip-media          # reuse media flags; skip slow CA API
 uv run prepare.py --parent-only         # re-join reply/quote parents only
 uv run prepare.py --urls-only           # CA expanded URL domains + text-url structure
+uv run prepare.py --mentions-only       # timestamped inbound @-mentions (user_mentions ⋊ tweet time)
 uv run modal run label_provoke.py --nonreply-only   # default: Qwen3-8B → provoke_cache_Qwen__*
 uv run train.py --provoke-labels --provoke-cache ~/.cache/will-it-bang/provoke_cache_Qwen__Qwen3-8B.parquet
 uv run train.py --skip-embeddings       # ablation: tabular only
