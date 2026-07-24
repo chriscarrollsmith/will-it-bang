@@ -26,10 +26,14 @@ uv run prepare.py --skip-media          # reuse media flags; skip slow CA API
 uv run prepare.py --parent-only         # re-join reply/quote parents only
 uv run prepare.py --urls-only           # CA expanded URL domains + text-url structure
 uv run prepare.py --mentions-only       # patch inbound @-mentions onto an older dataset
-uv run prepare.py --provenance-only     # patch archive_upload_id / is_stream onto an older dataset
+uv run prepare.py --provenance-only     # patch archive_upload_id / is_stream / upload-end onto an older dataset
 uv run modal run label_provoke.py --nonreply-only   # default: Qwen3-8B → provoke_cache_Qwen__*
 uv run train.py --provoke-labels --provoke-cache ~/.cache/will-it-bang/provoke_cache_Qwen__Qwen3-8B.parquet
 uv run train.py --skip-embeddings       # ablation: tabular only
+uv run train.py --holdout-policy upload_era   # cap at last upload-linked created_at before time split
+uv run train.py --holdout-policy stream_only  # train/eval on extension-stream rows only
+uv run train.py --no-provenance-features      # ablate is_stream / upload-end / provenance×age (default on)
+uv run train.py --stream-fresh-days 30        # down-weight very fresh stream labels
 ```
 
 ## Metric
