@@ -149,7 +149,7 @@ Check off when tried; note outcome in one line.
 - [ ] Media-type breakdown (photo / gif / video) if available
 
 ### Graph / archive denser still
-- [ ] Timestamped mention joins (via dump tweet join; `user_mentions` alone has no time)
+- [ ] Timestamped mention joins (via dump tweet join; `user_mentions` alone has no time) — **v35 in progress:** `prepare.py --mentions-only` → `inbound_mentions*`
 - [ ] X API fallback for missing reply/quote parents
 - [ ] Quote-of-quote / deeper parent chain (1–2 hops, still pre-T)
 - Note: CA `followers`/`following` are archive **snapshots** (no follow/unfollow event times) — not usable as pre-T graph history.
