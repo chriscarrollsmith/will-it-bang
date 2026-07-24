@@ -577,22 +577,26 @@ def load_mention_times(account_ids: pd.Series, *, force: bool = False) -> dict[s
     if missing:
         print(f"Fetching user_mentions for {len(missing):,} accounts…", flush=True)
         fresh = _fetch_mention_events_api(missing)
+        pieces = [cached] if len(cached) else []
         if not fresh.empty:
             fresh = _backfill_mention_times_from_dump(fresh)
-            cached = pd.concat([cached, fresh], ignore_index=True)
-            cached = cached.drop_duplicates(["mentioned_user_id", "tweet_id"], keep="last")
+            pieces.append(fresh)
         seen = set(fresh["mentioned_user_id"].astype(str).unique()) if not fresh.empty else set()
         still_empty = [a for a in missing if a not in seen]
         if still_empty:
             # Sentinel rows so zero-mention accounts are not refetched every run.
-            empty = pd.DataFrame(
-                {
-                    "mentioned_user_id": still_empty,
-                    "tweet_id": [""] * len(still_empty),
-                    "created_at": [pd.NaT] * len(still_empty),
-                }
+            pieces.append(
+                pd.DataFrame(
+                    {
+                        "mentioned_user_id": still_empty,
+                        "tweet_id": [""] * len(still_empty),
+                        "created_at": pd.to_datetime([pd.NaT] * len(still_empty), utc=True),
+                    }
+                )
             )
-            cached = pd.concat([cached, empty], ignore_index=True)
+        cached = pd.concat(pieces, ignore_index=True) if pieces else cached
+        if not fresh.empty:
+            cached = cached.drop_duplicates(["mentioned_user_id", "tweet_id"], keep="last")
         cached.to_parquet(MENTION_CACHE_PATH, index=False)
         print(
             f"Wrote mention cache: {len(cached):,} rows → {MENTION_CACHE_PATH} "

@@ -20,12 +20,13 @@ Process retrospective (what moved the scoreboard vs what burned cycles): [`logs/
 
 | Objective | Run | wa_nr_wmean | wa_rp_wmean | global_nr | rmse_log | Notes |
 |---|---|---:|---:|---:|---:|---|
-| **Default stack** | **v31b** | **0.227** | **0.280** | 0.518 | 0.608 | Hybrid level + stratum LambdaRank blend (default) |
+| **Default stack** | **v35b** | **0.242** | 0.266 | **0.579** | **0.605** | Hybrid + timestamped inbound mentions (default prepare) |
+| Prior hybrid (no mentions) | v31b / v35a | 0.227 / 0.237 | **0.280** / 0.275 | 0.518 | 0.608 / 0.620 | v35a = same-rebuild control for v35b |
 | Level-only (ablation) | v31a | 0.187 | 0.172 | 0.508 | 0.610 | Asymmetric without hybrid blend |
 | Magnitude (opt-in SERA) | v28b / v33b | 0.227† | 0.280† | 0.483 | **0.584** | †wa_* frozen by hybrid ranker; level SERA only moves RMSE/global |
 | Dump total | v13 | — | — | — | 0.967 | Legacy objective |
 
-Rebuild: `uv run prepare.py --skip-media` (defaults are the v12 scale knobs).  
+Rebuild: `uv run prepare.py --skip-media` (defaults are the v12 scale knobs; mentions via `--mentions-only` on an existing dataset).  
 Train: `uv run train.py --description "…"`.
 
 ## Timeline (curated)
@@ -87,6 +88,15 @@ Dump-time fav/RT used as author history → optimistic RMSE ~0.82 (v5). Invalid 
 | v33b | **0.584** (rate) | 0.460 | Hybrid × SERA: wa_* **unchanged** (ranker sets within-author order); RMSE −0.024 / under-pred 2.21→2.04; global_nr 0.518→0.483 — magnitude-only; **do not promote** |
 | v33c | 0.601 (rate) | 0.474 | Hybrid × SERA `--sera-nonreply-only`: same frozen wa_*; milder RMSE/global trade vs v33b |
 | v33d | 0.604 (rate) | 0.453 | Level SERA NR-only: wa_nr **0.138** (−0.049 vs level control), wa_rp 0.170 (flat); **regress** on locked primary — NR-stratum SERA fails |
+| v35a | 0.620 (rate) | 0.503 | Same-rebuild hybrid control **without** mention cols (0% media): wa_nr **0.237**, wa_rp **0.275**, global_nr 0.518; under-pred 2.22 |
+| v35b | **0.605** (rate) | **0.521** | Timestamped inbound @-mentions (`user_mentions` ⋊ tweet time; 99.7% accounts / 98.7% rows): wa_nr **0.242** (+0.006), wa_rp **0.266** (−0.009), global_nr **0.579** (+0.061), under-pred 2.15; smoke NR spearman(mentions,rate)≈0.55; `reply_x_inbound_mentions` / `inbound_mentions_per_tweet` top gains; **keep default** (NR + magnitude/global win; mild reply within-author cost) |
+
+### v35 inbound mentions (same rebuild)
+
+| Run | wa_nr | wa_rp | global_nr | rmse | Notes |
+|---|---:|---:|---:|---:|---|
+| v35a no mentions | 0.237 | **0.275** | 0.518 | 0.620 | Control |
+| v35b + mentions | **0.242** | 0.266 | **0.579** | **0.605** | Promote / default on |
 
 ### Rescore shortlist (level-only, locked primaries)
 
@@ -149,7 +159,7 @@ Check off when tried; note outcome in one line.
 - [ ] Media-type breakdown (photo / gif / video) if available
 
 ### Graph / archive denser still
-- [ ] Timestamped mention joins (via dump tweet join; `user_mentions` alone has no time) — **v35 in progress:** `prepare.py --mentions-only` → `inbound_mentions*`
+- [x] Timestamped mention joins (via dump tweet join; `user_mentions` alone has no time) — **v35b: keep default**; vs same-rebuild wa_nr +0.006 / wa_rp −0.009 / rmse −0.015 / global_nr +0.061; `prepare.py --mentions-only`
 - [ ] X API fallback for missing reply/quote parents
 - [ ] Quote-of-quote / deeper parent chain (1–2 hops, still pre-T)
 - Note: CA `followers`/`following` are archive **snapshots** (no follow/unfollow event times) — not usable as pre-T graph history.
