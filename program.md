@@ -40,3 +40,5 @@ For the older dump-total objective: `uv run train.py --no-exposure-correct --res
 
 Curated history, current best, and the **unexplored backlog** live in [`experiments.md`](experiments.md).  
 Raw stdout goes under `logs/`; `results.tsv` is the machine-append metric table (gitignored).
+
+CA upload-vs-stream data-quality audit: [`logs/ca_data_quality_audit.md`](logs/ca_data_quality_audit.md) (`uv run audit_ca_quality.py`).
