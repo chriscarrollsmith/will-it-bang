@@ -245,7 +245,7 @@ INTERLOCUTOR_FEATURES = [
     "interlocutor_n_partners",
 ]
 
-# Reply/quote dyad + parent-author size (--reply-dyad); prepare.py --dyad-only.
+# Reply/quote dyad + parent-author size/corpus MiniLM (--reply-dyad); prepare --dyad-only.
 DYAD_FEATURES = [
     "reply_parent_author_known",
     "reply_parent_author_hist_n",
@@ -255,6 +255,10 @@ DYAD_FEATURES = [
     "reply_dyad_outbound",
     "reply_dyad_has_prior",
     "reply_dyad_bidir",
+    "reply_parent_author_emb_cos",
+    "reply_parent_author_emb_l2",
+    "reply_parent_author_emb_log_n",
+    "reply_parent_author_emb_has",
     "quote_parent_author_known",
     "quote_parent_author_hist_n",
     "quote_parent_author_inbound",
@@ -263,6 +267,10 @@ DYAD_FEATURES = [
     "quote_dyad_outbound",
     "quote_dyad_has_prior",
     "quote_dyad_bidir",
+    "quote_parent_author_emb_cos",
+    "quote_parent_author_emb_l2",
+    "quote_parent_author_emb_log_n",
+    "quote_parent_author_emb_has",
 ]
 
 # TE × own-corpus novelty (needs affinity + account TE columns).
