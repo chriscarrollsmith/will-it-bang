@@ -1,0 +1,57 @@
+Source: https://fabxmporizzqflnftavs.supabase.co/storage/v1/object/public/enriched_tweets/enriched_tweets.parquet
+
+=== Dump totals ===
+      n  n_with_upload  n_null_upload  reply_miss_uid            min_created            max_created
+8314040        6728898        1585142          560764 1998-10-28 06:57:12+00 2026-07-24 04:33:08+00
+
+=== Yearly (% null upload / % reply miss uid) ===
+year       n  pct_null_upload  pct_reply_miss_uid  pct_null_conv
+1998       1             0.00                 NaN         100.00
+1999       1             0.00                0.00         100.00
+2002       2             0.00                 NaN         100.00
+2004       1             0.00                 NaN         100.00
+2007     136             0.00                0.00           6.62
+2008    3901             0.03                0.00          46.73
+2009   19107             0.18                0.11          33.51
+2010   41289             0.02                0.01          50.99
+2011   72624             0.01                0.00          50.93
+2012   86742             0.14                0.03          62.96
+2013   91657             0.16                0.07          62.20
+2014   91691             0.14                0.03          54.67
+2015   89389             0.15                0.05          49.38
+2016   85231             0.69                0.20          44.48
+2017  121559             0.90                0.53          43.49
+2018  175404             0.81                0.79          43.77
+2019  280465             0.68                0.23          52.70
+2020  674459             0.60                0.40          55.89
+2021  914857             0.81                0.48          60.74
+2022 1074088             0.96                0.51          56.56
+2023 1248978             1.58                0.69          56.54
+2024 1363892             4.73                2.61          58.04
+2025 1029695            62.16               26.70          44.68
+2026  848871            98.19               62.70           8.79
+
+=== Eligible accounts (50–8000 non-RT tweets): yearly stream share ===
+year      n  pct_stream  pct_reply_miss_uid  n_accounts
+2020  25419        11.1                 9.9         163
+2021  35774        15.9                12.3         247
+2022  52895        12.7                 8.7         317
+2023  81282        11.9                 8.3         488
+2024 147323        20.9                14.9         725
+2025 279088        78.7                42.0         922
+2026 221162        99.6                67.7         893
+
+=== Global time quintiles on eligible pool (last quint ≈ holdout) ===
+ quint                    min_ts                    max_ts      n  pct_stream  pct_reply_miss_uid
+     1 2007-02-19 02:00:31+00:00 2023-05-22 23:39:41+00:00 175689        12.6                 9.8
+     2 2023-05-22 23:43:19+00:00 2024-11-05 01:09:40+00:00 175689        14.8                10.2
+     3 2024-11-05 01:14:00+00:00 2025-08-18 09:55:13+00:00 175689        66.6                40.7
+     4 2025-08-18 09:55:16+00:00 2026-02-15 07:13:39+00:00 175689        90.3                42.9
+     5 2026-02-15 07:18:32+00:00 2026-07-24 04:12:41+00:00 175689        99.9                73.4
+
+Wrote:
+  logs/ca_dq/monthly_dq.csv
+  logs/ca_dq/yearly_dq.csv
+  logs/ca_dq/eligible_yearly_dq.csv
+  logs/ca_dq/time_quintile_dq.csv
+Narrative: logs/ca_data_quality_audit.md
