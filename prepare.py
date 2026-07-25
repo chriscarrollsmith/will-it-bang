@@ -2915,9 +2915,10 @@ def load_parent_author_corpus_tweets(
 ) -> pd.DataFrame:
     """Capped parent-author tweets for MiniLM corpus affinity.
 
-    For each parent account, keep up to ``per_account_cap`` most recent dump
-    tweets with ``created_at < max_child_created_at`` (max over children that
-    reference that parent). Leakage-safe at feature time: each child still uses
+    For each parent account, keep up to ``per_account_cap`` dump tweets with
+    ``created_at < max_child_created_at``, spaced evenly across that history
+    (not just the most recent — recency-only caps leave older children with
+    empty pre-T means). Leakage-safe at feature time: each child still uses
     only tweets strictly before its own *T*.
     """
     empty = pd.DataFrame(columns=["tweet_id", "account_id", "full_text", "created_at"])
@@ -2934,9 +2935,10 @@ def load_parent_author_corpus_tweets(
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     need.to_parquet(tmp, index=False)
     path = str(RAW_PARQUET)
+    cap = int(per_account_cap)
     print(
         f"Loading parent-author corpus texts: {len(need):,} authors, "
-        f"cap={per_account_cap} pre-max-child…",
+        f"cap={cap} even-spaced pre-max-child…",
         flush=True,
     )
     con = duckdb.connect()
@@ -2957,8 +2959,11 @@ def load_parent_author_corpus_tweets(
             t.created_at,
             ROW_NUMBER() OVER (
               PARTITION BY CAST(t.account_id AS VARCHAR)
-              ORDER BY t.created_at DESC
-            ) AS rn
+              ORDER BY t.created_at ASC
+            ) AS rn,
+            COUNT(*) OVER (
+              PARTITION BY CAST(t.account_id AS VARCHAR)
+            ) AS n
           FROM read_parquet('{path}') t
           JOIN caps c
             ON CAST(t.account_id AS VARCHAR) = c.account_id
@@ -2968,7 +2973,16 @@ def load_parent_author_corpus_tweets(
         )
         SELECT tweet_id, account_id, full_text, created_at
         FROM ranked
-        WHERE rn <= {int(per_account_cap)}
+        WHERE n <= {cap}
+           OR rn = 1
+           OR rn = n
+           OR (
+             {cap} > 2
+             AND ((rn - 1) % GREATEST(
+               1,
+               CAST(CEIL((n - 1) * 1.0 / ({cap} - 1)) AS BIGINT)
+             )) = 0
+           )
         """
     ).fetchdf()
     con.close()
