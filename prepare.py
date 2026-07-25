@@ -17,6 +17,7 @@ import argparse
 import os
 import re
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import duckdb
@@ -46,6 +47,8 @@ MEDIA_TYPE_KEYS = ("photo", "video", "animated_gif")
 X_PARENT_DONE_STATUSES = frozenset({"ok", "not_found", "forbidden"})
 X_TWEETS_URL = "https://api.x.com/2/tweets"
 X_TWEETS_BATCH = 100
+# CA / paste junk sometimes leaves "?s=20" (or status URLs) in ref ids.
+TWEET_ID_RE = re.compile(r"(\d{5,25})")
 EMBED_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"  # Apache-2.0
 PARQUET_URL = (
     "https://fabxmporizzqflnftavs.supabase.co/storage/v1/object/public/"
@@ -571,8 +574,17 @@ def _count_window(times: np.ndarray | None, cutoff, days: float) -> int:
     return max(0, right - left)
 
 
-def _fetch_mention_events_api(account_ids: list[str], batch_size: int = 40) -> pd.DataFrame:
-    """Page CA user_mentions for mentioned_user_id ∈ accounts; join tweet created_at."""
+def _fetch_mention_events_api(
+    account_ids: list[str],
+    batch_size: int = 40,
+    *,
+    on_batch: Callable[[pd.DataFrame, list[str]], None] | None = None,
+) -> pd.DataFrame:
+    """Page CA user_mentions for mentioned_user_id ∈ accounts; join tweet created_at.
+
+    If on_batch is set, it is called after each account batch with the cumulative
+    events DataFrame so callers can flush a durable cache for resume.
+    """
     if not account_ids:
         return pd.DataFrame(columns=["mentioned_user_id", "tweet_id", "created_at"])
     session = requests.Session()
@@ -582,6 +594,7 @@ def _fetch_mention_events_api(account_ids: list[str], batch_size: int = 40) -> p
         joined = ",".join(f'"{aid}"' for aid in batch)
         last_id = 0
         page = 0
+        batch_rows_before = len(rows)
         while True:
             params = {
                 "select": "id,tweet_id,mentioned_user_id,tweets(created_at,account_id)",
@@ -625,12 +638,27 @@ def _fetch_mention_events_api(account_ids: list[str], batch_size: int = 40) -> p
                     f"{len(account_ids):,}: {len(rows):,} events (id>{last_id})",
                     flush=True,
                 )
-        if start == 0 or (start // batch_size) % 5 == 0:
+        # Zero-mention accounts in this batch: sentinel so they are not refetched.
+        seen_in_batch = {
+            str(r["mentioned_user_id"]) for r in rows[batch_rows_before:]
+        }
+        for aid in batch:
+            if aid not in seen_in_batch:
+                rows.append(
+                    {
+                        "mentioned_user_id": aid,
+                        "tweet_id": "",
+                        "created_at": None,
+                    }
+                )
+        if start == 0 or (start // batch_size) % 5 == 0 or start + batch_size >= len(account_ids):
             print(
                 f"  user_mentions: {min(start + batch_size, len(account_ids)):,}/"
                 f"{len(account_ids):,} accounts → {len(rows):,} events",
                 flush=True,
             )
+        if on_batch is not None:
+            on_batch(pd.DataFrame(rows), batch)
     return pd.DataFrame(rows)
 
 
@@ -695,7 +723,28 @@ def load_mention_times(account_ids: pd.Series, *, force: bool = False) -> dict[s
     missing = [a for a in accounts if a not in have]
     if missing:
         print(f"Fetching user_mentions for {len(missing):,} accounts…", flush=True)
-        fresh = _fetch_mention_events_api(missing)
+
+        def _flush_mention_progress(fresh_raw: pd.DataFrame, batch: list[str]) -> None:
+            """Persist each account batch so CA mention paging can resume after kills."""
+            nonlocal cached
+            if fresh_raw.empty:
+                return
+            # Only merge the just-finished batch accounts (raw times; dump backfill later).
+            piece = fresh_raw.loc[
+                fresh_raw["mentioned_user_id"].astype(str).isin(batch)
+            ].copy()
+            if piece.empty:
+                return
+            piece["mentioned_user_id"] = piece["mentioned_user_id"].astype(str)
+            piece["tweet_id"] = piece["tweet_id"].astype(str)
+            pieces = [cached] if len(cached) else []
+            pieces.append(piece)
+            cached = pd.concat(pieces, ignore_index=True)
+            cached = cached.drop_duplicates(["mentioned_user_id", "tweet_id"], keep="last")
+            cached.to_parquet(MENTION_CACHE_PATH, index=False)
+
+        fresh = _fetch_mention_events_api(missing, on_batch=_flush_mention_progress)
+        # Final merge + dump backfill for timestamps (idempotent with batch flushes).
         pieces = [cached] if len(cached) else []
         if not fresh.empty:
             fresh = _backfill_mention_times_from_dump(fresh)
@@ -716,6 +765,8 @@ def load_mention_times(account_ids: pd.Series, *, force: bool = False) -> dict[s
         cached = pd.concat(pieces, ignore_index=True) if pieces else cached
         if not fresh.empty:
             cached = cached.drop_duplicates(["mentioned_user_id", "tweet_id"], keep="last")
+        # Backfill created_at on any sentinel/partial rows still missing times.
+        cached = _backfill_mention_times_from_dump(cached)
         cached.to_parquet(MENTION_CACHE_PATH, index=False)
         print(
             f"Wrote mention cache: {len(cached):,} rows → {MENTION_CACHE_PATH} "
@@ -1308,6 +1359,56 @@ def _is_quota_http_status(status: int) -> bool:
     return status in {402, 429}
 
 
+def normalize_tweet_id(value: object) -> str | None:
+    """Return a bare snowflake id, or None if the value is not a usable tweet id."""
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    s = str(value).strip()
+    if not s or s.lower() in {"none", "nan", "<na>"}:
+        return None
+    if "status/" in s:
+        s = s.split("status/")[-1]
+    s = s.split("?")[0].split("#")[0].strip().rstrip("/")
+    if s.isdigit() and 5 <= len(s) <= 25:
+        return s
+    m = TWEET_ID_RE.search(str(value))
+    return m.group(1) if m else None
+
+
+def _normalize_ref_id_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Strip URL/query junk from reply/quote parent ids so dump + X joins match."""
+    out = df.copy()
+    for col in ("reply_to_tweet_id", "quoted_tweet_id"):
+        if col not in out.columns:
+            continue
+        out[col] = out[col].map(normalize_tweet_id)
+    return out
+
+
+def _invalid_id_cache_rows(tweet_ids: list[str], *, status: str = "not_found") -> pd.DataFrame:
+    ts = pd.Timestamp.now(tz="UTC").isoformat()
+    return pd.DataFrame(
+        [
+            {
+                "tweet_id": tid,
+                "account_id": pd.NA,
+                "full_text": "",
+                "created_at": pd.NaT,
+                "reply_to_tweet_id": None,
+                "quoted_tweet_id": None,
+                "fetch_status": status,
+                "fetched_at": ts,
+            }
+            for tid in tweet_ids
+        ]
+    )
+
+
 def _x_parent_rows_from_cache(tweet_ids: list[str], cache: pd.DataFrame | None = None) -> pd.DataFrame:
     """Dump-shaped ok rows for ids already in the X parent cache (no API calls)."""
     cols = [
@@ -1348,13 +1449,36 @@ def fetch_x_parent_tweets(
     On rate-limit / credit exhaustion, flushes the cache and raises
     XParentFetchInterrupted so callers can keep going with partial coverage.
     """
-    uniq = list(dict.fromkeys(str(t) for t in tweet_ids if pd.notna(t) and str(t)))
-    if not uniq:
+    raw_uniq = list(dict.fromkeys(str(t) for t in tweet_ids if pd.notna(t) and str(t)))
+    # Normalize before any API call so "?s=20" / status URLs never burn a batch.
+    normalized: list[str] = []
+    invalid_raw: list[str] = []
+    for raw in raw_uniq:
+        nid = normalize_tweet_id(raw)
+        if nid is None:
+            invalid_raw.append(raw)
+        else:
+            normalized.append(nid)
+    uniq = list(dict.fromkeys(normalized))
+    if invalid_raw:
+        print(
+            f"X parent ids: dropped {len(invalid_raw):,} non-snowflake ref ids "
+            f"(cached as not_found, no API)",
+            flush=True,
+        )
+
+    if not uniq and not invalid_raw:
         return _x_parent_rows_from_cache([])
 
     cache = _empty_x_parent_cache() if force else load_x_parent_cache()
     if force and X_PARENT_CACHE_PATH.exists():
         print(f"Force X parent refetch: ignoring {X_PARENT_CACHE_PATH.name}", flush=True)
+
+    if invalid_raw:
+        inv = _invalid_id_cache_rows(invalid_raw)
+        cache = inv if cache.empty else pd.concat([cache, inv], ignore_index=True)
+        cache = cache.drop_duplicates("tweet_id", keep="last")
+        save_x_parent_cache(cache)
 
     have_done: set[str] = set()
     if not cache.empty:
@@ -1378,8 +1502,10 @@ def fetch_x_parent_tweets(
             }
             fetched = 0
             now_iso = lambda: pd.Timestamp.now(tz="UTC").isoformat()
-            for start in range(0, len(miss), X_TWEETS_BATCH):
-                batch = miss[start : start + X_TWEETS_BATCH]
+            pending = list(miss)
+            while pending:
+                batch = pending[:X_TWEETS_BATCH]
+                pending = pending[X_TWEETS_BATCH:]
                 params = {**params_base, "ids": ",".join(batch)}
                 try:
                     resp = sess.get(X_TWEETS_URL, params=params, timeout=60)
@@ -1388,7 +1514,7 @@ def fetch_x_parent_tweets(
                     raise XParentFetchInterrupted(
                         f"X parent fetch network error after {fetched:,} new rows: {exc}",
                         fetched=fetched,
-                        remaining=len(miss) - start,
+                        remaining=len(pending) + len(batch),
                     ) from exc
 
                 if _is_quota_http_status(resp.status_code) or resp.status_code in {401, 403}:
@@ -1400,17 +1526,60 @@ def fetch_x_parent_tweets(
                         f"X parent fetch stopped on HTTP {resp.status_code}"
                         f"{f' (retry-after/reset={retry_after})' if retry_after else ''}; "
                         f"cache has {len(cache):,} rows. "
-                        f"Re-run: uv run prepare.py --parent-only",
+                        f"Re-run: uv run prepare.py --parent-only --x-parents",
                         fetched=fetched,
-                        remaining=len(miss) - start,
+                        remaining=len(pending) + len(batch),
                     )
+
+                if resp.status_code == 400:
+                    # One bad id can fail a whole batch; quarantine and retry the rest.
+                    bad: list[str] = []
+                    try:
+                        err_body = resp.json()
+                        for e in err_body.get("errors") or []:
+                            for v in (e.get("parameters") or {}).get("ids") or []:
+                                nid = normalize_tweet_id(v) or str(v)
+                                bad.append(nid)
+                            msg = str(e.get("message") or "")
+                            m = TWEET_ID_RE.search(msg)
+                            if m:
+                                bad.append(m.group(1))
+                    except Exception:
+                        bad = []
+                    bad = [b for b in dict.fromkeys(bad) if b in batch]
+                    if not bad and len(batch) == 1:
+                        bad = list(batch)
+                    if not bad:
+                        # Fall back: split batch so a single poison id cannot block the rest.
+                        if len(batch) > 1:
+                            mid = len(batch) // 2
+                            pending = batch[:mid] + batch[mid:] + pending
+                            print(
+                                f"  X parents: HTTP 400 on {len(batch)}-id batch; "
+                                f"bisecting to isolate bad id",
+                                flush=True,
+                            )
+                            continue
+                        bad = list(batch)
+                    inv = _invalid_id_cache_rows(bad)
+                    cache = inv if cache.empty else pd.concat([cache, inv], ignore_index=True)
+                    cache = cache.drop_duplicates("tweet_id", keep="last")
+                    save_x_parent_cache(cache)
+                    rest = [t for t in batch if t not in set(bad)]
+                    pending = rest + pending
+                    print(
+                        f"  X parents: quarantined {len(bad):,} invalid id(s) from HTTP 400 "
+                        f"(no credit wasted on retry of those)",
+                        flush=True,
+                    )
+                    continue
 
                 if resp.status_code != 200:
                     save_x_parent_cache(cache)
                     raise XParentFetchInterrupted(
                         f"X parent fetch HTTP {resp.status_code}: {resp.text[:300]}",
                         fetched=fetched,
-                        remaining=len(miss) - start,
+                        remaining=len(pending) + len(batch),
                     )
 
                 body = resp.json()
@@ -1461,14 +1630,15 @@ def fetch_x_parent_tweets(
                 cache = cache.drop_duplicates("tweet_id", keep="last")
                 save_x_parent_cache(cache)
                 fetched += len(batch)
-                if start == 0 or ((start // X_TWEETS_BATCH) % 5 == 0) or start + X_TWEETS_BATCH >= len(miss):
+                done_n = fetched
+                total_n = len(miss)
+                if done_n == len(batch) or done_n % 500 < len(batch) or not pending:
                     print(
-                        f"  X parents: {min(start + len(batch), len(miss)):,}/{len(miss):,} "
+                        f"  X parents: {min(done_n, total_n):,}/{total_n:,} "
                         f"(cache={len(cache):,})",
                         flush=True,
                     )
-                # Be polite on free/basic tiers; cache already durable if we die.
-                if start + X_TWEETS_BATCH < len(miss):
+                if pending:
                     time.sleep(0.5)
 
     ok = _x_parent_rows_from_cache(uniq, cache)
@@ -1692,6 +1862,7 @@ def attach_parent_context(
     out = df.reset_index(drop=True).copy()
     if "reply_to_tweet_id" not in out.columns or "quoted_tweet_id" not in out.columns:
         raise RuntimeError("Dataset missing reply_to_tweet_id / quoted_tweet_id for parent join")
+    out = _normalize_ref_id_columns(out)
 
     reply_ids = out["reply_to_tweet_id"].dropna().astype(str)
     quote_ids = out["quoted_tweet_id"].dropna().astype(str)
@@ -1737,7 +1908,7 @@ def attach_parent_context(
                 flush=True,
             )
     elif missing and not use_x:
-        print("  X parent fallback disabled (--no-x-parents)", flush=True)
+        print("  X parent fallback off (--no-x-parents)", flush=True)
 
     if parents.empty:
         out = _empty_parent_feature_frame(out)
@@ -2125,17 +2296,20 @@ def parse_args() -> argparse.Namespace:
         "--parent-only",
         action="store_true",
         help="Only add reply/quote parent features onto an existing dataset.parquet "
-        "(resumes X parent cache if a prior fetch stopped on rate/credits)",
+        "(resumes x_parent_cache after rate/credits stops; default --x-parents)",
     )
     p.add_argument(
-        "--no-x-parents",
-        action="store_true",
-        help="Do not call X API for reply/quote parents missing from the CA dump",
+        "--x-parents",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fetch reply/quote parents missing from the CA dump via X API "
+        "(resumable x_parent_cache.parquet; default on after v39c). "
+        "Use --no-x-parents for dump-only ablation",
     )
     p.add_argument(
         "--force-x-parents",
         action="store_true",
-        help="Refetch X parents even when x_parent_cache.parquet already has the tweet_id",
+        help="With --x-parents, refetch even when x_parent_cache.parquet has the tweet_id",
     )
     p.add_argument(
         "--urls-only",
@@ -2296,7 +2470,7 @@ def main() -> None:
         dataset = attach_parent_context(
             dataset,
             batch_size=args.embed_batch_size,
-            use_x=not args.no_x_parents,
+            use_x=args.x_parents,
             force_x=args.force_x_parents,
         )
         if before_cov["reply"] is not None:
@@ -2366,7 +2540,7 @@ def main() -> None:
     dataset = attach_parent_context(
         dataset,
         batch_size=args.embed_batch_size,
-        use_x=not args.no_x_parents,
+        use_x=args.x_parents,
         force_x=args.force_x_parents,
     )
     dataset = attach_url_domains(dataset, force=args.force_urls)
