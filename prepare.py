@@ -2535,6 +2535,11 @@ DYAD_FEATURE_SUFFIXES = (
     "dyad_outbound",
     "dyad_has_prior",
     "dyad_bidir",
+    # Cosine / L2 vs mean of parent author's pre-T MiniLM corpus (capped).
+    "parent_author_emb_cos",
+    "parent_author_emb_l2",
+    "parent_author_emb_log_n",
+    "parent_author_emb_has",
 )
 
 
@@ -2903,8 +2908,237 @@ def _dyad_time_maps(
     return inbound, outbound
 
 
-def attach_reply_dyad_features(df: pd.DataFrame, *, force: bool = False) -> pd.DataFrame:
-    """Parent-author size + prior reciprocal reply/quote interaction (pre-T).
+def load_parent_author_corpus_tweets(
+    parent_max_t: pd.DataFrame,
+    *,
+    per_account_cap: int = 200,
+) -> pd.DataFrame:
+    """Capped parent-author tweets for MiniLM corpus affinity.
+
+    For each parent account, keep up to ``per_account_cap`` dump tweets with
+    ``created_at < max_child_created_at``, spaced evenly across that history
+    (not just the most recent — recency-only caps leave older children with
+    empty pre-T means). Leakage-safe at feature time: each child still uses
+    only tweets strictly before its own *T*.
+    """
+    empty = pd.DataFrame(columns=["tweet_id", "account_id", "full_text", "created_at"])
+    if parent_max_t is None or parent_max_t.empty or per_account_cap <= 0:
+        return empty
+    need = parent_max_t[["account_id", "max_created_at"]].copy()
+    need["account_id"] = need["account_id"].astype(str)
+    need["max_created_at"] = pd.to_datetime(need["max_created_at"], utc=True)
+    need = need.dropna(subset=["account_id", "max_created_at"])
+    need = need[need["account_id"].ne("")]
+    if need.empty:
+        return empty
+    tmp = CACHE_DIR / "_parent_author_max_t.parquet"
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    need.to_parquet(tmp, index=False)
+    path = str(RAW_PARQUET)
+    cap = int(per_account_cap)
+    print(
+        f"Loading parent-author corpus texts: {len(need):,} authors, "
+        f"cap={cap} even-spaced pre-max-child…",
+        flush=True,
+    )
+    con = duckdb.connect()
+    con.execute(f"SET threads TO {max(1, os.cpu_count() or 4)}")
+    df = con.execute(
+        f"""
+        WITH caps AS (
+          SELECT
+            account_id,
+            CAST(max_created_at AS TIMESTAMPTZ) AS max_created_at
+          FROM read_parquet('{tmp}')
+        ),
+        ranked AS (
+          SELECT
+            CAST(t.tweet_id AS VARCHAR) AS tweet_id,
+            CAST(t.account_id AS VARCHAR) AS account_id,
+            t.full_text,
+            t.created_at,
+            ROW_NUMBER() OVER (
+              PARTITION BY CAST(t.account_id AS VARCHAR)
+              ORDER BY t.created_at ASC
+            ) AS rn,
+            COUNT(*) OVER (
+              PARTITION BY CAST(t.account_id AS VARCHAR)
+            ) AS n
+          FROM read_parquet('{path}') t
+          JOIN caps c
+            ON CAST(t.account_id AS VARCHAR) = c.account_id
+          WHERE t.full_text IS NOT NULL
+            AND t.full_text NOT LIKE 'RT @%'
+            AND CAST(t.created_at AS TIMESTAMPTZ) < c.max_created_at
+        )
+        SELECT tweet_id, account_id, full_text, created_at
+        FROM ranked
+        WHERE n <= {cap}
+           OR rn = 1
+           OR rn = n
+           OR (
+             {cap} > 2
+             AND ((rn - 1) % GREATEST(
+               1,
+               CAST(CEIL((n - 1) * 1.0 / ({cap} - 1)) AS BIGINT)
+             )) = 0
+           )
+        """
+    ).fetchdf()
+    con.close()
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+    if df.empty:
+        print("  parent-author corpus: 0 tweets", flush=True)
+        return empty
+    df["created_at"] = pd.to_datetime(df["created_at"], utc=True)
+    df["account_id"] = df["account_id"].astype(str)
+    df["tweet_id"] = df["tweet_id"].astype(str)
+    print(
+        f"  parent-author corpus: {len(df):,} tweets / "
+        f"{df['account_id'].nunique():,} authors "
+        f"(mean {len(df) / max(df['account_id'].nunique(), 1):.1f}/author)",
+        flush=True,
+    )
+    return df
+
+
+def _attach_parent_author_emb_affinity(
+    out: pd.DataFrame,
+    *,
+    per_account_cap: int,
+    batch_size: int,
+) -> pd.DataFrame:
+    """Cosine / L2 of child MiniLM vs mean of parent author's pre-T corpus."""
+    emb_cols = [c for c in out.columns if c.startswith("emb_")]
+    for prefix in ("reply", "quote"):
+        out[f"{prefix}_parent_author_emb_cos"] = 0.0
+        out[f"{prefix}_parent_author_emb_l2"] = 0.0
+        out[f"{prefix}_parent_author_emb_log_n"] = 0.0
+        out[f"{prefix}_parent_author_emb_has"] = np.int8(0)
+
+    if not emb_cols:
+        print("Parent-author emb affinity: no emb_* on dataset; left at 0", flush=True)
+        return out
+    emb_cols = sorted(emb_cols, key=lambda c: int(c.split("_", 1)[1]))
+
+    max_rows: list[dict] = []
+    for prefix, aid_col in (
+        ("reply", "reply_parent_account_id"),
+        ("quote", "quote_parent_account_id"),
+    ):
+        if aid_col not in out.columns:
+            continue
+        sub = out.loc[out[aid_col].notna(), ["created_at", aid_col]].copy()
+        if sub.empty:
+            continue
+        sub["account_id"] = sub[aid_col].astype(str)
+        sub = sub[sub["account_id"].ne("") & ~sub["account_id"].isin({"None", "nan", "<NA>"})]
+        # Exclude self-replies: corpus mean would equal own-history affinity.
+        ego = out.loc[sub.index, "account_id"].astype(str)
+        sub = sub.loc[sub["account_id"].to_numpy() != ego.to_numpy()]
+        if sub.empty:
+            continue
+        g = sub.groupby("account_id", sort=False)["created_at"].max().reset_index()
+        g = g.rename(columns={"created_at": "max_created_at"})
+        max_rows.append(g)
+    if not max_rows:
+        print("Parent-author emb affinity: no external parent authors", flush=True)
+        return out
+
+    parent_max = (
+        pd.concat(max_rows, ignore_index=True)
+        .groupby("account_id", sort=False)["max_created_at"]
+        .max()
+        .reset_index()
+    )
+    corpus = load_parent_author_corpus_tweets(parent_max, per_account_cap=per_account_cap)
+    if corpus.empty:
+        return out
+
+    cache = ensure_embed_cache(corpus["tweet_id"], corpus["full_text"], batch_size=batch_size)
+    cache_emb = cache.set_index("tweet_id")[emb_cols]
+    corpus = corpus.merge(
+        cache_emb.reset_index(),
+        on="tweet_id",
+        how="left",
+    )
+    if corpus[emb_cols[0]].isna().any():
+        n_miss = int(corpus[emb_cols[0]].isna().sum())
+        raise RuntimeError(f"Missing parent-author corpus embeddings ({n_miss})")
+
+    # Per parent: sorted times + prefix-sum embeddings for O(log n) pre-T means.
+    packs: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for aid, g in corpus.groupby("account_id", sort=False):
+        g = g.sort_values("created_at", kind="mergesort")
+        times = g["created_at"].to_numpy(dtype="datetime64[ns]")
+        vecs = g[emb_cols].to_numpy(dtype=np.float64)
+        packs[str(aid)] = (times, np.cumsum(vecs, axis=0))
+
+    child_emb = out[emb_cols].to_numpy(dtype=np.float64)
+    child_t = pd.to_datetime(out["created_at"], utc=True).to_numpy(dtype="datetime64[ns]")
+    n = len(out)
+
+    for prefix, aid_col in (
+        ("reply", "reply_parent_account_id"),
+        ("quote", "quote_parent_account_id"),
+    ):
+        if aid_col not in out.columns:
+            continue
+        cos = np.zeros(n, dtype=np.float64)
+        l2 = np.zeros(n, dtype=np.float64)
+        log_n = np.zeros(n, dtype=np.float64)
+        has = np.zeros(n, dtype=np.int8)
+        aids = out[aid_col]
+        ego = out["account_id"].astype(str).to_numpy()
+        for i in range(n):
+            raw = aids.iloc[i]
+            if pd.isna(raw):
+                continue
+            pid = str(raw)
+            if not pid or pid in {"None", "nan", "<NA>"} or pid == ego[i]:
+                continue
+            pack = packs.get(pid)
+            if pack is None:
+                continue
+            times, cum = pack
+            n_prior = int(np.searchsorted(times, child_t[i], side="left"))
+            if n_prior <= 0:
+                continue
+            mean = cum[n_prior - 1] / n_prior
+            v = child_emb[i]
+            mean_n = float(np.linalg.norm(mean))
+            v_n = float(np.linalg.norm(v))
+            if mean_n > 1e-12 and v_n > 1e-12:
+                cos[i] = float(np.dot(mean, v) / (mean_n * v_n))
+            l2[i] = float(np.linalg.norm(v - mean))
+            log_n[i] = float(np.log1p(n_prior))
+            has[i] = 1
+        out[f"{prefix}_parent_author_emb_cos"] = cos
+        out[f"{prefix}_parent_author_emb_l2"] = l2
+        out[f"{prefix}_parent_author_emb_log_n"] = log_n
+        out[f"{prefix}_parent_author_emb_has"] = has
+        among = has.astype(bool)
+        print(
+            f"  {prefix} parent-author emb: has={has.mean():.1%} rows; "
+            f"among-has mean_cos={(cos[among].mean() if among.any() else 0):.3f} "
+            f"mean_log_n={(log_n[among].mean() if among.any() else 0):.3f}",
+            flush=True,
+        )
+    return out
+
+
+def attach_reply_dyad_features(
+    df: pd.DataFrame,
+    *,
+    force: bool = False,
+    parent_author_emb_cap: int = 200,
+    skip_parent_author_emb: bool = False,
+    embed_batch_size: int = 256,
+) -> pd.DataFrame:
+    """Parent-author size + reciprocal reply/quote dyad + optional corpus MiniLM.
 
     Does not use dump fav/RT or current follower counts. Parent author ids come
     from dump / X parent cache; dyad events are reply/quote edges only (mentions
@@ -3015,6 +3249,20 @@ def attach_reply_dyad_features(df: pd.DataFrame, *, force: bool = False) -> pd.D
             f"mean_hist_n={(hist_n[among].mean() if n_among else 0):.3f}",
             flush=True,
         )
+
+    if skip_parent_author_emb:
+        for prefix in ("reply", "quote"):
+            out[f"{prefix}_parent_author_emb_cos"] = 0.0
+            out[f"{prefix}_parent_author_emb_l2"] = 0.0
+            out[f"{prefix}_parent_author_emb_log_n"] = 0.0
+            out[f"{prefix}_parent_author_emb_has"] = np.int8(0)
+        print("Parent-author emb affinity skipped (--skip-parent-author-emb)", flush=True)
+    else:
+        out = _attach_parent_author_emb_affinity(
+            out,
+            per_account_cap=parent_author_emb_cap,
+            batch_size=embed_batch_size,
+        )
     return out
 
 
@@ -3117,6 +3365,18 @@ def parse_args() -> argparse.Namespace:
         help="With --dyad-only (or full prepare), rescan dump dyad events even when "
         "dyad_cache.parquet has the ego account_id",
     )
+    p.add_argument(
+        "--parent-author-emb-cap",
+        type=int,
+        default=200,
+        help="Max pre-max-child tweets per parent author for MiniLM corpus affinity "
+        "(default 200; used by --dyad-only / full prepare)",
+    )
+    p.add_argument(
+        "--skip-parent-author-emb",
+        action="store_true",
+        help="Skip parent-author MiniLM corpus affinity when building dyad features",
+    )
     return p.parse_args()
 
 
@@ -3140,7 +3400,13 @@ def main() -> None:
         dataset["tweet_id"] = dataset["tweet_id"].astype(str)
         dataset["created_at"] = pd.to_datetime(dataset["created_at"], utc=True)
         dataset = backfill_ref_ids_from_dump(dataset)
-        dataset = attach_reply_dyad_features(dataset, force=args.force_dyad)
+        dataset = attach_reply_dyad_features(
+            dataset,
+            force=args.force_dyad,
+            parent_author_emb_cap=args.parent_author_emb_cap,
+            skip_parent_author_emb=args.skip_parent_author_emb,
+            embed_batch_size=args.embed_batch_size,
+        )
         dataset.to_parquet(DATASET_PATH, index=False)
         print(f"Wrote {DATASET_PATH} ({len(dataset):,} rows, {dataset.shape[1]} cols)")
         print(f"Done in {time.time() - t0:.1f}s")
@@ -3339,7 +3605,13 @@ def main() -> None:
         use_x=args.x_parents,
         force_x=args.force_x_parents,
     )
-    dataset = attach_reply_dyad_features(dataset, force=args.force_dyad)
+    dataset = attach_reply_dyad_features(
+        dataset,
+        force=args.force_dyad,
+        parent_author_emb_cap=args.parent_author_emb_cap,
+        skip_parent_author_emb=args.skip_parent_author_emb,
+        embed_batch_size=args.embed_batch_size,
+    )
     dataset = attach_url_domains(dataset, force=args.force_urls)
     dataset = attach_upload_end_features(dataset, force=args.force_uploads)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
