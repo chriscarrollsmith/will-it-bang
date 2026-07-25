@@ -193,6 +193,15 @@ PROVOKE_FEATURES = [
     "has_provoke",
 ]
 
+# Cached LM agree/disagree vs parent (label_stance.py); opt-in --stance-labels.
+STANCE_FEATURES = [
+    "stance_agree",
+    "stance_disagree",
+    "stance_net",
+    "stance_conflict",
+    "has_stance",
+]
+
 # Train-fold account target encoding (add_account_target_encoding).
 ACCOUNT_TE_FEATURES = [
     "account_mean_rate",
@@ -304,6 +313,7 @@ def feature_matrix(df: pd.DataFrame, skip_embeddings: bool) -> tuple[np.ndarray,
             + DESCRIPTIVE_TEXT_FEATURES
             + URL_DOMAIN_FEATURES
             + PROVOKE_FEATURES
+            + STANCE_FEATURES
             + ACCOUNT_TE_FEATURES
             + EMB_KNN_TE_FEATURES
             + EMB_CAV_FEATURES
@@ -1484,6 +1494,19 @@ def parse_args() -> argparse.Namespace:
         help="Path to provoke cache parquet (default: ~/.cache/will-it-bang/provoke_cache.parquet)",
     )
     p.add_argument(
+        "--stance-labels",
+        action="store_true",
+        help="Join LM agree/disagree-vs-parent scores from stance cache "
+        "(label_stance.py; opt-in until smoke clears gate)",
+    )
+    p.add_argument(
+        "--stance-cache",
+        type=Path,
+        default=None,
+        help="Path to stance cache parquet "
+        "(default: ~/.cache/will-it-bang/stance_cache.parquet)",
+    )
+    p.add_argument(
         "--account-te",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1820,6 +1843,47 @@ def add_provoke_features(df: pd.DataFrame, cache_path: Path | None = None) -> pd
         f"Provoke labels: coverage={has.mean():.1%} "
         f"mean wrongheaded={wh_s[has].mean() if has.any() else float('nan'):.3f} "
         f"infuriating={inf_s[has].mean() if has.any() else float('nan'):.3f}",
+        flush=True,
+    )
+    return out
+
+
+def add_stance_features(df: pd.DataFrame, cache_path: Path | None = None) -> pd.DataFrame:
+    """Join cached LM agree/disagree-vs-parent scores (text-only)."""
+    path = cache_path or (CACHE_DIR / "stance_cache.parquet")
+    if not path.exists():
+        # Fall back to any stance_cache_*.parquet (model-slugged default writes).
+        cands = sorted(CACHE_DIR.glob("stance_cache_*.parquet"))
+        if not cands:
+            raise SystemExit(
+                f"Missing {path}; run: uv run python label_stance.py --local --limit 500"
+            )
+        path = cands[-1]
+        print(f"Stance cache: using {path.name}", flush=True)
+    cache = pd.read_parquet(path)
+    cache["tweet_id"] = cache["tweet_id"].astype(str)
+    cache = cache.drop_duplicates("tweet_id", keep="last")
+    if "ok" in cache.columns:
+        cache = cache.loc[cache["ok"].fillna(0).astype(int) == 1]
+    ok = cache[["tweet_id", "agree", "disagree"]]
+    out = df.copy()
+    out["tweet_id"] = out["tweet_id"].astype(str)
+    merged = out[["tweet_id"]].merge(ok, on="tweet_id", how="left")
+    ag = merged["agree"].to_numpy(dtype=np.float64)
+    dg = merged["disagree"].to_numpy(dtype=np.float64)
+    has = np.isfinite(ag) & np.isfinite(dg)
+    ag_s = np.where(has, ag / 10.0, 0.0)
+    dg_s = np.where(has, dg / 10.0, 0.0)
+    out["stance_agree"] = ag_s.astype(np.float32)
+    out["stance_disagree"] = dg_s.astype(np.float32)
+    out["stance_net"] = (ag_s - dg_s).astype(np.float32)
+    out["stance_conflict"] = np.minimum(ag_s, dg_s).astype(np.float32)
+    out["has_stance"] = has.astype(np.int8)
+    print(
+        f"Stance labels: coverage={has.mean():.1%} "
+        f"mean agree={ag_s[has].mean() if has.any() else float('nan'):.3f} "
+        f"disagree={dg_s[has].mean() if has.any() else float('nan'):.3f} "
+        f"net={(ag_s - dg_s)[has].mean() if has.any() else float('nan'):.3f}",
         flush=True,
     )
     return out
@@ -3020,6 +3084,8 @@ def main() -> None:
         df = add_descriptive_text_features(df)
     if args.provoke_labels:
         df = add_provoke_features(df, cache_path=args.provoke_cache)
+    if args.stance_labels:
+        df = add_stance_features(df, cache_path=args.stance_cache)
 
     df = add_time_regime_features(df)
 
