@@ -22,8 +22,9 @@ Process retrospective (what moved the scoreboard vs what burned cycles): [`logs/
 |---|---|---:|---:|---:|---:|---|
 | **Default stack** | **v36c** | **0.249** | **0.276** | 0.569 | **0.602** | Hybrid + mentions + provenance features (`stream_x_log_age` #21 gain) |
 | Media types (opt-in) | v38b | **0.252** | 0.267 | **0.589** | 0.602 | `--media-types` after media refresh; +wa_nr/−wa_rp vs v38a — leave opt-in |
-| X parents (partial) | v39b | 0.247 | 0.276 | 0.578 | 0.600 | Same-rebuild vs v39a; 2861/26.7k X fills then credits 402 — **regress wa_***; leave `--x-parents` opt-in |
-| No-X parents control | v39a | **0.263** | **0.282** | **0.588** | **0.600** | Dump parents only on fresh full prepare (0% media; not vs v36c) |
+| X parents (near-complete) | v39c | 0.245 | **0.303** | 0.585 | **0.599** | vs v39a2: wa_rp +0.021 / wa_nr −0.018; among-reply parent 73%→97%; **default on** (validity) |
+| No-X parents control | v39a2 | **0.263** | 0.282 | **0.588** | 0.600 | Dump-only twin of v39c |
+| X parents (partial) | v39b | 0.247 | 0.276 | 0.578 | 0.600 | Early 402 at 2.9k/26.7k — superseded by v39c |
 | Prior (no provenance feats) | v36a / v35b | 0.225 / 0.242 | 0.251 / 0.266 | **0.593** / **0.579** | 0.602 / 0.605 | v36a = same-rebuild control (0% media); v35b had refreshed media |
 | Prior hybrid (no mentions) | v31b / v35a | 0.227 / 0.237 | 0.280 / 0.275 | 0.518 | 0.608 / 0.620 | v35a = same-rebuild control for v35b |
 | Level-only (ablation) | v31a | 0.187 | 0.172 | 0.508 | 0.610 | Asymmetric without hybrid blend |
@@ -117,16 +118,17 @@ Dump-time fav/RT used as author history → optimistic RMSE ~0.82 (v5). Invalid 
 
 Bugfix: custom asymmetric MSE ignored `Dataset` sample weights (LightGBM does not apply them to Python objectives). Pre-fix v37b matched control bit-for-bit despite n_affected>0. Fix is neutral when weights are uniform (default stack). `--nonreply-weight` under asymmetric was similarly inert before the fix.
 
-### v39 X parent fallback (same rebuild; partial fill)
+### v39 X parent fallback (same rebuild)
 
-Full prepare `--skip-media` (~110k rows / 934 accounts). X `GET /2/tweets` hit **HTTP 402 credits depleted** after 2,861 usable parents of ~26.7k dump-misses (~11% of gap; among-reply parent cov 73.4%→76.5%). Cache durable at 3,075 rows.
+Full prepare `--skip-media` (~110k / 934 accounts). Resumable X lookup; sanitize `?s=` junk so bad ids cannot 400 a batch.
 
-| Run | wa_nr | wa_rp | global_nr | rmse | Notes |
-|---|---:|---:|---:|---:|---|
-| v39a no-X | **0.263** | **0.282** | **0.588** | **0.600** | Dump parents only |
-| v39b partial-X | 0.247 | 0.276 | 0.578 | 0.600 | Regress on locked primaries |
+| Run | fill | wa_nr | wa_rp | global_nr | rmse | Notes |
+|---|---|---:|---:|---:|---:|---|
+| v39a / a2 no-X | dump | **0.263** | 0.282 | **0.588** | 0.600 | Control |
+| v39b partial-X | 2.9k/26.7k | 0.247 | 0.276 | 0.578 | 0.600 | Early 402; superseded |
+| **v39c near-X** | 22.8k ok (+0.9k forb / 0.8k nf; 2.3k pending) | 0.245 | **0.303** | 0.585 | **0.599** | among-reply 73%→97%, quote 70%→85% |
 
-**Verdict:** leave `--x-parents` **opt-in**. Re-ablate only after a complete fill (or a stratified smoke that the filled subset is not adverse selection — 402 may bias toward easier/earlier ids).
+**Verdict:** **default `--x-parents` on.** Reply within-author lifts; NR dips with flat guardrails — treat as removing CA missingness proxy more than “worse model.” Finish remaining ~2.3k when credits recover (`--parent-only`).
 
 ### v38 media types (same rebuild after `--media-only`)
 
@@ -178,7 +180,7 @@ Fair revisit of prior ablations after the metric lock. Control = asymmetric leve
 
 - High-engagement **non-replies** (viral under-prediction); often already-hot authors. Improved by SERA (v28b: mean under-pred 2.22→2.04) but still open.
 - **Media** / short+image posts — API refresh restores ~9% coverage (v18/v38a); binary-only refresh can regress wa_nr vs 0% media; type breakdown (v38b) recovers NR at reply cost — `--media-types` opt-in. Caption/vision still open.
-- **Quote** / reply parents missing from CA — X fallback resumable; **v39b partial fill regressed** wa_nr 0.263→0.247 (credits 402 with ~11% of misses filled). Revisit only after a complete-fill ablation.
+- **Quote** / reply parents missing from CA — X fallback near-complete (**v39c**): among-reply parent 73%→97%, quote 70%→85%; wa_rp↑ / wa_nr↓; keep default on. ~2.3k ids still pending 402.
 
 ---
 
@@ -220,7 +222,7 @@ Check off when tried; note outcome in one line.
 
 ### Graph / archive denser still
 - [x] Timestamped mention joins (via dump tweet join; `user_mentions` alone has no time) — **v35b: keep default**; vs same-rebuild wa_nr +0.006 / wa_rp −0.009 / rmse −0.015 / global_nr +0.061; `prepare.py --mentions-only`
-- [x] X API fallback for missing reply/quote parents — resumable `x_parent_cache.parquet` (batch flush; `--parent-only --x-parents` resumes after rate/credits); dump preferred over X; no X fav/RT. Smoke (5.5k): among-reply 80.5%→97.9%, among-quote 80.7%→99.4%. **v39a/b full-scale:** no-X wa_nr/wa_rp **0.263/0.282** vs partial-X **0.247/0.276** (2861/26.7k filled, then HTTP 402 credits depleted) — **do not promote**; `--x-parents` opt-in until complete-fill ablation.
+- [x] X API fallback for missing reply/quote parents — resumable `x_parent_cache.parquet` (batch flush; snowflake sanitize; no refetch of terminal statuses). **v39c near-complete:** cache 24,475 (22,793 ok / 914 forbidden / 768 not_found; ~2.3k pending 402); among-reply parent **73.4%→97.4%**, quote **70.4%→84.9%**; vs dump-only wa_nr 0.263→0.245, wa_rp 0.282→**0.303**, rmse/global flat — **default on** (`--no-x-parents` to ablate). Richer context preferred even when NR dips (likely CA-gap proxy removal).
 - [ ] Quote-of-quote / deeper parent chain (1–2 hops, still pre-T)
 - Note: CA `followers`/`following` are archive **snapshots** (no follow/unfollow event times) — not usable as pre-T graph history.
 

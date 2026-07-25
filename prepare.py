@@ -1908,7 +1908,7 @@ def attach_parent_context(
                 flush=True,
             )
     elif missing and not use_x:
-        print("  X parent fallback off (pass --x-parents to enable)", flush=True)
+        print("  X parent fallback off (--no-x-parents)", flush=True)
 
     if parents.empty:
         out = _empty_parent_feature_frame(out)
@@ -2296,14 +2296,15 @@ def parse_args() -> argparse.Namespace:
         "--parent-only",
         action="store_true",
         help="Only add reply/quote parent features onto an existing dataset.parquet "
-        "(with --x-parents, resumes x_parent_cache after rate/credits stops)",
+        "(resumes x_parent_cache after rate/credits stops; default --x-parents)",
     )
     p.add_argument(
         "--x-parents",
-        action="store_true",
-        help="Opt-in: fetch reply/quote parents missing from the CA dump via X API "
-        "(resumable x_parent_cache.parquet). v39b: partial fill regressed wa_*; leave off "
-        "until a complete-fill ablation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fetch reply/quote parents missing from the CA dump via X API "
+        "(resumable x_parent_cache.parquet; default on after v39c). "
+        "Use --no-x-parents for dump-only ablation",
     )
     p.add_argument(
         "--force-x-parents",
