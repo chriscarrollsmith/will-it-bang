@@ -21,6 +21,7 @@ Process retrospective (what moved the scoreboard vs what burned cycles): [`logs/
 | Objective | Run | wa_nr_wmean | wa_rp_wmean | global_nr | rmse_log | Notes |
 |---|---|---:|---:|---:|---:|---|
 | **Default stack** | **v36c** | **0.249** | **0.276** | 0.569 | **0.602** | Hybrid + mentions + provenance features (`stream_x_log_age` #21 gain) |
+| Media types (opt-in) | v38b | **0.252** | 0.267 | **0.589** | 0.602 | `--media-types` after media refresh; +wa_nr/−wa_rp vs v38a — leave opt-in |
 | Prior (no provenance feats) | v36a / v35b | 0.225 / 0.242 | 0.251 / 0.266 | **0.593** / **0.579** | 0.602 / 0.605 | v36a = same-rebuild control (0% media); v35b had refreshed media |
 | Prior hybrid (no mentions) | v31b / v35a | 0.227 / 0.237 | 0.280 / 0.275 | 0.518 | 0.608 / 0.620 | v35a = same-rebuild control for v35b |
 | Level-only (ablation) | v31a | 0.187 | 0.172 | 0.508 | 0.610 | Asymmetric without hybrid blend |
@@ -138,7 +139,7 @@ Fair revisit of prior ablations after the metric lock. Control = asymmetric leve
 ## Failure modes (still open)
 
 - High-engagement **non-replies** (viral under-prediction); often already-hot authors. Improved by SERA (v28b: mean under-pred 2.22→2.04) but still open.
-- **Media** / short+image posts — API refresh restored ~9% coverage (v18); binary flags still low gain vs interactions/`hist_frac_media`.
+- **Media** / short+image posts — API refresh restores ~9% coverage (v18/v38a); binary-only refresh can regress wa_nr vs 0% media; type breakdown (v38b) recovers NR at reply cost — `--media-types` opt-in. Caption/vision still open.
 - **Quote** tweets when parent missing from CA dump (~10% quote-parent coverage).
 
 ---
@@ -177,7 +178,7 @@ Check off when tried; note outcome in one line.
 ### Vision / media
 - [x] Full CA media/url API pass on the scaled set — **v18: tied rate RMSE** (0.642), Spearman 0.427→0.441; coverage 5%→9% media / 4%→7% ca_url (`prepare.py --media-only`)
 - [ ] Image caption or vision embedding for tweets with media URLs
-- [ ] Media-type breakdown (photo / gif / video) if available
+- [x] Media-type breakdown (photo / gif / video) — **v38b:** vs binary refresh wa_nr +0.018 / wa_rp −0.013; `photo_x_inbound_replies` mid-gain; leave `--media-types` **opt-in** (cache `media_cache.parquet`)
 
 ### Graph / archive denser still
 - [x] Timestamped mention joins (via dump tweet join; `user_mentions` alone has no time) — **v35b: keep default**; vs same-rebuild wa_nr +0.006 / wa_rp −0.009 / rmse −0.015 / global_nr +0.061; `prepare.py --mentions-only`
