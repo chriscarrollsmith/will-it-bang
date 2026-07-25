@@ -591,6 +591,38 @@ def _spearman(x: np.ndarray, y: np.ndarray) -> float:
     return float(corr)
 
 
+def _cv_ridge_spearman(
+    X: np.ndarray,
+    y: np.ndarray,
+    *,
+    folds: int = 5,
+    ridge: float = 1.0,
+    seed: int = 0,
+) -> float:
+    """Out-of-fold ridge probe Spearman (smoke diagnostic; not train TE)."""
+    n = len(y)
+    if n < 40 or X.ndim != 2 or X.shape[0] != n:
+        return float("nan")
+    rng = np.random.default_rng(seed)
+    idx = rng.permutation(n)
+    folds = int(min(folds, max(2, n // 20)))
+    oof = np.full(n, np.nan, dtype=np.float64)
+    for f in range(folds):
+        te = idx[f::folds]
+        tr = np.setdiff1d(idx, te, assume_unique=False)
+        if len(tr) < 10 or len(te) < 5:
+            continue
+        Xtr, ytr = X[tr], y[tr]
+        mu = Xtr.mean(axis=0, keepdims=True)
+        sd = Xtr.std(axis=0, keepdims=True) + 1e-8
+        Ztr = (Xtr - mu) / sd
+        Zte = (X[te] - mu) / sd
+        xtx = Ztr.T @ Ztr + float(ridge) * np.eye(Ztr.shape[1])
+        w = np.linalg.solve(xtx, Ztr.T @ ytr)
+        oof[te] = Zte @ w
+    return _spearman(oof, y)
+
+
 def evaluate(
     sample: pd.DataFrame,
     gemini: pd.DataFrame | None,
@@ -641,7 +673,7 @@ def evaluate(
                 "mean": float(np.nanmean(x)) if len(x) else float("nan"),
             }
         report["gemini"]["corr"] = corrs
-        # Simple linear combo of tags (standardized) for an upper-bound smoke signal.
+        # Linear combo of tags: report OOF CV (fair) and in-sample (upper bound).
         if ok.sum() >= 20:
             mats = []
             names = []
@@ -649,16 +681,18 @@ def evaluate(
                 x = pd.to_numeric(g.loc[ok, col], errors="coerce").to_numpy(dtype=np.float64)
                 if np.nanstd(x) < 1e-12:
                     continue
-                mats.append((x - np.nanmean(x)) / (np.nanstd(x) + 1e-8))
+                mats.append(x)
                 names.append(col)
             if mats:
                 X = np.column_stack(mats)
-                # ridge-ish closed form on smoke only (diagnostic, not leakage-safe TE)
-                xtx = X.T @ X + 1e-2 * np.eye(X.shape[1])
-                w = np.linalg.solve(xtx, X.T @ y)
-                pred = X @ w
-                report["gemini"]["linear_combo_spearman_rate"] = _spearman(pred, y)
                 report["gemini"]["linear_combo_features"] = names
+                report["gemini"]["cv_ridge_spearman_rate"] = _cv_ridge_spearman(X, y, ridge=1.0)
+                mu = X.mean(axis=0, keepdims=True)
+                sd = X.std(axis=0, keepdims=True) + 1e-8
+                Z = (X - mu) / sd
+                xtx = Z.T @ Z + 1.0 * np.eye(Z.shape[1])
+                w = np.linalg.solve(xtx, Z.T @ y)
+                report["gemini"]["insample_ridge_spearman_rate"] = _spearman(Z @ w, y)
 
     if siglip is not None and len(siglip):
         emb_cols = sorted(
@@ -680,11 +714,14 @@ def evaluate(
             _, _, vt = np.linalg.svd(E0, full_matrices=False)
             pc1 = E0 @ vt[0]
             report["siglip"]["pc1_spearman_rate"] = _spearman(pc1, y)
-            # Supervised linear probe on smoke (diagnostic upper bound).
-            xtx = E.T @ E + 1e-2 * np.eye(E.shape[1])
-            w = np.linalg.solve(xtx, E.T @ y)
-            pred = E @ w
-            report["siglip"]["linear_probe_spearman_rate"] = _spearman(pred, y)
+            report["siglip"]["cv_ridge_spearman_rate"] = _cv_ridge_spearman(E, y, ridge=10.0)
+            # PCA-8 then CV ridge — closer to how we'd actually train-fit.
+            k = int(min(8, E.shape[0] - 1, E.shape[1]))
+            _, _, vt8 = np.linalg.svd(E0, full_matrices=False)
+            Z8 = E0 @ vt8[:k].T
+            report["siglip"]["cv_pca8_ridge_spearman_rate"] = _cv_ridge_spearman(
+                Z8, y, ridge=1.0
+            )
             dim_corrs = [_spearman(E[:, j], y) for j in range(E.shape[1])]
             report["siglip"]["best_dim_spearman_rate"] = float(
                 dim_corrs[int(np.nanargmax(np.abs(dim_corrs)))]
@@ -711,7 +748,8 @@ def write_report(report: dict, path: Path = SMOKE_REPORT) -> None:
         lines += [
             f"- ok/coverage: {g.get('n_ok')} / {g.get('coverage', float('nan')):.1%}",
             f"- est_cost_usd (this run tokens): {g.get('est_cost_usd', float('nan')):.3f}",
-            f"- linear combo spearman(rate): {g.get('linear_combo_spearman_rate', float('nan')):.4f}",
+            f"- **cv ridge spearman(rate): {g.get('cv_ridge_spearman_rate', float('nan')):.4f}**",
+            f"- in-sample ridge spearman(rate): {g.get('insample_ridge_spearman_rate', float('nan')):.4f}",
             "",
             "| feature | spearman(rate) | spearman(log_eng) | mean |",
             "|---|---:|---:|---:|",
@@ -733,7 +771,8 @@ def write_report(report: dict, path: Path = SMOKE_REPORT) -> None:
             f"- dims: {s.get('dims')}",
             f"- pc1 spearman(rate): {s.get('pc1_spearman_rate', float('nan')):.4f}",
             f"- best dim spearman(rate): {s.get('best_dim_spearman_rate', float('nan')):.4f}",
-            f"- linear probe spearman(rate): {s.get('linear_probe_spearman_rate', float('nan')):.4f}",
+            f"- **cv ridge spearman(rate): {s.get('cv_ridge_spearman_rate', float('nan')):.4f}**",
+            f"- cv PCA-8 ridge spearman(rate): {s.get('cv_pca8_ridge_spearman_rate', float('nan')):.4f}",
         ]
     else:
         lines.append("- skipped")
@@ -741,10 +780,11 @@ def write_report(report: dict, path: Path = SMOKE_REPORT) -> None:
         "",
         "## Read",
         "",
-        "- Correlations are in-sample diagnostics on the smoke set (not val `wa_*`).",
-        "- Prefer SigLIP if its linear probe ≥ Gemini linear combo; use Gemini only if "
-        "OCR/structure tags (esp. `has_text_in_image` / screenshot/meme) clearly add signal.",
-        "- Full-corpus spend (~10k media) only after this smoke clears a coverage×corr gate.",
+        "- Primary smoke metric is **5-fold CV ridge Spearman vs exposure rate** (not val `wa_*`).",
+        "- In-sample probes with dim ≫ n are ignored (overfit).",
+        "- Prefer SigLIP if its CV probe ≥ Gemini CV combo; pay for Gemini only if "
+        "OCR/structure tags clearly add complementary signal.",
+        "- Full-corpus spend (~10k media) only after CV corr clears ~0.10+ with decent coverage.",
         "",
         "```json",
         json.dumps(report, indent=2, default=float),
@@ -764,11 +804,16 @@ def main() -> None:
     p.add_argument("--force-gemini", action="store_true")
     p.add_argument("--force-siglip", action="store_true")
     p.add_argument("--reuse-sample", action="store_true")
+    p.add_argument(
+        "--eval-only",
+        action="store_true",
+        help="Re-score from existing sample + caches (no Gemini/SigLIP calls)",
+    )
     p.add_argument("--siglip-batch-size", type=int, default=16)
     args = p.parse_args()
 
     _load_dotenv()
-    if args.reuse_sample and SMOKE_SAMPLE.exists():
+    if (args.reuse_sample or args.eval_only) and SMOKE_SAMPLE.exists():
         sample = pd.read_parquet(SMOKE_SAMPLE)
         sample["tweet_id"] = sample["tweet_id"].astype(str)
         print(f"Reusing sample {SMOKE_SAMPLE} ({len(sample):,})", flush=True)
@@ -781,12 +826,16 @@ def main() -> None:
 
     gemini = None
     siglip = None
-    if not args.skip_gemini:
-        gemini = label_gemini(sample, force=args.force_gemini)
-    if not args.skip_siglip:
-        siglip = embed_siglip(
-            sample, force=args.force_siglip, batch_size=args.siglip_batch_size
-        )
+    if args.eval_only:
+        gemini = None if args.skip_gemini else _read_cache(GEMINI_CACHE)
+        siglip = None if args.skip_siglip else _read_cache(SIGLIP_CACHE)
+    else:
+        if not args.skip_gemini:
+            gemini = label_gemini(sample, force=args.force_gemini)
+        if not args.skip_siglip:
+            siglip = embed_siglip(
+                sample, force=args.force_siglip, batch_size=args.siglip_batch_size
+            )
 
     report = evaluate(sample, gemini, siglip)
     write_report(report)

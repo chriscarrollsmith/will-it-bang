@@ -181,7 +181,7 @@ Fair revisit of prior ablations after the metric lock. Control = asymmetric leve
 ## Failure modes (still open)
 
 - High-engagement **non-replies** (viral under-prediction); often already-hot authors. Improved by SERA (v28b: mean under-pred 2.22→2.04) but still open.
-- **Media** / short+image posts — API refresh restores ~9% coverage (v18/v38a); binary-only refresh can regress wa_nr vs 0% media; type breakdown (v38b) recovers NR at reply cost — `--media-types` opt-in. Caption/vision still open.
+- **Media** / short+image posts — API refresh restores ~9% coverage (v18/v38a); binary-only refresh can regress wa_nr vs 0% media; type breakdown (v38b) recovers NR at reply cost — `--media-types` opt-in. Vision smoke: Gemini tags fail CV gate; SigLIP PCA-8 marginal — no full Gemini spend.
 - **Quote** / reply parents missing from CA — X fallback **complete** (**v39d**): among-reply 73%→97%, quote 70%→99%; wa_rp +0.006 / wa_nr −0.009 / rmse flat; keep default on.
 
 ---
@@ -219,7 +219,7 @@ Check off when tried; note outcome in one line.
 
 ### Vision / media
 - [x] Full CA media/url API pass on the scaled set — **v18: tied rate RMSE** (0.642), Spearman 0.427→0.441; coverage 5%→9% media / 4%→7% ca_url (`prepare.py --media-only`)
-- [ ] Image caption or vision embedding for tweets with media URLs
+- [x] Image caption / vision emb smoke — **`uv run vision_smoke.py --limit 500`** (`logs/vision_smoke.md`): download 88%; Gemini+SigLIP coverage 92%; cost ~$0.83. Gemini tag CV ridge spearman(rate) **0.028** (best singles controversy/realworld ~0.09); SigLIP CV ridge 0.067 / PCA-8 **0.101**. **Do not full-spend Gemini** (fails coverage×corr gate); SigLIP PCA emb is a marginal opt-in backlog item, not a promote.
 - [x] Media-type breakdown (photo / gif / video) — **v38b:** vs binary refresh wa_nr +0.018 / wa_rp −0.013; `photo_x_inbound_replies` mid-gain; leave `--media-types` **opt-in** (cache `media_cache.parquet`)
 
 ### Graph / archive denser still
