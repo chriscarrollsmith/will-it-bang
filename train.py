@@ -232,6 +232,19 @@ AFFINITY_FEATURES = [
     "author_emb_l2_30d",
 ]
 
+# Pre-T inbound interlocutor MiniLM affinity (--interlocutor-emb-affinity).
+INTERLOCUTOR_FEATURES = [
+    "interlocutor_emb_cos",
+    "interlocutor_emb_l2",
+    "interlocutor_emb_cos_sq",
+    "interlocutor_sweet_dist",
+    "interlocutor_log_n",
+    "interlocutor_has",
+    "interlocutor_emb_cos_30d",
+    "interlocutor_log_n_30d",
+    "interlocutor_n_partners",
+]
+
 # TE × own-corpus novelty (needs affinity + account TE columns).
 BREAKOUT_FEATURES = [
     "author_emb_novelty",
@@ -257,6 +270,7 @@ def feature_matrix(df: pd.DataFrame, skip_embeddings: bool) -> tuple[np.ndarray,
         c
         for c in (
             AFFINITY_FEATURES
+            + INTERLOCUTOR_FEATURES
             + BREAKOUT_FEATURES
             + DESCRIPTIVE_TEXT_FEATURES
             + URL_DOMAIN_FEATURES
@@ -1396,6 +1410,29 @@ def parse_args() -> argparse.Namespace:
         help="Add pre-T mean-author MiniLM cosine/L2 features (flat in v10; off by default)",
     )
     p.add_argument(
+        "--interlocutor-emb-affinity",
+        action="store_true",
+        help="Add pre-T inbound interlocutor MiniLM affinity (reply/quote texts to "
+        "the author by default; sweet-spot + 30d). Builds interlocutor_cache via "
+        "prepare helpers; off by default until promoted",
+    )
+    p.add_argument(
+        "--force-interlocutor",
+        action="store_true",
+        help="With --interlocutor-emb-affinity, rescan dump interlocutor events",
+    )
+    p.add_argument(
+        "--interlocutor-include-mentions",
+        action="store_true",
+        help="Pool inbound @-mention tweets into interlocutor affinity (off by default)",
+    )
+    p.add_argument(
+        "--interlocutor-sweet-cos",
+        type=float,
+        default=0.5,
+        help="Target cosine for interlocutor_sweet_dist = (cos - sweet)^2",
+    )
+    p.add_argument(
         "--descriptive-text",
         action="store_true",
         help="Add VADER sentiment + first-person ratio (v15: flat rate RMSE; off by default)",
@@ -2003,6 +2040,137 @@ def add_author_emb_affinity(df: pd.DataFrame) -> pd.DataFrame:
     print(
         f"Author emb affinity: mean cos={cos_all.mean():.3f}, "
         f"mean cos_30d={cos_30.mean():.3f}"
+    )
+    return out
+
+
+def add_interlocutor_emb_affinity(
+    df: pd.DataFrame,
+    *,
+    force: bool = False,
+    include_mentions: bool = False,
+    sweet_cos: float = 0.5,
+    embed_batch_size: int = 256,
+) -> pd.DataFrame:
+    """Cosine / L2 vs mean of pre-T inbound interlocutor MiniLM vectors.
+
+    Interlocutor texts are reply/quote tweets directed at the author (dump),
+    optionally mentions. Includes quadratic and distance-to-sweet-spot terms
+    for a non-linear audience-fit effect.
+    """
+    emb_cols = [c for c in df.columns if re.fullmatch(r"emb_\d+", c)]
+    if not emb_cols:
+        print("Skipping interlocutor emb affinity (no emb_* columns)")
+        return df
+    emb_cols = sorted(emb_cols, key=lambda c: int(c.split("_", 1)[1]))
+
+    # Local import keeps prepare's heavy deps out of the default train path.
+    from prepare import ensure_interlocutor_embeddings, load_interlocutor_events
+
+    events = load_interlocutor_events(
+        df["account_id"],
+        force=force,
+        include_mentions=include_mentions,
+    )
+    if events.empty:
+        print("Interlocutor emb affinity: no inbound events; features left at 0")
+        out = df.copy()
+        for c in INTERLOCUTOR_FEATURES:
+            out[c] = 0.0
+        return out
+    events = ensure_interlocutor_embeddings(events, batch_size=embed_batch_size)
+    evt_emb_cols = [c for c in events.columns if c.startswith("emb_")]
+    evt_emb_cols = sorted(evt_emb_cols, key=lambda c: int(c.split("_", 1)[1]))
+    if len(evt_emb_cols) != len(emb_cols):
+        raise SystemExit(
+            f"Interlocutor emb dim mismatch: events={len(evt_emb_cols)} dataset={len(emb_cols)}"
+        )
+
+    out = df.reset_index(drop=True).copy()
+    out["created_at"] = pd.to_datetime(out["created_at"], utc=True)
+    tweet_emb = out[emb_cols].to_numpy(dtype=np.float64)
+    n = len(out)
+    cos_all = np.zeros(n, dtype=np.float64)
+    l2_all = np.zeros(n, dtype=np.float64)
+    cos_30 = np.zeros(n, dtype=np.float64)
+    log_n = np.zeros(n, dtype=np.float64)
+    log_n_30 = np.zeros(n, dtype=np.float64)
+    n_partners = np.zeros(n, dtype=np.float64)
+    has = np.zeros(n, dtype=np.float64)
+
+    events = events.sort_values(["ego_account_id", "created_at"], kind="mergesort")
+    evt_by_ego: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    for ego, g in events.groupby("ego_account_id", sort=False):
+        evt_by_ego[str(ego)] = (
+            g["created_at"].to_numpy(dtype="datetime64[ns]"),
+            g[evt_emb_cols].to_numpy(dtype=np.float64),
+            g["partner_account_id"].astype(str).to_numpy(),
+        )
+
+    for aid, g in out.groupby("account_id", sort=False):
+        g = g.sort_values("created_at", kind="mergesort")
+        ix = g.index.to_numpy()
+        times = g["created_at"].to_numpy(dtype="datetime64[ns]")
+        pack = evt_by_ego.get(str(aid))
+        if pack is None:
+            continue
+        etimes, evecs, epartners = pack
+        if len(etimes) == 0:
+            continue
+        ecum = np.cumsum(evecs, axis=0)
+        # Partner first-seen times for leakage-safe partner counts.
+        first_partner: dict[str, np.datetime64] = {}
+        for t, p in zip(etimes, epartners, strict=True):
+            if p not in first_partner:
+                first_partner[p] = t
+        partner_items = sorted(first_partner.items(), key=lambda kv: kv[1])
+        partner_times = np.array([t for _, t in partner_items], dtype="datetime64[ns]")
+
+        for k, row_i in enumerate(ix):
+            cut = times[k]
+            n_evt = int(np.searchsorted(etimes, cut, side="left"))
+            if n_evt <= 0:
+                continue
+            mean = ecum[n_evt - 1] / n_evt
+            v = tweet_emb[row_i]
+            mean_n = np.linalg.norm(mean)
+            v_n = np.linalg.norm(v)
+            if mean_n > 1e-12 and v_n > 1e-12:
+                cos_all[row_i] = float(np.dot(mean, v) / (mean_n * v_n))
+            l2_all[row_i] = float(np.linalg.norm(v - mean))
+            log_n[row_i] = float(np.log1p(n_evt))
+            has[row_i] = 1.0
+            n_partners[row_i] = float(np.log1p(int(np.searchsorted(partner_times, cut, side="left"))))
+
+            start = cut - np.timedelta64(30, "D")
+            left = int(np.searchsorted(etimes[:n_evt], start, side="left"))
+            n_win = n_evt - left
+            if n_win <= 0:
+                continue
+            mean_w = (ecum[n_evt - 1] - (ecum[left - 1] if left > 0 else 0.0)) / n_win
+            mean_wn = np.linalg.norm(mean_w)
+            if mean_wn > 1e-12 and v_n > 1e-12:
+                cos_30[row_i] = float(np.dot(mean_w, v) / (mean_wn * v_n))
+            log_n_30[row_i] = float(np.log1p(n_win))
+
+    sweet = float(sweet_cos)
+    out["interlocutor_emb_cos"] = cos_all.astype(np.float32)
+    out["interlocutor_emb_l2"] = l2_all.astype(np.float32)
+    out["interlocutor_emb_cos_sq"] = (cos_all * cos_all).astype(np.float32)
+    out["interlocutor_sweet_dist"] = ((cos_all - sweet) ** 2).astype(np.float32)
+    out["interlocutor_log_n"] = log_n.astype(np.float32)
+    out["interlocutor_has"] = has.astype(np.float32)
+    out["interlocutor_emb_cos_30d"] = cos_30.astype(np.float32)
+    out["interlocutor_log_n_30d"] = log_n_30.astype(np.float32)
+    out["interlocutor_n_partners"] = n_partners.astype(np.float32)
+
+    covered = has.mean()
+    covered_cos = cos_all[has > 0]
+    print(
+        f"Interlocutor emb affinity: row coverage={covered:.1%}, "
+        f"mean cos={covered_cos.mean() if len(covered_cos) else 0.0:.3f}, "
+        f"sweet={sweet:g}",
+        flush=True,
     )
     return out
 
@@ -2795,6 +2963,14 @@ def main() -> None:
     if args.author_emb_affinity:
         # Affinity on raw MiniLM before train-fit PCA replaces emb_*.
         df = add_author_emb_affinity(df)
+    if args.interlocutor_emb_affinity:
+        # Same raw-MiniLM timing as author affinity (before emb PCA).
+        df = add_interlocutor_emb_affinity(
+            df,
+            force=args.force_interlocutor,
+            include_mentions=args.interlocutor_include_mentions,
+            sweet_cos=args.interlocutor_sweet_cos,
+        )
     if args.descriptive_text:
         df = add_descriptive_text_features(df)
     if args.provoke_labels:

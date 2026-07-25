@@ -240,7 +240,7 @@ Mostly helps replies (not the main under-prediction bucket); still cheap if pare
 ### Standalone / author–audience corpus affinity
 Limited by CA completeness; affinity to own history was flat as coarse v10 mean.
 - [x] Richer own-corpus similarity × account TE (novelty, te_x_novelty, 30d, nonreply) — **v21: flat** (0.609 vs 0.607); **v32 rescore:** still worse on wa_* — leave `--author-emb-affinity` off
-- [ ] Similarity to corpus of users who previously interacted with you (pre-T reply/mention partners’ mean MiniLM): expect non-linear “not too similar, not too foreign” effect (include quadratic / distance-to-sweet-spot features)
+- [x] Similarity to corpus of users who previously interacted with you (pre-T reply/quote interlocutor MiniLM): **v40 smoke** — reply/quote pool row coverage ~98%; NR spearman(cos, rate)≈0.02 / sweet_dist≈0 (fails content gate); `log_n` / partner counts pierce but overlap inbound graph volume. Mentions drown the pool (120k/138k) and duplicate `inbound_mentions` — default off. Within-sample partner-corpus mean only ~6% coverage on small set. Harness: `prepare.py --interlocutor-only` + `train.py --interlocutor-emb-affinity` (opt-in; do not promote without a new angle)
 
 ### Embedding discovery (vs arbitrary LM tags)
 Discover engagement-related structure in MiniLM (or a larger frozen encoder) from the *data*, not hand-picked labels. Fit only on the train time fold; apply to val. Contrast with v15–v17b descriptive tags and with unsupervised emb PCA (already in the stack).
