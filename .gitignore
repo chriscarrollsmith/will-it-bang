@@ -13,6 +13,7 @@ wheels/
 results.tsv
 *.parquet
 !.cache/
+.env
 logs/*.log
 logs/rescore_within_account/
 logs/v33_sera/
