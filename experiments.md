@@ -207,7 +207,7 @@ Check off when tried; note outcome in one line.
 
 ### Graph / archive denser still
 - [x] Timestamped mention joins (via dump tweet join; `user_mentions` alone has no time) — **v35b: keep default**; vs same-rebuild wa_nr +0.006 / wa_rp −0.009 / rmse −0.015 / global_nr +0.061; `prepare.py --mentions-only`
-- [x] X API fallback for missing reply/quote parents — resumable `x_parent_cache.parquet` (batch flush; `--parent-only` resumes after rate/credits); dump preferred over X; no X fav/RT. Scoreboard ablation still open.
+- [x] X API fallback for missing reply/quote parents — resumable `x_parent_cache.parquet` (batch flush; `--parent-only` resumes after rate/credits); dump preferred over X; no X fav/RT. Smoke (5.5k-row cache): among-reply parent cov 80.5%→**97.9%**, among-quote 80.7%→**99.4%** (915/975 X ok; 37 forbidden / 23 not_found); second `--parent-only` fetched 0. Scoreboard ablation still open.
 - [ ] Quote-of-quote / deeper parent chain (1–2 hops, still pre-T)
 - Note: CA `followers`/`following` are archive **snapshots** (no follow/unfollow event times) — not usable as pre-T graph history.
 
