@@ -98,8 +98,14 @@ TABULAR_FEATURES = [
     "inbound_quotes_7d",
     "inbound_quotes_30d",
     "inbound_quotes_per_tweet",
+    "inbound_mentions",
+    "inbound_mentions_7d",
+    "inbound_mentions_30d",
+    "inbound_mentions_per_tweet",
     "media_x_inbound_replies",
     "reply_x_inbound_replies",
+    "media_x_inbound_mentions",
+    "reply_x_inbound_mentions",
     "has_reply_parent",
     "reply_parent_emb_cos",
     "reply_parent_log_text_len",
@@ -125,6 +131,16 @@ TABULAR_FEATURES = [
     "era_pre_musk",
     "era_musk_early",
     "era_musk_late",
+]
+
+# Opt-in CA provenance / upload-regime features (--provenance-features).
+PROVENANCE_FEATURES = [
+    "is_stream",
+    "has_upload_end",
+    "hours_since_upload_end",
+    "log_hours_since_upload_end",
+    "stream_x_log_age",
+    "stream_x_inbound_replies",
 ]
 
 # Opt-in descriptive text tags (--descriptive-text); flat on rate RMSE in v15.
@@ -184,11 +200,6 @@ EMB_CAV_FEATURES = [
     "emb_cav_proj_sq",
 ]
 
-# FWL residual emb after regressing MiniLM on account TE (`--emb-residual-pls`).
-EMB_RESIDUAL_FEATURES = [
-    "emb_res_l2",
-]
-
 # Train-fold MiniLM k-means cluster target encoding (content neighborhoods).
 EMB_CLUSTER_TE_FEATURES = [
     "cluster_mean_rate",
@@ -218,6 +229,11 @@ BREAKOUT_FEATURES = [
 
 
 def feature_matrix(df: pd.DataFrame, skip_embeddings: bool) -> tuple[np.ndarray, list[str]]:
+    # Provenance raw cols (is_stream, …) live on the dataset for holdout/analyze;
+    # only include them when --provenance-features has built the derived marker col.
+    provenance_cols = (
+        PROVENANCE_FEATURES if "log_hours_since_upload_end" in df.columns else []
+    )
     extra = [
         c
         for c in (
@@ -230,6 +246,7 @@ def feature_matrix(df: pd.DataFrame, skip_embeddings: bool) -> tuple[np.ndarray,
             + EMB_KNN_TE_FEATURES
             + EMB_CAV_FEATURES
             + EMB_CLUSTER_TE_FEATURES
+            + provenance_cols
         )
         if c in df.columns
     ]
@@ -250,13 +267,6 @@ def feature_matrix(df: pd.DataFrame, skip_embeddings: bool) -> tuple[np.ndarray,
     if pls_cols:
         pls_cols = sorted(pls_cols, key=lambda c: int(c.split("_", 1)[1]))
         cols = cols + pls_cols
-    res_pls_cols = [c for c in df.columns if re.fullmatch(r"res_pls_\d+", c)]
-    if res_pls_cols:
-        res_pls_cols = sorted(res_pls_cols, key=lambda c: int(c.rsplit("_", 1)[1]))
-        cols = cols + res_pls_cols
-    for c in EMB_RESIDUAL_FEATURES:
-        if c in df.columns and c not in cols:
-            cols = cols + [c]
     fail_cols = [c for c in df.columns if c == "fail_min_dist" or re.fullmatch(r"fail_dist_\d+", c)]
     if fail_cols:
         fail_cols = sorted(
@@ -287,7 +297,174 @@ def time_split(df: pd.DataFrame, val_frac: float) -> tuple[pd.DataFrame, pd.Data
         f"val={val['account_id'].nunique():,} "
         f"overlap={len(set(train['account_id']) & set(val['account_id'])):,}"
     )
+    if "is_stream" in train.columns:
+        print(
+            f"Provenance: train stream={train['is_stream'].mean():.1%} "
+            f"val stream={val['is_stream'].mean():.1%}",
+            flush=True,
+        )
     return train, val
+
+
+def prior_upload_hist_counts(df: pd.DataFrame) -> np.ndarray:
+    """Per-row count of earlier upload-linked tweets by the same account (pre-T)."""
+    if "is_stream" not in df.columns:
+        return np.zeros(len(df), dtype=np.int32)
+    ordered = df.sort_values(["account_id", "created_at"], kind="mergesort")
+    is_upload = (ordered["is_stream"].to_numpy() == 0).astype(np.int32)
+    # Cumsum within account, then subtract current row ⇒ strictly earlier uploads.
+    prior = (
+        pd.Series(is_upload, index=ordered.index)
+        .groupby(ordered["account_id"], sort=False)
+        .cumsum()
+        .to_numpy(dtype=np.int32)
+        - is_upload
+    )
+    out = np.zeros(len(df), dtype=np.int32)
+    out[ordered.index.to_numpy()] = prior
+    return out
+
+
+def apply_holdout_policy(
+    df: pd.DataFrame,
+    *,
+    policy: str,
+    min_upload_hist: int = 0,
+) -> pd.DataFrame:
+    """Filter rows before the global time split by CA ingestion regime.
+
+    Policies:
+      time         — no regime filter (default global time holdout)
+      upload_era   — cap at the latest upload-linked created_at (drop pure-stream tail)
+      stream_only  — keep only browser-extension stream rows (null archive_upload_id)
+    """
+    out = df.copy()
+    if policy not in {"time", "upload_era", "stream_only"}:
+        raise SystemExit(f"Unknown holdout policy: {policy}")
+    if policy != "time" or min_upload_hist > 0:
+        if "is_stream" not in out.columns:
+            raise SystemExit(
+                "Holdout policy requires is_stream; run: uv run prepare.py --provenance-only"
+            )
+
+    if min_upload_hist > 0:
+        prior = prior_upload_hist_counts(out)
+        keep = prior >= int(min_upload_hist)
+        print(
+            f"min_upload_hist={min_upload_hist}: kept {int(keep.sum()):,}/{len(out):,} "
+            f"(mean prior upload-linked={float(prior.mean()):.2f})",
+            flush=True,
+        )
+        out = out.loc[keep].reset_index(drop=True)
+
+    if policy == "upload_era":
+        upload_times = out.loc[out["is_stream"].to_numpy() == 0, "created_at"]
+        if upload_times.empty:
+            raise SystemExit("upload_era holdout: no upload-linked rows in dataset")
+        cap = upload_times.max()
+        before = len(out)
+        out = out.loc[out["created_at"] <= cap].reset_index(drop=True)
+        print(
+            f"Holdout policy=upload_era: cap created_at≤{cap} "
+            f"kept {len(out):,}/{before:,} "
+            f"(stream after filter={out['is_stream'].mean():.1%})",
+            flush=True,
+        )
+    elif policy == "stream_only":
+        before = len(out)
+        out = out.loc[out["is_stream"].to_numpy() == 1].reset_index(drop=True)
+        print(
+            f"Holdout policy=stream_only: kept {len(out):,}/{before:,} stream rows",
+            flush=True,
+        )
+    else:
+        print("Holdout policy=time (global time split, no regime filter)", flush=True)
+
+    if len(out) < 50:
+        raise SystemExit(f"Holdout policy left only {len(out)} rows; need a denser dataset")
+    return out
+
+
+def add_provenance_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Build opt-in is_stream / upload-end features + light interactions."""
+    if "is_stream" not in df.columns:
+        raise SystemExit(
+            "Missing is_stream; run: uv run prepare.py --provenance-only"
+        )
+    out = df.copy()
+    out["is_stream"] = out["is_stream"].fillna(0).astype(np.int8)
+    if "has_upload_end" not in out.columns:
+        out["has_upload_end"] = np.int8(0)
+    if "hours_since_upload_end" not in out.columns:
+        out["hours_since_upload_end"] = np.float32(0.0)
+    hours = out["hours_since_upload_end"].to_numpy(dtype=np.float64)
+    # log1p of non-negative hours; negative ⇒ still inside prior archive coverage window.
+    out["log_hours_since_upload_end"] = np.log1p(np.clip(hours, 0.0, None)).astype(np.float32)
+    if "exposure_age_days" in out.columns:
+        age = out["exposure_age_days"].to_numpy(dtype=np.float64)
+    else:
+        # Fallback: age vs dataset max (same dump-time proxy as exposure rate).
+        dump_time = pd.Timestamp(out["created_at"].max())
+        age = (dump_time - pd.to_datetime(out["created_at"], utc=True)).dt.total_seconds().to_numpy()
+        age = np.clip(age / 86400.0, 0.0, None)
+    out["stream_x_log_age"] = (
+        out["is_stream"].to_numpy(dtype=np.float64) * np.log1p(age)
+    ).astype(np.float32)
+    if "inbound_replies" in out.columns:
+        out["stream_x_inbound_replies"] = (
+            out["is_stream"].to_numpy(dtype=np.float64)
+            * out["inbound_replies"].to_numpy(dtype=np.float64)
+        ).astype(np.float32)
+    else:
+        out["stream_x_inbound_replies"] = np.float32(0.0)
+    print(
+        f"Provenance features: stream={out['is_stream'].mean():.1%} "
+        f"has_upload_end={out['has_upload_end'].mean():.1%}",
+        flush=True,
+    )
+    return out
+
+
+def stream_fresh_sample_weights(
+    train_df: pd.DataFrame,
+    base_weights: np.ndarray,
+    *,
+    fresh_days: float,
+    floor: float = 0.25,
+) -> np.ndarray:
+    """Down-weight very fresh stream rows (as-observed eng; maturity still uncertain)."""
+    w = np.asarray(base_weights, dtype=np.float64).copy()
+    if fresh_days <= 0 or "is_stream" not in train_df.columns:
+        return w
+    if "exposure_age_days" in train_df.columns:
+        age = train_df["exposure_age_days"].to_numpy(dtype=np.float64)
+    else:
+        dump_time = pd.Timestamp(train_df["created_at"].max())
+        age = (
+            dump_time - pd.to_datetime(train_df["created_at"], utc=True)
+        ).dt.total_seconds().to_numpy() / 86400.0
+        age = np.clip(age, 0.0, None)
+    stream = train_df["is_stream"].to_numpy() == 1
+    # Linear ramp: age=0 → floor, age≥fresh_days → 1.
+    ramp = np.clip(age / float(fresh_days), 0.0, 1.0)
+    mult = floor + (1.0 - floor) * ramp
+    w[stream] *= mult[stream]
+    n_affected = int((stream & (mult < 1.0 - 1e-12)).sum())
+    print(
+        f"Stream-fresh weights: days={fresh_days:g} floor={floor:g} "
+        f"n_stream={int(stream.sum()):,} n_affected={n_affected:,} "
+        f"mean_mult={float(mult[stream].mean()) if stream.any() else 1.0:.3f} "
+        f"train_age_min={float(age.min()):.1f}d",
+        flush=True,
+    )
+    if stream.any() and n_affected == 0:
+        print(
+            "Warning: stream-fresh affected 0 train rows — under a time holdout, "
+            "train ages are ≥ the val-window span; raise --stream-fresh-days "
+            f"(need >~{float(age.min()):.0f}d here) or the knob is a no-op",
+            flush=True,
+        )
+    return w
 
 
 def evaluate(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
@@ -732,9 +909,16 @@ def train_model(
         under_w = float(asymmetric_under_weight)
 
         def asymmetric_mse(y_pred: np.ndarray, dataset: lgb.Dataset):
+            # Custom objectives must apply Dataset weights themselves (LightGBM
+            # does not multiply them into grad/hess for Python objectives).
             y_true = dataset.get_label()
+            sw = dataset.get_weight()
+            if sw is None:
+                sw = np.ones_like(y_true, dtype=np.float64)
+            else:
+                sw = np.asarray(sw, dtype=np.float64)
             resid = y_true - y_pred
-            w = np.where(resid > 0.0, under_w, 1.0)
+            w = np.where(resid > 0.0, under_w, 1.0) * sw
             grad = -2.0 * w * resid
             hess = 2.0 * w
             return grad, hess
@@ -1087,6 +1271,40 @@ def parse_args() -> argparse.Namespace:
         help="Optional row cap after time-sort (smoke tests); 0 = full dataset",
     )
     p.add_argument(
+        "--holdout-policy",
+        choices=("time", "upload_era", "stream_only"),
+        default="time",
+        help="Regime filter before the global time split: upload_era caps at the "
+        "latest upload-linked tweet; stream_only trains/evals on extension rows only",
+    )
+    p.add_argument(
+        "--min-upload-hist",
+        type=int,
+        default=0,
+        help="Drop rows whose author has fewer than N prior upload-linked tweets (0=off)",
+    )
+    p.add_argument(
+        "--provenance-features",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Add is_stream / upload-end / provenance×age features (default on; "
+        "v36c: +wa_nr/+wa_rp vs same-rebuild; --no-provenance-features to ablate)",
+    )
+    p.add_argument(
+        "--stream-fresh-days",
+        type=float,
+        default=0.0,
+        help="Down-weight stream rows with dump-age < this many days (0=off); "
+        "linear ramp from --stream-fresh-floor to 1.0. Under a time holdout, "
+        "must exceed the val-window age span or no train rows are affected",
+    )
+    p.add_argument(
+        "--stream-fresh-floor",
+        type=float,
+        default=0.25,
+        help="Minimum sample-weight multiplier for brand-new stream rows",
+    )
+    p.add_argument(
         "--residual",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -1277,19 +1495,6 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Train-fold PLS of raw MiniLM→target; add this many pls_* dims "
         "(fit before emb PCA; 0 disables). Use with --emb-pca 0 to replace variance PCA",
-    )
-    p.add_argument(
-        "--emb-residual-pls",
-        type=int,
-        default=0,
-        help="FWL: residualize MiniLM on account_mean_rate, PLS→(y−TE); add res_pls_* "
-        "+ emb_res_l2 (fit before emb PCA; 0 disables; needs --account-te)",
-    )
-    p.add_argument(
-        "--emb-residual-pls-nonreply-only",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Fit residual PLS on non-replies only (default off; still score all rows)",
     )
     p.add_argument(
         "--fail-clusters",
@@ -1999,115 +2204,6 @@ def add_emb_pls(
     return train_out, val_out
 
 
-def add_emb_residual_pls(
-    train_df: pd.DataFrame,
-    val_df: pd.DataFrame,
-    n_components: int,
-    *,
-    te_col: str = "account_mean_rate",
-    target_col: str = "log_engagement",
-    nonreply_only: bool = False,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """FWL residual MiniLM after linear account-TE removal, then PLS → residual target.
-
-    Isolates content geometry orthogonal to account heat. Fit before emb PCA.
-    Requires ``account_mean_rate`` (run after ``--account-te``). Adds ``res_pls_*``
-    and ``emb_res_l2`` (||residual emb||).
-    """
-    from sklearn.cross_decomposition import PLSRegression
-
-    emb_cols = [c for c in train_df.columns if re.fullmatch(r"emb_\d+", c)]
-    if not emb_cols or n_components <= 0:
-        return train_df, val_df
-    if te_col not in train_df.columns or te_col not in val_df.columns:
-        print(f"Skipping emb residual PLS (missing {te_col}; enable --account-te)", flush=True)
-        return train_df, val_df
-    emb_cols = sorted(emb_cols, key=lambda c: int(c.split("_", 1)[1]))
-    k = min(int(n_components), len(emb_cols), len(train_df) - 1)
-    if k < 1:
-        return train_df, val_df
-
-    train_out = train_df.reset_index(drop=True).copy()
-    val_out = val_df.reset_index(drop=True).copy()
-    x_tr = train_out[emb_cols].to_numpy(dtype=np.float64)
-    x_va = val_out[emb_cols].to_numpy(dtype=np.float64)
-    te_tr = train_out[te_col].to_numpy(dtype=np.float64)
-    te_va = val_out[te_col].to_numpy(dtype=np.float64)
-    y = train_out[target_col].to_numpy(dtype=np.float64)
-
-    fit_mask = np.ones(len(train_out), dtype=bool)
-    if nonreply_only and "is_reply" in train_out.columns:
-        fit_mask &= train_out["is_reply"].to_numpy(dtype=np.float64) < 0.5
-    if int(fit_mask.sum()) < max(50, k + 5):
-        print("Skipping emb residual PLS (too few fit rows)", flush=True)
-        return train_df, val_df
-
-    # Per-dim OLS: emb_j ~ a + b · account_TE (train-fit; apply to val).
-    te_fit = te_tr[fit_mask]
-    te_c = te_fit - float(te_fit.mean())
-    te_var = float(np.dot(te_c, te_c))
-    if te_var < 1e-12:
-        print("Skipping emb residual PLS (degenerate account TE)", flush=True)
-        return train_df, val_df
-    x_fit = x_tr[fit_mask]
-    # slope_j = cov(te, emb_j) / var(te); intercept from means.
-    slopes = (te_c @ (x_fit - x_fit.mean(axis=0))) / te_var
-    intercepts = x_fit.mean(axis=0) - slopes * float(te_fit.mean())
-    x_tr_res = x_tr - (intercepts + np.outer(te_tr, slopes))
-    x_va_res = x_va - (intercepts + np.outer(te_va, slopes))
-
-    y_res = y - te_tr
-    y_fit_res = y_res[fit_mask]
-    x_fit_res = x_tr_res[fit_mask]
-
-    pls = PLSRegression(n_components=k, scale=True)
-    z_fit = np.asarray(pls.fit_transform(x_fit_res, y_fit_res)[0], dtype=np.float64)
-    z_tr = np.asarray(pls.transform(x_tr_res), dtype=np.float64)
-    z_va = np.asarray(pls.transform(x_va_res), dtype=np.float64)
-
-    drop = [c for c in train_out.columns if re.fullmatch(r"res_pls_\d+", c) or c == "emb_res_l2"]
-    if drop:
-        train_out = train_out.drop(columns=drop)
-        val_out = val_out.drop(columns=[c for c in drop if c in val_out.columns])
-    for i in range(z_tr.shape[1]):
-        train_out[f"res_pls_{i}"] = z_tr[:, i].astype(np.float32)
-        val_out[f"res_pls_{i}"] = z_va[:, i].astype(np.float32)
-
-    emb_res_l2_tr = np.linalg.norm(x_tr_res, axis=1).astype(np.float32)
-    emb_res_l2_va = np.linalg.norm(x_va_res, axis=1).astype(np.float32)
-    train_out["emb_res_l2"] = emb_res_l2_tr
-    val_out["emb_res_l2"] = emb_res_l2_va
-
-    def _safe_corr(a: np.ndarray, b: np.ndarray) -> float:
-        if a.size < 3 or np.std(a) < 1e-12 or np.std(b) < 1e-12:
-            return float("nan")
-        return float(np.corrcoef(a, b)[0, 1])
-
-    corr_yres = _safe_corr(z_tr[:, 0], y_res)
-    corr_y = _safe_corr(z_tr[:, 0], y)
-    corr_l2 = _safe_corr(emb_res_l2_tr, y_res)
-    # Within-account demeaned target corr (proxy for locked wa_* primary).
-    aid = train_out["account_id"].astype(str).to_numpy()
-    y_demean = y.copy()
-    for a in np.unique(aid):
-        m = aid == a
-        if m.sum() >= 2:
-            y_demean[m] -= float(y_demean[m].mean())
-    corr_wa = _safe_corr(z_tr[:, 0], y_demean)
-    # Fraction of emb variance removed by TE residualization.
-    var_raw = float(np.mean(np.var(x_fit, axis=0)))
-    var_res = float(np.mean(np.var(x_fit_res, axis=0)))
-    frac_kept = var_res / var_raw if var_raw > 0 else float("nan")
-    print(
-        f"Emb residual PLS: k={k} nonreply_only={nonreply_only} "
-        f"corr(res_pls_0,y_res)={corr_yres:.4f} corr(res_pls_0,y)={corr_y:.4f} "
-        f"corr(res_pls_0,y_within)={corr_wa:.4f} corr(emb_res_l2,y_res)={corr_l2:.4f} "
-        f"emb_var_kept={frac_kept:.3f} val res_pls_0 p50={float(np.median(z_va[:, 0])):.4f}",
-        flush=True,
-    )
-    return train_out, val_out
-
-
 def _train_oof_underpred(
     train_df: pd.DataFrame,
     *,
@@ -2441,6 +2537,8 @@ def fit_predict_group(
     rank_min_group: int = 2,
     hybrid_rank: bool = True,
     model_kind: str = "lgbm",
+    stream_fresh_days: float = 0.0,
+    stream_fresh_floor: float = 0.25,
 ) -> tuple[np.ndarray, Any, list[str], dict[str, float]]:
     x_train, feature_names = feature_matrix(train_df, skip_embeddings=skip_embeddings)
     x_val, _ = feature_matrix(val_df, skip_embeddings=skip_embeddings)
@@ -2459,6 +2557,13 @@ def fit_predict_group(
         nonreply_weight,
         1.0,
     ).astype(np.float64)
+    if stream_fresh_days > 0:
+        weight_train = stream_fresh_sample_weights(
+            train_df,
+            weight_train,
+            fresh_days=stream_fresh_days,
+            floor=stream_fresh_floor,
+        )
     train_is_nonreply = train_df["is_reply"].to_numpy() == 0
     val_is_nonreply = val_df["is_reply"].to_numpy() == 0
     account_train = train_df["account_id"].astype(str).to_numpy()
@@ -2660,6 +2765,12 @@ def main() -> None:
 
     df = add_time_regime_features(df)
 
+    df = apply_holdout_policy(
+        df,
+        policy=args.holdout_policy,
+        min_upload_hist=args.min_upload_hist,
+    )
+
     dump_time = pd.Timestamp(df["created_at"].max())
     y_train_raw_ref: np.ndarray | None = None
     y_val_raw_ref: np.ndarray | None = None
@@ -2674,6 +2785,16 @@ def main() -> None:
             beta=args.exposure_beta,
             eps=args.exposure_eps,
         )
+
+    if args.provenance_features:
+        if "is_stream" not in df.columns:
+            print(
+                "Warning: --provenance-features on but is_stream missing; "
+                "skipping (run: uv run prepare.py --provenance-only)",
+                flush=True,
+            )
+        else:
+            df = add_provenance_features(df)
 
     train_df, val_df = time_split(df, args.val_frac)
     if args.exposure_correct and args.exposure_mode == "resid":
@@ -2731,14 +2852,6 @@ def main() -> None:
     if args.emb_pls > 0 and not args.skip_embeddings:
         # Fit on raw MiniLM before train-fit PCA replaces emb_*.
         train_df, val_df = add_emb_pls(train_df, val_df, args.emb_pls)
-    if args.emb_residual_pls > 0 and not args.skip_embeddings:
-        # Needs account_mean_rate; residualize raw MiniLM before emb PCA.
-        train_df, val_df = add_emb_residual_pls(
-            train_df,
-            val_df,
-            args.emb_residual_pls,
-            nonreply_only=args.emb_residual_pls_nonreply_only,
-        )
     if args.fail_clusters and not args.skip_embeddings:
         # Cluster raw MiniLM of OOF under-preds before emb PCA replaces emb_*.
         train_df, val_df = add_fail_clusters(
@@ -2850,6 +2963,8 @@ def main() -> None:
             rank_min_group=args.rank_min_group,
             hybrid_rank=args.hybrid_rank,
             model_kind=args.model,
+            stream_fresh_days=args.stream_fresh_days,
+            stream_fresh_floor=args.stream_fresh_floor,
         )
         # Score full val with the non-reply model, then overwrite replies.
         x_val_full, _ = feature_matrix(val_df, skip_embeddings=args.skip_embeddings)
@@ -2905,6 +3020,8 @@ def main() -> None:
                 rank_min_group=args.rank_min_group,
                 hybrid_rank=args.hybrid_rank,
                 model_kind=args.model,
+                stream_fresh_days=args.stream_fresh_days,
+                stream_fresh_floor=args.stream_fresh_floor,
             )
             pred[val_df["is_reply"].to_numpy() == mask_val] = p
             models.append(model)
@@ -2930,6 +3047,8 @@ def main() -> None:
             rank_min_group=args.rank_min_group,
             hybrid_rank=args.hybrid_rank,
             model_kind=args.model,
+            stream_fresh_days=args.stream_fresh_days,
+            stream_fresh_floor=args.stream_fresh_floor,
         )
 
     # Primary prediction/label are in training-target space.
@@ -3038,7 +3157,6 @@ def main() -> None:
     metrics["sera_nonreply_only"] = (
         float(args.sera_nonreply_only) if args.loss == "sera" else 0.0
     )
-    metrics["emb_residual_pls"] = float(args.emb_residual_pls)
     metrics["early_stop_metric"] = args.early_stop_metric
     metrics["hybrid_rank"] = float(args.hybrid_rank)
     metrics["rank_nonreply_only"] = (
@@ -3047,6 +3165,10 @@ def main() -> None:
     metrics["rank_min_group"] = (
         float(args.rank_min_group) if args.loss == "lambdarank" or args.hybrid_rank else 0.0
     )
+    metrics["holdout_policy"] = args.holdout_policy
+    metrics["min_upload_hist"] = float(args.min_upload_hist)
+    metrics["provenance_features"] = float(args.provenance_features)
+    metrics["stream_fresh_days"] = float(args.stream_fresh_days)
     metrics.update(gpboost_meta)
     metrics["seconds"] = round(time.time() - t0, 2)
 
@@ -3071,6 +3193,8 @@ def main() -> None:
                 "log_engagement",
                 "is_reply",
                 "is_quote",
+                "is_stream",
+                "archive_upload_id",
                 "has_media",
                 "has_url",
                 "text_len",
