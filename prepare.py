@@ -47,6 +47,8 @@ MEDIA_TYPE_KEYS = ("photo", "video", "animated_gif")
 X_PARENT_DONE_STATUSES = frozenset({"ok", "not_found", "forbidden"})
 X_TWEETS_URL = "https://api.x.com/2/tweets"
 X_TWEETS_BATCH = 100
+# CA / paste junk sometimes leaves "?s=20" (or status URLs) in ref ids.
+TWEET_ID_RE = re.compile(r"(\d{5,25})")
 EMBED_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"  # Apache-2.0
 PARQUET_URL = (
     "https://fabxmporizzqflnftavs.supabase.co/storage/v1/object/public/"
@@ -1357,6 +1359,56 @@ def _is_quota_http_status(status: int) -> bool:
     return status in {402, 429}
 
 
+def normalize_tweet_id(value: object) -> str | None:
+    """Return a bare snowflake id, or None if the value is not a usable tweet id."""
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    s = str(value).strip()
+    if not s or s.lower() in {"none", "nan", "<na>"}:
+        return None
+    if "status/" in s:
+        s = s.split("status/")[-1]
+    s = s.split("?")[0].split("#")[0].strip().rstrip("/")
+    if s.isdigit() and 5 <= len(s) <= 25:
+        return s
+    m = TWEET_ID_RE.search(str(value))
+    return m.group(1) if m else None
+
+
+def _normalize_ref_id_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Strip URL/query junk from reply/quote parent ids so dump + X joins match."""
+    out = df.copy()
+    for col in ("reply_to_tweet_id", "quoted_tweet_id"):
+        if col not in out.columns:
+            continue
+        out[col] = out[col].map(normalize_tweet_id)
+    return out
+
+
+def _invalid_id_cache_rows(tweet_ids: list[str], *, status: str = "not_found") -> pd.DataFrame:
+    ts = pd.Timestamp.now(tz="UTC").isoformat()
+    return pd.DataFrame(
+        [
+            {
+                "tweet_id": tid,
+                "account_id": pd.NA,
+                "full_text": "",
+                "created_at": pd.NaT,
+                "reply_to_tweet_id": None,
+                "quoted_tweet_id": None,
+                "fetch_status": status,
+                "fetched_at": ts,
+            }
+            for tid in tweet_ids
+        ]
+    )
+
+
 def _x_parent_rows_from_cache(tweet_ids: list[str], cache: pd.DataFrame | None = None) -> pd.DataFrame:
     """Dump-shaped ok rows for ids already in the X parent cache (no API calls)."""
     cols = [
@@ -1397,13 +1449,36 @@ def fetch_x_parent_tweets(
     On rate-limit / credit exhaustion, flushes the cache and raises
     XParentFetchInterrupted so callers can keep going with partial coverage.
     """
-    uniq = list(dict.fromkeys(str(t) for t in tweet_ids if pd.notna(t) and str(t)))
-    if not uniq:
+    raw_uniq = list(dict.fromkeys(str(t) for t in tweet_ids if pd.notna(t) and str(t)))
+    # Normalize before any API call so "?s=20" / status URLs never burn a batch.
+    normalized: list[str] = []
+    invalid_raw: list[str] = []
+    for raw in raw_uniq:
+        nid = normalize_tweet_id(raw)
+        if nid is None:
+            invalid_raw.append(raw)
+        else:
+            normalized.append(nid)
+    uniq = list(dict.fromkeys(normalized))
+    if invalid_raw:
+        print(
+            f"X parent ids: dropped {len(invalid_raw):,} non-snowflake ref ids "
+            f"(cached as not_found, no API)",
+            flush=True,
+        )
+
+    if not uniq and not invalid_raw:
         return _x_parent_rows_from_cache([])
 
     cache = _empty_x_parent_cache() if force else load_x_parent_cache()
     if force and X_PARENT_CACHE_PATH.exists():
         print(f"Force X parent refetch: ignoring {X_PARENT_CACHE_PATH.name}", flush=True)
+
+    if invalid_raw:
+        inv = _invalid_id_cache_rows(invalid_raw)
+        cache = inv if cache.empty else pd.concat([cache, inv], ignore_index=True)
+        cache = cache.drop_duplicates("tweet_id", keep="last")
+        save_x_parent_cache(cache)
 
     have_done: set[str] = set()
     if not cache.empty:
@@ -1427,8 +1502,10 @@ def fetch_x_parent_tweets(
             }
             fetched = 0
             now_iso = lambda: pd.Timestamp.now(tz="UTC").isoformat()
-            for start in range(0, len(miss), X_TWEETS_BATCH):
-                batch = miss[start : start + X_TWEETS_BATCH]
+            pending = list(miss)
+            while pending:
+                batch = pending[:X_TWEETS_BATCH]
+                pending = pending[X_TWEETS_BATCH:]
                 params = {**params_base, "ids": ",".join(batch)}
                 try:
                     resp = sess.get(X_TWEETS_URL, params=params, timeout=60)
@@ -1437,7 +1514,7 @@ def fetch_x_parent_tweets(
                     raise XParentFetchInterrupted(
                         f"X parent fetch network error after {fetched:,} new rows: {exc}",
                         fetched=fetched,
-                        remaining=len(miss) - start,
+                        remaining=len(pending) + len(batch),
                     ) from exc
 
                 if _is_quota_http_status(resp.status_code) or resp.status_code in {401, 403}:
@@ -1449,17 +1526,60 @@ def fetch_x_parent_tweets(
                         f"X parent fetch stopped on HTTP {resp.status_code}"
                         f"{f' (retry-after/reset={retry_after})' if retry_after else ''}; "
                         f"cache has {len(cache):,} rows. "
-                        f"Re-run: uv run prepare.py --parent-only",
+                        f"Re-run: uv run prepare.py --parent-only --x-parents",
                         fetched=fetched,
-                        remaining=len(miss) - start,
+                        remaining=len(pending) + len(batch),
                     )
+
+                if resp.status_code == 400:
+                    # One bad id can fail a whole batch; quarantine and retry the rest.
+                    bad: list[str] = []
+                    try:
+                        err_body = resp.json()
+                        for e in err_body.get("errors") or []:
+                            for v in (e.get("parameters") or {}).get("ids") or []:
+                                nid = normalize_tweet_id(v) or str(v)
+                                bad.append(nid)
+                            msg = str(e.get("message") or "")
+                            m = TWEET_ID_RE.search(msg)
+                            if m:
+                                bad.append(m.group(1))
+                    except Exception:
+                        bad = []
+                    bad = [b for b in dict.fromkeys(bad) if b in batch]
+                    if not bad and len(batch) == 1:
+                        bad = list(batch)
+                    if not bad:
+                        # Fall back: split batch so a single poison id cannot block the rest.
+                        if len(batch) > 1:
+                            mid = len(batch) // 2
+                            pending = batch[:mid] + batch[mid:] + pending
+                            print(
+                                f"  X parents: HTTP 400 on {len(batch)}-id batch; "
+                                f"bisecting to isolate bad id",
+                                flush=True,
+                            )
+                            continue
+                        bad = list(batch)
+                    inv = _invalid_id_cache_rows(bad)
+                    cache = inv if cache.empty else pd.concat([cache, inv], ignore_index=True)
+                    cache = cache.drop_duplicates("tweet_id", keep="last")
+                    save_x_parent_cache(cache)
+                    rest = [t for t in batch if t not in set(bad)]
+                    pending = rest + pending
+                    print(
+                        f"  X parents: quarantined {len(bad):,} invalid id(s) from HTTP 400 "
+                        f"(no credit wasted on retry of those)",
+                        flush=True,
+                    )
+                    continue
 
                 if resp.status_code != 200:
                     save_x_parent_cache(cache)
                     raise XParentFetchInterrupted(
                         f"X parent fetch HTTP {resp.status_code}: {resp.text[:300]}",
                         fetched=fetched,
-                        remaining=len(miss) - start,
+                        remaining=len(pending) + len(batch),
                     )
 
                 body = resp.json()
@@ -1510,14 +1630,15 @@ def fetch_x_parent_tweets(
                 cache = cache.drop_duplicates("tweet_id", keep="last")
                 save_x_parent_cache(cache)
                 fetched += len(batch)
-                if start == 0 or ((start // X_TWEETS_BATCH) % 5 == 0) or start + X_TWEETS_BATCH >= len(miss):
+                done_n = fetched
+                total_n = len(miss)
+                if done_n == len(batch) or done_n % 500 < len(batch) or not pending:
                     print(
-                        f"  X parents: {min(start + len(batch), len(miss)):,}/{len(miss):,} "
+                        f"  X parents: {min(done_n, total_n):,}/{total_n:,} "
                         f"(cache={len(cache):,})",
                         flush=True,
                     )
-                # Be polite on free/basic tiers; cache already durable if we die.
-                if start + X_TWEETS_BATCH < len(miss):
+                if pending:
                     time.sleep(0.5)
 
     ok = _x_parent_rows_from_cache(uniq, cache)
@@ -1741,6 +1862,7 @@ def attach_parent_context(
     out = df.reset_index(drop=True).copy()
     if "reply_to_tweet_id" not in out.columns or "quoted_tweet_id" not in out.columns:
         raise RuntimeError("Dataset missing reply_to_tweet_id / quoted_tweet_id for parent join")
+    out = _normalize_ref_id_columns(out)
 
     reply_ids = out["reply_to_tweet_id"].dropna().astype(str)
     quote_ids = out["quoted_tweet_id"].dropna().astype(str)
