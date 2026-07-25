@@ -202,6 +202,18 @@ STANCE_FEATURES = [
     "has_stance",
 ]
 
+# Cached richer descriptive LM tags (label_desc.py); opt-in --desc-labels.
+DESC_FEATURES = [
+    "desc_humor",
+    "desc_controversy",
+    "desc_narrative",
+    "desc_cta",
+    "desc_news",
+    "desc_dunk_bait",
+    "desc_max",
+    "has_desc",
+]
+
 # Train-fold account target encoding (add_account_target_encoding).
 ACCOUNT_TE_FEATURES = [
     "account_mean_rate",
@@ -314,6 +326,7 @@ def feature_matrix(df: pd.DataFrame, skip_embeddings: bool) -> tuple[np.ndarray,
             + URL_DOMAIN_FEATURES
             + PROVOKE_FEATURES
             + STANCE_FEATURES
+            + DESC_FEATURES
             + ACCOUNT_TE_FEATURES
             + EMB_KNN_TE_FEATURES
             + EMB_CAV_FEATURES
@@ -1507,6 +1520,19 @@ def parse_args() -> argparse.Namespace:
         "(default: ~/.cache/will-it-bang/stance_cache.parquet)",
     )
     p.add_argument(
+        "--desc-labels",
+        action="store_true",
+        help="Join richer LM descriptive tags (humor/controversy/narrative/cta/news/"
+        "dunk_bait) from desc cache (label_desc.py; opt-in until smoke clears gate)",
+    )
+    p.add_argument(
+        "--desc-cache",
+        type=Path,
+        default=None,
+        help="Path to desc cache parquet "
+        "(default: ~/.cache/will-it-bang/desc_cache.parquet)",
+    )
+    p.add_argument(
         "--account-te",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1886,6 +1912,57 @@ def add_stance_features(df: pd.DataFrame, cache_path: Path | None = None) -> pd.
         f"net={(ag_s - dg_s)[has].mean() if has.any() else float('nan'):.3f}",
         flush=True,
     )
+    return out
+
+
+_DESC_TAG_COLS = (
+    "humor",
+    "controversy",
+    "narrative",
+    "cta",
+    "news",
+    "dunk_bait",
+)
+
+
+def add_desc_features(df: pd.DataFrame, cache_path: Path | None = None) -> pd.DataFrame:
+    """Join cached richer LM descriptive tags (text-only; no fame/quality)."""
+    path = cache_path or (CACHE_DIR / "desc_cache.parquet")
+    if not path.exists():
+        cands = sorted(CACHE_DIR.glob("desc_cache_*.parquet"))
+        if not cands:
+            raise SystemExit(
+                f"Missing {path}; run: uv run python label_desc.py --local --limit 500"
+            )
+        path = cands[-1]
+        print(f"Desc cache: using {path.name}", flush=True)
+    cache = pd.read_parquet(path)
+    cache["tweet_id"] = cache["tweet_id"].astype(str)
+    cache = cache.drop_duplicates("tweet_id", keep="last")
+    if "ok" in cache.columns:
+        cache = cache.loc[cache["ok"].fillna(0).astype(int) == 1]
+    missing = [c for c in _DESC_TAG_COLS if c not in cache.columns]
+    if missing:
+        raise SystemExit(f"Desc cache missing columns {missing}: {path}")
+    ok = cache[["tweet_id", *_DESC_TAG_COLS]]
+    out = df.copy()
+    out["tweet_id"] = out["tweet_id"].astype(str)
+    merged = out[["tweet_id"]].merge(ok, on="tweet_id", how="left")
+    mats = [merged[c].to_numpy(dtype=np.float64) for c in _DESC_TAG_COLS]
+    has = np.ones(len(merged), dtype=bool)
+    for m in mats:
+        has &= np.isfinite(m)
+    scaled = [np.where(has, m / 10.0, 0.0).astype(np.float32) for m in mats]
+    for name, arr in zip(_DESC_TAG_COLS, scaled, strict=True):
+        out[f"desc_{name}"] = arr
+    stacked = np.vstack(scaled)
+    out["desc_max"] = stacked.max(axis=0).astype(np.float32)
+    out["has_desc"] = has.astype(np.int8)
+    means = " ".join(
+        f"{n}={scaled[i][has].mean():.3f}" if has.any() else f"{n}=nan"
+        for i, n in enumerate(_DESC_TAG_COLS)
+    )
+    print(f"Desc labels: coverage={has.mean():.1%} mean {means}", flush=True)
     return out
 
 
@@ -3086,6 +3163,8 @@ def main() -> None:
         df = add_provoke_features(df, cache_path=args.provoke_cache)
     if args.stance_labels:
         df = add_stance_features(df, cache_path=args.stance_cache)
+    if args.desc_labels:
+        df = add_desc_features(df, cache_path=args.desc_cache)
 
     df = add_time_regime_features(df)
 

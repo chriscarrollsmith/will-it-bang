@@ -31,6 +31,8 @@ uv run prepare.py --provenance-only     # patch archive_upload_id / is_stream / 
 uv run train.py --media-types           # use photo/video/gif breakdown (after --media-only)
 uv run modal run label_provoke.py --nonreply-only   # default: Qwen3-8B → provoke_cache_Qwen__*
 uv run train.py --provoke-labels --provoke-cache ~/.cache/will-it-bang/provoke_cache_Qwen__Qwen3-8B.parquet
+uv run python label_desc.py --local --nonreply-only --limit 500   # richer descriptive tags smoke
+uv run train.py --desc-labels --desc-cache ~/.cache/will-it-bang/desc_cache_Qwen__Qwen2.5-1.5B-Instruct.parquet
 uv run vision_smoke.py --limit 500   # Gemini tags vs SigLIP emb smoke (needs GEMINI_API_KEY in .env)
 uv run train.py --skip-embeddings       # ablation: tabular only
 uv run train.py --holdout-policy upload_era   # cap at last upload-linked created_at before time split
