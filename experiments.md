@@ -97,8 +97,23 @@ Dump-time fav/RT used as author history → optimistic RMSE ~0.82 (v5). Invalid 
 | v36b | 0.482† (rate) | 0.459† | `--holdout-policy upload_era` (cap ≤ last upload-linked `created_at` 2026-03-22): wa_nr **0.143** (−0.082), wa_rp **0.299** (+0.049); †different val — **do not promote** / keep `time` default |
 | v36c | **0.602** (rate) | **0.521** | `--provenance-features` on time holdout: wa_nr **0.249** (+0.024), wa_rp **0.276** (+0.025), global_nr 0.569 (−0.024); `stream_x_log_age` #21 gain; raw `is_stream` zero gain on ~pure-stream val; **promote / default on** |
 | v36d | 0.615† (rate) | 0.516† | `--holdout-policy stream_only`: wa_nr 0.239 / wa_rp 0.276; †near-identical corpus (dataset already 96.7% stream) — diagnostic only |
+| v37a2 | **0.602** (rate) | **0.521** | Control after asymmetric sample-weight fix (= v36c; uniform weights unchanged) |
+| v37b2 | 0.603 (rate) | 0.521 | `--stream-fresh-days 90`: wa_* **frozen** (hybrid ranker); global_nr 0.569→**0.577**; rmse 0.602→0.603; under-pred flat; **leave opt-in** |
+| v37d | 0.604 (rate) | 0.521 | `--stream-fresh-days 180` (35% train affected): wa_* frozen; global_nr 0.575; rmse worse — no promote |
+| v37c | — | — | `--stream-fresh-days 30`: **no-op** under time holdout (train ages ≥~37d); harness now warns |
 | v38a | **0.600** (rate) | 0.521 | Media refresh 0%→9% (binary flags only): wa_nr **0.234** (−0.014 vs v36c), wa_rp 0.279, global_nr **0.587** |
 | v38b | 0.602 (rate) | 0.521 | `--media-types` (photo 7.7% / video 0.8% / gif 0.6%): wa_nr **0.252** (+0.018 vs v38a), wa_rp **0.267** (−0.013); `photo_x_inbound_replies` #33; **leave opt-in** |
+
+### v37 stream-fresh weights (same rebuild; after asymmetric weight fix)
+
+| Run | fresh_days | wa_nr | wa_rp | global_nr | rmse | Notes |
+|---|---:|---:|---:|---:|---:|---|
+| v37a2 control | 0 | 0.249 | 0.276 | 0.569 | 0.602 | Uniform weights; matches v36c |
+| v37b2 | 90 | 0.249 | 0.276 | **0.577** | 0.603 | 9.5k train rows affected (mean_mult 0.97); wa_* frozen |
+| v37d | 180 | 0.249 | 0.276 | 0.575 | 0.604 | 31k affected (mean_mult 0.90); still no wa_* move |
+| v37c | 30 | 0.249 | 0.276 | 0.569 | 0.602 | 0 affected — time-holdout no-op |
+
+Bugfix: custom asymmetric MSE ignored `Dataset` sample weights (LightGBM does not apply them to Python objectives). Pre-fix v37b matched control bit-for-bit despite n_affected>0. Fix is neutral when weights are uniform (default stack). `--nonreply-weight` under asymmetric was similarly inert before the fix.
 
 ### v38 media types (same rebuild after `--media-only`)
 
@@ -167,7 +182,7 @@ Check off when tried; note outcome in one line.
 - [x] Backfill `reply_to_user_id` from parent `account_id` when parent ∈ dump — in `load_author_graph` (inbound hist) + sampled-row coalesce for `is_self_reply`; rebuild densifies `inbound_replies*` (v36a).
 - [x] Holdout / train policy by ingestion regime — **v36b `upload_era`:** wa_nr regresses on new val (still ~stream); **v36d `stream_only`:** ≈ time on today’s corpus; keep `--holdout-policy time` default; knobs remain for regime-specific scoreboards. `--min-upload-hist` still unused.
 - [x] Optional train feature `is_stream` / hours since pre-T `archive_upload.end_date` — **v36c: promote / default on** (`stream_x_log_age` #21; wa_nr +0.024 / wa_rp +0.025 / global_nr −0.024 vs v36a); `--no-provenance-features` to ablate
-- [ ] Label honesty for stream eng: treat fav/RT as as-observed (not eventual); `--stream-fresh-days` harness exists but untested as scoreboard bet
+- [x] Label honesty for stream eng via `--stream-fresh-days` — **v37b2/d:** under hybrid, wa_* frozen (ranker dominates); mild global_nr lift / flat-to-worse RMSE; leave **opt-in**. Note: d must exceed val-window span (~37d) or train coverage is 0; asymmetric custom obj now honors sample weights
 - [ ] Fixed-horizon labels if CA/X ever provide time-series engagement (cleaner maturity control)
 - [ ] Do **not** build liker / likes-graph features until CA streams likes with usable timestamps (extension omits likes; upload likes undated) — revisit only if #427 lands or a dated source appears
 

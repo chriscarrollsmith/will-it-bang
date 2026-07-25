@@ -120,15 +120,21 @@ If (2)–(3) fail, treat as mechanism research — not a scoreboard bet. ε is a
 
 ## Still open (high EV)
 
-- Label honesty for stream eng (`--stream-fresh-days` untested on this branch; fixed-horizon labels if CA/X ever provide them)
 - Viral non-reply under-prediction (improved by SERA magnitude, still open on rank)
 - Quote parents missing from CA (X API fallback); media **captions/vision** beyond type flags
 - Regime-specific heads / min-upload-hist once stream history is long enough for a stable stream-only scoreboard
+- Fixed-horizon labels if CA/X ever provide time-series engagement
 
 ### v36 note (regime holdout + provenance features)
 
 - **`upload_era` holdout** truncates the timeline but val remains ~stream → new scoreboard, wa_nr regresses; leave opt-in.
 - **`--provenance-features`** (default on): same time holdout; `stream_x_log_age` carries the lift; raw `is_stream` is useless when val is constant-stream.
+
+### v37 note (stream-fresh weights)
+
+- Under time holdout, `--stream-fresh-days` must exceed the val-window dump-age span or train coverage is 0.
+- Custom asymmetric MSE previously ignored `Dataset` weights — fixed; default uniform weights unchanged.
+- With hybrid on, stream-fresh behaves like SERA: **wa_* frozen**, small global_nr wiggle, no promote.
 
 ### v38 note (media types)
 

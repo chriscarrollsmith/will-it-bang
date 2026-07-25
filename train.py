@@ -469,11 +469,21 @@ def stream_fresh_sample_weights(
     ramp = np.clip(age / float(fresh_days), 0.0, 1.0)
     mult = floor + (1.0 - floor) * ramp
     w[stream] *= mult[stream]
+    n_affected = int((stream & (mult < 1.0 - 1e-12)).sum())
     print(
         f"Stream-fresh weights: days={fresh_days:g} floor={floor:g} "
-        f"n_stream={int(stream.sum()):,} mean_mult={float(mult[stream].mean()) if stream.any() else 1.0:.3f}",
+        f"n_stream={int(stream.sum()):,} n_affected={n_affected:,} "
+        f"mean_mult={float(mult[stream].mean()) if stream.any() else 1.0:.3f} "
+        f"train_age_min={float(age.min()):.1f}d",
         flush=True,
     )
+    if stream.any() and n_affected == 0:
+        print(
+            "Warning: stream-fresh affected 0 train rows — under a time holdout, "
+            "train ages are ≥ the val-window span; raise --stream-fresh-days "
+            f"(need >~{float(age.min()):.0f}d here) or the knob is a no-op",
+            flush=True,
+        )
     return w
 
 
@@ -919,9 +929,16 @@ def train_model(
         under_w = float(asymmetric_under_weight)
 
         def asymmetric_mse(y_pred: np.ndarray, dataset: lgb.Dataset):
+            # Custom objectives must apply Dataset weights themselves (LightGBM
+            # does not multiply them into grad/hess for Python objectives).
             y_true = dataset.get_label()
+            sw = dataset.get_weight()
+            if sw is None:
+                sw = np.ones_like(y_true, dtype=np.float64)
+            else:
+                sw = np.asarray(sw, dtype=np.float64)
             resid = y_true - y_pred
-            w = np.where(resid > 0.0, under_w, 1.0)
+            w = np.where(resid > 0.0, under_w, 1.0) * sw
             grad = -2.0 * w * resid
             hess = 2.0 * w
             return grad, hess
@@ -1297,8 +1314,9 @@ def parse_args() -> argparse.Namespace:
         "--stream-fresh-days",
         type=float,
         default=0.0,
-        help="Down-weight stream rows younger than this many days (0=off); "
-        "linear ramp from --stream-fresh-floor to 1.0",
+        help="Down-weight stream rows with dump-age < this many days (0=off); "
+        "linear ramp from --stream-fresh-floor to 1.0. Under a time holdout, "
+        "must exceed the val-window age span or no train rows are affected",
     )
     p.add_argument(
         "--stream-fresh-floor",
