@@ -275,13 +275,23 @@ def score_batch_local(
                 ),
             },
         ]
-        prompts.append(
-            tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
+        try:
+            prompts.append(
+                tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                )
             )
-        )
+        except TypeError:
+            prompts.append(
+                tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            )
     enc = tokenizer(
         prompts,
         return_tensors="pt",
