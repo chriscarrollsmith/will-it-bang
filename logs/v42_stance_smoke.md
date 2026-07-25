@@ -3,39 +3,42 @@
 ## Setup
 
 - Dataset: ~5.5k rows / 102 accounts
-- Labeler: `uv run python label_stance.py --local --limit 500`  
-  Model: `Qwen/Qwen2.5-1.5B-Instruct` (Apache-2.0) on CPU (~0.46 pairs/s)  
-  Cache: `stance_cache_Qwen__Qwen2.5-1.5B-Instruct.parquet`
-- Modal / Qwen3-8B not available in this cloud env (no Modal token); same harness supports `uv run modal run label_stance.py`
+- Labeler: `label_stance.py` (reply→parent pairs; parent text from CA dump)
+- Raters:
+  - **v42a/b:** local `Qwen/Qwen2.5-1.5B-Instruct` (no Modal token initially)
+  - **v42c–f:** Modal `Qwen/Qwen3-8B` on A10G (~4.6 pairs/s)
+- Cache: `stance_cache_Qwen__Qwen3-8B.parquet` (3,428 ok / 3,429)
 - Train: `--stance-labels --stance-cache …` vs control
 
-## Coverage / calibration
+## Calibration
 
-| | |
-|---|---:|
-| ok labels | 508 / 508 |
-| dataset coverage | 9.2% (smoke limit; among replies 11.9%) |
-| agree mean / p50 / ≥7 | 5.41 / **8.0** / **56.5%** |
-| disagree mean / p50 / ≥7 | 3.79 / 2.0 / 27.4% |
+| rater | n | agree mean/p50/≥7 | disagree mean/p50/≥7 |
+|---|---:|---:|---:|
+| Qwen2.5-1.5B | 508 | 5.41 / **8.0** / **56%** | 3.79 / 2.0 / 27% |
+| Qwen3-8B (500) | 500 | 3.65 / 3.0 / 37% | 0.97 / 0.0 / 8% |
+| Qwen3-8B (dense) | 3428 | 3.66 / 3.0 / 37% | 0.73 / 0.0 / 6% |
 
-Prompt asked for most ordinary replies in 0–3; 1.5B rater is **overconfident on agree** (mode 8) — same noisy-labeler pattern as v17 provoke 1.5B.
+8B is better calibrated (disagree mostly 0; fewer false high-agree). Spot checks of agree≥7 look plausible; a few disagree≥8 still look wrong.
 
 ## Correlation vs exposure rate (labeled replies)
 
-| feature | spearman(rate) | within-account wmean |
-|---|---:|---:|
-| `agree` | +0.057 | +0.104 |
-| `disagree` | +0.012 | −0.041 |
-| `stance_net` | +0.029 | +0.075 |
-| `stance_conflict` | **+0.172** | +0.135 |
-
-`agree` sits on the ~0.06 content-gate line; `conflict` pierces but is entangled with the overconfident dual-mid scores. Spot checks: some disagree≥8 look wrong (e.g. light jokes).
-
-## Small-scale train (sparse join; most rows `has_stance=0`)
-
-| run | wa_nr_wmean | wa_rp_wmean | global_nr | rmse_log |
+| rater / slice | agree ρ | disagree ρ | net ρ | conflict ρ |
 |---|---:|---:|---:|---:|
-| v42a control | 0.148 | **0.247** | 0.394 | 0.988 |
-| v42b + `--stance-labels` | 0.148 | 0.221 | **0.425** | **0.976** |
+| 1.5B n=508 | +0.057 | +0.012 | +0.029 | +0.172 |
+| 8B n=500 | **+0.091** | +0.096 | +0.048 | +0.035 |
+| **8B dense n=3428** | **+0.021** | +0.046 | +0.007 | +0.001 |
 
-Stance cols absent from top gains. **Verdict:** leave `--stance-labels` **opt-in**; do not promote. Revisit only with a better-calibrated rater (Modal Qwen3-8B) and denser coverage — not a scoreboard bet on this 1.5B smoke.
+Dense 8B fails the ~0.06 content gate (500-row lift was sampling noise). Within-account agree wmean ≈0.05 on dense set.
+
+Coverage when dense: **62%** of rows / **80.5%** of replies.
+
+## Small-scale train
+
+| run | labels | wa_nr | wa_rp | global_nr | rmse |
+|---|---|---:|---:|---:|---:|
+| v42e control | — | 0.148 | **0.247** | 0.394 | 0.988 |
+| v42b 1.5B sparse | 508 | 0.148 | 0.221 | 0.425 | 0.976 |
+| v42d 8B sparse | 500 | 0.148 | 0.221 | 0.390 | 0.988 |
+| v42f 8B dense | 3428 | 0.148 | 0.218 | — | — |
+
+Stance cols absent from top gains in all ablations. **Verdict:** leave `--stance-labels` **opt-in**; do not promote. Better rater improves calibration but not target correlation or wa_rp on this smoke set.
