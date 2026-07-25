@@ -121,7 +121,7 @@ If (2)–(3) fail, treat as mechanism research — not a scoreboard bet. ε is a
 ## Still open (high EV)
 
 - Viral non-reply under-prediction (improved by SERA magnitude, still open on rank)
-- Quote parents missing from CA; media beyond binary flags
+- Quote parents missing from CA (X API fallback); media **captions/vision** beyond type flags
 - Regime-specific heads / min-upload-hist once stream history is long enough for a stable stream-only scoreboard
 - Fixed-horizon labels if CA/X ever provide time-series engagement
 
@@ -135,3 +135,8 @@ If (2)–(3) fail, treat as mechanism research — not a scoreboard bet. ε is a
 - Under time holdout, `--stream-fresh-days` must exceed the val-window dump-age span or train coverage is 0.
 - Custom asymmetric MSE previously ignored `Dataset` weights — fixed; default uniform weights unchanged.
 - With hybrid on, stream-fresh behaves like SERA: **wa_* frozen**, small global_nr wiggle, no promote.
+
+### v38 note (media types)
+
+- Refresh alone (v38a): wa_nr regresses vs 0% media; global_nr up.
+- Type breakdown (v38b): recovers wa_nr, costs wa_rp; `photo_x_inbound_replies` is the useful cross. Leave `--media-types` opt-in.

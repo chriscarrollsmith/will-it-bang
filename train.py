@@ -143,6 +143,21 @@ PROVENANCE_FEATURES = [
     "stream_x_inbound_replies",
 ]
 
+# CA tweet_media type breakdown (--media-types); requires prepare media refresh.
+MEDIA_TYPE_FEATURES = [
+    "has_photo",
+    "n_photo",
+    "has_video",
+    "n_video",
+    "has_animated_gif",
+    "n_animated_gif",
+    "has_media_other",
+    "n_media_other",
+    "photo_x_inbound_replies",
+    "video_x_inbound_replies",
+    "animated_gif_x_inbound_replies",
+]
+
 # Opt-in descriptive text tags (--descriptive-text); flat on rate RMSE in v15.
 DESCRIPTIVE_TEXT_FEATURES = [
     "sent_neg",
@@ -234,6 +249,10 @@ def feature_matrix(df: pd.DataFrame, skip_embeddings: bool) -> tuple[np.ndarray,
     provenance_cols = (
         PROVENANCE_FEATURES if "log_hours_since_upload_end" in df.columns else []
     )
+    # Media-type cols are prepared always after media refresh; include when the
+    # train-time marker `has_photo` is present *and* caller kept those columns
+    # (see --media-types / drop in main).
+    media_type_cols = MEDIA_TYPE_FEATURES if "has_photo" in df.columns else []
     extra = [
         c
         for c in (
@@ -247,6 +266,7 @@ def feature_matrix(df: pd.DataFrame, skip_embeddings: bool) -> tuple[np.ndarray,
             + EMB_CAV_FEATURES
             + EMB_CLUSTER_TE_FEATURES
             + provenance_cols
+            + media_type_cols
         )
         if c in df.columns
     ]
@@ -1303,6 +1323,13 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.25,
         help="Minimum sample-weight multiplier for brand-new stream rows",
+    )
+    p.add_argument(
+        "--media-types",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use CA tweet_media type breakdown (photo/video/gif); "
+        "requires prepare.py --media-only (off by default until promoted)",
     )
     p.add_argument(
         "--residual",
@@ -2744,6 +2771,16 @@ def main() -> None:
     t0 = time.time()
     df = pd.read_parquet(args.dataset)
     df["created_at"] = pd.to_datetime(df["created_at"], utc=True)
+    if not args.media_types:
+        drop_mt = [c for c in MEDIA_TYPE_FEATURES if c in df.columns]
+        if drop_mt:
+            df = df.drop(columns=drop_mt)
+    elif "has_photo" not in df.columns:
+        print(
+            "Warning: --media-types on but has_photo missing; "
+            "run: uv run prepare.py --media-only",
+            flush=True,
+        )
     if args.max_rows and args.max_rows > 0 and len(df) > args.max_rows:
         df = df.sort_values("created_at", kind="mergesort").tail(args.max_rows).reset_index(drop=True)
         print(f"Smoke subsample: keeping last {len(df):,} rows by created_at", flush=True)
@@ -3169,6 +3206,7 @@ def main() -> None:
     metrics["min_upload_hist"] = float(args.min_upload_hist)
     metrics["provenance_features"] = float(args.provenance_features)
     metrics["stream_fresh_days"] = float(args.stream_fresh_days)
+    metrics["media_types"] = float(args.media_types)
     metrics.update(gpboost_meta)
     metrics["seconds"] = round(time.time() - t0, 2)
 

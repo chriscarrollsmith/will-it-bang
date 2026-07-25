@@ -37,6 +37,9 @@ DATASET_PATH = CACHE_DIR / "dataset.parquet"
 EMBED_CACHE_PATH = CACHE_DIR / "embed_cache.parquet"
 MENTION_CACHE_PATH = CACHE_DIR / "mention_cache.parquet"
 UPLOAD_CACHE_PATH = CACHE_DIR / "archive_upload_cache.parquet"
+MEDIA_CACHE_PATH = CACHE_DIR / "media_cache.parquet"
+# CA tweet_media.media_type values observed in the public API.
+MEDIA_TYPE_KEYS = ("photo", "video", "animated_gif")
 EMBED_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"  # Apache-2.0
 PARQUET_URL = (
     "https://fabxmporizzqflnftavs.supabase.co/storage/v1/object/public/"
@@ -226,22 +229,119 @@ def _fetch_id_counts(table: str, id_col: str, tweet_ids: list[str], batch_size: 
     return counts
 
 
-def attach_media_flags(df: pd.DataFrame) -> pd.DataFrame:
-    """Join sparse CA tweet_media / tweet_urls presence flags (known at post time)."""
-    df = df.copy()
-    ids = df["tweet_id"].astype(str).tolist()
-    print(f"Fetching attachment flags for {len(ids):,} tweets…")
-    media_counts = _fetch_id_counts("tweet_media", "tweet_id", ids)
-    url_counts = _fetch_id_counts("tweet_urls", "tweet_id", ids)
-    df["n_media"] = df["tweet_id"].astype(str).map(lambda t: media_counts.get(t, 0)).astype(np.int16)
-    df["has_media"] = (df["n_media"] > 0).astype(np.int8)
-    df["n_ca_urls"] = df["tweet_id"].astype(str).map(lambda t: url_counts.get(t, 0)).astype(np.int16)
-    df["has_ca_url"] = (df["n_ca_urls"] > 0).astype(np.int8)
-    print(
-        f"  media coverage: {df['has_media'].mean():.1%}, "
-        f"ca_url coverage: {df['has_ca_url'].mean():.1%}"
+def _fetch_tweet_media(tweet_ids: list[str], batch_size: int = 80) -> pd.DataFrame:
+    """Fetch tweet_id / media_type rows from CA tweet_media."""
+    rows: list[dict[str, str]] = []
+    session = requests.Session()
+    for start in range(0, len(tweet_ids), batch_size):
+        batch = tweet_ids[start : start + batch_size]
+        joined = ",".join(f'"{tid}"' for tid in batch)
+        resp = session.get(
+            f"{CA_API}/tweet_media",
+            headers=_ca_headers(),
+            params={"select": "tweet_id,media_type", "tweet_id": f"in.({joined})"},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        for row in resp.json():
+            rows.append(
+                {
+                    "tweet_id": str(row["tweet_id"]),
+                    "media_type": str(row.get("media_type") or ""),
+                }
+            )
+        if start == 0 or (start // batch_size) % 20 == 0:
+            print(f"  tweet_media: {min(start + batch_size, len(tweet_ids)):,}/{len(tweet_ids):,}")
+    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["tweet_id", "media_type"])
+
+
+def _aggregate_media_types(raw: pd.DataFrame, tweet_ids: list[str]) -> pd.DataFrame:
+    """Per-tweet media counts by type (zeros for ids with no media rows)."""
+    base = pd.DataFrame({"tweet_id": [str(t) for t in tweet_ids]})
+    if raw.empty:
+        out = base.copy()
+        out["n_media"] = np.int16(0)
+        for key in MEDIA_TYPE_KEYS:
+            out[f"n_{key}"] = np.int16(0)
+        out["n_media_other"] = np.int16(0)
+        return out
+    raw = raw.copy()
+    raw["tweet_id"] = raw["tweet_id"].astype(str)
+    raw["media_type"] = raw["media_type"].fillna("").astype(str).str.lower()
+    known = set(MEDIA_TYPE_KEYS)
+    raw["type_key"] = raw["media_type"].map(lambda t: t if t in known else "other")
+    pivot = (
+        raw.groupby(["tweet_id", "type_key"], sort=False)
+        .size()
+        .unstack(fill_value=0)
+        .reset_index()
     )
-    return df
+    for key in (*MEDIA_TYPE_KEYS, "other"):
+        if key not in pivot.columns:
+            pivot[key] = 0
+    pivot = pivot.rename(columns={k: f"n_{k}" for k in (*MEDIA_TYPE_KEYS, "other")})
+    pivot["n_media_other"] = pivot["n_other"].astype(np.int16)
+    pivot = pivot.drop(columns=["n_other"])
+    pivot["n_media"] = (
+        pivot[[f"n_{k}" for k in MEDIA_TYPE_KEYS]].sum(axis=1) + pivot["n_media_other"]
+    ).astype(np.int16)
+    for key in MEDIA_TYPE_KEYS:
+        pivot[f"n_{key}"] = pivot[f"n_{key}"].astype(np.int16)
+    out = base.merge(pivot, on="tweet_id", how="left")
+    for c in ["n_media", "n_media_other", *[f"n_{k}" for k in MEDIA_TYPE_KEYS]]:
+        out[c] = out[c].fillna(0).astype(np.int16)
+    return out
+
+
+def attach_media_flags(df: pd.DataFrame, *, force: bool = False) -> pd.DataFrame:
+    """Join sparse CA tweet_media (with type breakdown) / tweet_urls flags."""
+    out = df.copy()
+    out["tweet_id"] = out["tweet_id"].astype(str)
+    ids = out["tweet_id"].tolist()
+    uniq = list(dict.fromkeys(ids))
+    print(f"Fetching attachment flags for {len(uniq):,} tweets…")
+
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache = pd.DataFrame()
+    if MEDIA_CACHE_PATH.exists() and not force:
+        cache = pd.read_parquet(MEDIA_CACHE_PATH)
+        cache["tweet_id"] = cache["tweet_id"].astype(str)
+        print(f"Loaded media cache: {len(cache):,} tweets")
+    have = set(cache["tweet_id"]) if len(cache) else set()
+    miss = [tid for tid in uniq if tid not in have]
+    print(f"  media cache: {len(uniq) - len(miss):,} hit, {len(miss):,} to fetch")
+    if miss:
+        raw = _fetch_tweet_media(miss)
+        fresh = _aggregate_media_types(raw, miss)
+        cache = fresh if cache.empty else pd.concat([cache, fresh], ignore_index=True)
+        cache = cache.drop_duplicates("tweet_id", keep="last")
+        cache.to_parquet(MEDIA_CACHE_PATH, index=False)
+        print(f"Wrote media cache: {MEDIA_CACHE_PATH} ({len(cache):,} tweets)", flush=True)
+
+    if cache.empty:
+        cache = _aggregate_media_types(pd.DataFrame(), uniq)
+    merged = out[["tweet_id"]].merge(cache, on="tweet_id", how="left")
+    out["n_media"] = merged["n_media"].fillna(0).astype(np.int16)
+    out["has_media"] = (out["n_media"] > 0).astype(np.int8)
+    for key in MEDIA_TYPE_KEYS:
+        ncol = f"n_{key}"
+        hcol = f"has_{key}"
+        out[ncol] = merged[ncol].fillna(0).astype(np.int16)
+        out[hcol] = (out[ncol] > 0).astype(np.int8)
+    out["n_media_other"] = merged["n_media_other"].fillna(0).astype(np.int16)
+    out["has_media_other"] = (out["n_media_other"] > 0).astype(np.int8)
+
+    url_counts = _fetch_id_counts("tweet_urls", "tweet_id", uniq)
+    out["n_ca_urls"] = out["tweet_id"].map(lambda t: url_counts.get(t, 0)).astype(np.int16)
+    out["has_ca_url"] = (out["n_ca_urls"] > 0).astype(np.int8)
+    print(
+        f"  media coverage: {out['has_media'].mean():.1%} "
+        f"(photo={out['has_photo'].mean():.1%}, video={out['has_video'].mean():.1%}, "
+        f"gif={out['has_animated_gif'].mean():.1%}), "
+        f"ca_url coverage: {out['has_ca_url'].mean():.1%}",
+        flush=True,
+    )
+    return out
 
 
 def refresh_media_derived(df: pd.DataFrame) -> pd.DataFrame:
@@ -263,6 +363,16 @@ def refresh_media_derived(df: pd.DataFrame) -> pd.DataFrame:
         out["media_x_hist_replies"] = out["has_media"].astype(np.float64) * out["hist_mean_replies"]
     if "inbound_replies" in out.columns:
         out["media_x_inbound_replies"] = out["has_media"].astype(np.float64) * out["inbound_replies"]
+    if "inbound_mentions" in out.columns:
+        out["media_x_inbound_mentions"] = out["has_media"].astype(np.float64) * out["inbound_mentions"]
+    # Type × popularity crosses (sparse but leakage-safe).
+    if "inbound_replies" in out.columns:
+        for key in MEDIA_TYPE_KEYS:
+            hcol = f"has_{key}"
+            if hcol in out.columns:
+                out[f"{key}_x_inbound_replies"] = (
+                    out[hcol].astype(np.float64) * out["inbound_replies"].astype(np.float64)
+                )
     print(
         f"Refreshed media-derived cols: hist_frac_media mean={out['hist_frac_media'].mean():.3f}, "
         f"has_media={out['has_media'].mean():.1%}",
@@ -1715,7 +1825,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--media-only",
         action="store_true",
-        help="Refetch CA tweet_media/tweet_urls flags onto an existing dataset.parquet",
+        help="Refetch CA tweet_media (with type breakdown) / tweet_urls onto dataset.parquet",
     )
     p.add_argument(
         "--mentions-only",
@@ -1741,6 +1851,11 @@ def parse_args() -> argparse.Namespace:
         "--force-uploads",
         action="store_true",
         help="Refetch archive_upload even when archive_upload_cache.parquet exists",
+    )
+    p.add_argument(
+        "--force-media",
+        action="store_true",
+        help="Refetch tweet_media even when media_cache.parquet has the tweet_id",
     )
     return p.parse_args()
 
@@ -1787,12 +1902,14 @@ def main() -> None:
             "has_media": float(dataset["has_media"].mean()) if "has_media" in dataset.columns else 0.0,
             "has_ca_url": float(dataset["has_ca_url"].mean()) if "has_ca_url" in dataset.columns else 0.0,
         }
-        dataset = attach_media_flags(dataset)
+        dataset = attach_media_flags(dataset, force=args.force_media)
         dataset = refresh_media_derived(dataset)
         dataset.to_parquet(DATASET_PATH, index=False)
         print(
             f"Media refresh: has_media {before['has_media']:.1%} → {dataset['has_media'].mean():.1%}, "
-            f"has_ca_url {before['has_ca_url']:.1%} → {dataset['has_ca_url'].mean():.1%}"
+            f"has_ca_url {before['has_ca_url']:.1%} → {dataset['has_ca_url'].mean():.1%}; "
+            f"photo={dataset['has_photo'].mean():.1%} video={dataset['has_video'].mean():.1%} "
+            f"gif={dataset['has_animated_gif'].mean():.1%}"
         )
         print(f"Wrote {DATASET_PATH} ({len(dataset):,} rows, {dataset.shape[1]} cols)")
         print(f"Done in {time.time() - t0:.1f}s")
@@ -1861,15 +1978,33 @@ def main() -> None:
         per_account_cap=args.per_account_cap,
         seed=args.seed,
     )
+    media_fill_cols = (
+        ("has_media", 0),
+        ("n_media", 0),
+        ("has_ca_url", 0),
+        ("n_ca_urls", 0),
+        ("has_photo", 0),
+        ("n_photo", 0),
+        ("has_video", 0),
+        ("n_video", 0),
+        ("has_animated_gif", 0),
+        ("n_animated_gif", 0),
+        ("has_media_other", 0),
+        ("n_media_other", 0),
+    )
     if args.skip_media:
+        reuse_cols = ["tweet_id", *[c for c, _ in media_fill_cols]]
         if DATASET_PATH.exists():
-            prev = pd.read_parquet(
-                DATASET_PATH,
-                columns=["tweet_id", "has_media", "n_media", "has_ca_url", "n_ca_urls"],
-            )
+            import pyarrow.parquet as pq
+
+            available = set(pq.ParquetFile(DATASET_PATH).schema_arrow.names)
+            cols = [c for c in reuse_cols if c in available]
+            prev = pd.read_parquet(DATASET_PATH, columns=cols)
             prev["tweet_id"] = prev["tweet_id"].astype(str)
             sampled = sampled.merge(prev, on="tweet_id", how="left")
-            for c, fill in (("has_media", 0), ("n_media", 0), ("has_ca_url", 0), ("n_ca_urls", 0)):
+            for c, fill in media_fill_cols:
+                if c not in sampled.columns:
+                    sampled[c] = fill
                 sampled[c] = sampled[c].fillna(fill).astype(np.int32)
             print(
                 f"Reused media flags from {DATASET_PATH.name}: "
@@ -1877,8 +2012,10 @@ def main() -> None:
             )
         else:
             print("No prior dataset for media reuse; media flags default to 0")
+            for c, fill in media_fill_cols:
+                sampled[c] = fill
     else:
-        sampled = attach_media_flags(sampled)
+        sampled = attach_media_flags(sampled, force=args.force_media)
     sampled = backfill_reply_user_from_dump(sampled)
     graph = load_author_graph(sampled["account_id"])
     featured = build_features(sampled, min_history=args.min_history, graph=graph)

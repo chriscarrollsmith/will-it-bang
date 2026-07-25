@@ -21,6 +21,7 @@ Process retrospective (what moved the scoreboard vs what burned cycles): [`logs/
 | Objective | Run | wa_nr_wmean | wa_rp_wmean | global_nr | rmse_log | Notes |
 |---|---|---:|---:|---:|---:|---|
 | **Default stack** | **v36c** | **0.249** | **0.276** | 0.569 | **0.602** | Hybrid + mentions + provenance features (`stream_x_log_age` #21 gain) |
+| Media types (opt-in) | v38b | **0.252** | 0.267 | **0.589** | 0.602 | `--media-types` after media refresh; +wa_nr/−wa_rp vs v38a — leave opt-in |
 | Prior (no provenance feats) | v36a / v35b | 0.225 / 0.242 | 0.251 / 0.266 | **0.593** / **0.579** | 0.602 / 0.605 | v36a = same-rebuild control (0% media); v35b had refreshed media |
 | Prior hybrid (no mentions) | v31b / v35a | 0.227 / 0.237 | 0.280 / 0.275 | 0.518 | 0.608 / 0.620 | v35a = same-rebuild control for v35b |
 | Level-only (ablation) | v31a | 0.187 | 0.172 | 0.508 | 0.610 | Asymmetric without hybrid blend |
@@ -100,6 +101,8 @@ Dump-time fav/RT used as author history → optimistic RMSE ~0.82 (v5). Invalid 
 | v37b2 | 0.603 (rate) | 0.521 | `--stream-fresh-days 90`: wa_* **frozen** (hybrid ranker); global_nr 0.569→**0.577**; rmse 0.602→0.603; under-pred flat; **leave opt-in** |
 | v37d | 0.604 (rate) | 0.521 | `--stream-fresh-days 180` (35% train affected): wa_* frozen; global_nr 0.575; rmse worse — no promote |
 | v37c | — | — | `--stream-fresh-days 30`: **no-op** under time holdout (train ages ≥~37d); harness now warns |
+| v38a | **0.600** (rate) | 0.521 | Media refresh 0%→9% (binary flags only): wa_nr **0.234** (−0.014 vs v36c), wa_rp 0.279, global_nr **0.587** |
+| v38b | 0.602 (rate) | 0.521 | `--media-types` (photo 7.7% / video 0.8% / gif 0.6%): wa_nr **0.252** (+0.018 vs v38a), wa_rp **0.267** (−0.013); `photo_x_inbound_replies` #33; **leave opt-in** |
 
 ### v37 stream-fresh weights (same rebuild; after asymmetric weight fix)
 
@@ -111,6 +114,14 @@ Dump-time fav/RT used as author history → optimistic RMSE ~0.82 (v5). Invalid 
 | v37c | 30 | 0.249 | 0.276 | 0.569 | 0.602 | 0 affected — time-holdout no-op |
 
 Bugfix: custom asymmetric MSE ignored `Dataset` sample weights (LightGBM does not apply them to Python objectives). Pre-fix v37b matched control bit-for-bit despite n_affected>0. Fix is neutral when weights are uniform (default stack). `--nonreply-weight` under asymmetric was similarly inert before the fix.
+
+### v38 media types (same rebuild after `--media-only`)
+
+| Run | wa_nr | wa_rp | global_nr | rmse | Notes |
+|---|---:|---:|---:|---:|---|
+| v36c (0% media) | 0.249 | **0.276** | 0.569 | 0.602 | Prior default (skip-media) |
+| v38a binary media | 0.234 | 0.279 | 0.587 | **0.600** | Refresh only |
+| v38b + types | **0.252** | 0.267 | **0.589** | 0.602 | Opt-in `--media-types` |
 
 ### v36 regime holdout / provenance features (same rebuild)
 
@@ -153,7 +164,7 @@ Fair revisit of prior ablations after the metric lock. Control = asymmetric leve
 ## Failure modes (still open)
 
 - High-engagement **non-replies** (viral under-prediction); often already-hot authors. Improved by SERA (v28b: mean under-pred 2.22→2.04) but still open.
-- **Media** / short+image posts — API refresh restored ~9% coverage (v18); binary flags still low gain vs interactions/`hist_frac_media`.
+- **Media** / short+image posts — API refresh restores ~9% coverage (v18/v38a); binary-only refresh can regress wa_nr vs 0% media; type breakdown (v38b) recovers NR at reply cost — `--media-types` opt-in. Caption/vision still open.
 - **Quote** tweets when parent missing from CA dump (~10% quote-parent coverage).
 
 ---
@@ -192,7 +203,7 @@ Check off when tried; note outcome in one line.
 ### Vision / media
 - [x] Full CA media/url API pass on the scaled set — **v18: tied rate RMSE** (0.642), Spearman 0.427→0.441; coverage 5%→9% media / 4%→7% ca_url (`prepare.py --media-only`)
 - [ ] Image caption or vision embedding for tweets with media URLs
-- [ ] Media-type breakdown (photo / gif / video) if available
+- [x] Media-type breakdown (photo / gif / video) — **v38b:** vs binary refresh wa_nr +0.018 / wa_rp −0.013; `photo_x_inbound_replies` mid-gain; leave `--media-types` **opt-in** (cache `media_cache.parquet`)
 
 ### Graph / archive denser still
 - [x] Timestamped mention joins (via dump tweet join; `user_mentions` alone has no time) — **v35b: keep default**; vs same-rebuild wa_nr +0.006 / wa_rp −0.009 / rmse −0.015 / global_nr +0.061; `prepare.py --mentions-only`
