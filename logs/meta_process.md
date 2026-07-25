@@ -121,7 +121,7 @@ If (2)–(3) fail, treat as mechanism research — not a scoreboard bet. ε is a
 ## Still open (high EV)
 
 - Viral non-reply under-prediction (improved by SERA magnitude, still open on rank)
-- Quote parents missing from CA (X API fallback); media **captions/vision** beyond type flags
+- Quote/reply parents missing from CA — X API fallback landed (resumable `x_parent_cache`); scoreboard ablation still open; media **captions/vision** beyond type flags
 - Regime-specific heads / min-upload-hist once stream history is long enough for a stable stream-only scoreboard
 - Fixed-horizon labels if CA/X ever provide time-series engagement
 

@@ -25,6 +25,7 @@ import pandas as pd
 import requests
 import torch
 import torch.nn.functional as F
+from requests_oauthlib import OAuth1Session
 from transformers import AutoModel, AutoTokenizer
 
 # ---------------------------------------------------------------------------
@@ -38,8 +39,13 @@ EMBED_CACHE_PATH = CACHE_DIR / "embed_cache.parquet"
 MENTION_CACHE_PATH = CACHE_DIR / "mention_cache.parquet"
 UPLOAD_CACHE_PATH = CACHE_DIR / "archive_upload_cache.parquet"
 MEDIA_CACHE_PATH = CACHE_DIR / "media_cache.parquet"
+X_PARENT_CACHE_PATH = CACHE_DIR / "x_parent_cache.parquet"
 # CA tweet_media.media_type values observed in the public API.
 MEDIA_TYPE_KEYS = ("photo", "video", "animated_gif")
+# Terminal X lookup statuses — do not re-request on resume.
+X_PARENT_DONE_STATUSES = frozenset({"ok", "not_found", "forbidden"})
+X_TWEETS_URL = "https://api.x.com/2/tweets"
+X_TWEETS_BATCH = 100
 EMBED_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"  # Apache-2.0
 PARQUET_URL = (
     "https://fabxmporizzqflnftavs.supabase.co/storage/v1/object/public/"
@@ -1214,6 +1220,262 @@ def attach_embeddings(df: pd.DataFrame, batch_size: int) -> pd.DataFrame:
     return pd.concat([df.reset_index(drop=True), merged[emb_cols].reset_index(drop=True)], axis=1)
 
 
+class XParentFetchInterrupted(Exception):
+    """Raised when X API rate/credits stop a fetch; cache is already flushed."""
+
+    def __init__(self, message: str, *, fetched: int, remaining: int):
+        super().__init__(message)
+        self.fetched = fetched
+        self.remaining = remaining
+
+
+def _x_oauth_session() -> OAuth1Session | None:
+    ck = os.environ.get("X_CONSUMER_KEY", "").strip()
+    cs = os.environ.get("X_CONSUMER_KEY_SECRET", "").strip()
+    at = os.environ.get("X_ACCESS_TOKEN", "").strip()
+    ats = os.environ.get("X_ACCESS_TOKEN_SECRET", "").strip()
+    if not (ck and cs and at and ats):
+        return None
+    return OAuth1Session(ck, client_secret=cs, resource_owner_key=at, resource_owner_secret=ats)
+
+
+def _empty_x_parent_cache() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=[
+            "tweet_id",
+            "account_id",
+            "full_text",
+            "created_at",
+            "reply_to_tweet_id",
+            "quoted_tweet_id",
+            "fetch_status",
+            "fetched_at",
+        ]
+    )
+
+
+def load_x_parent_cache() -> pd.DataFrame:
+    if not X_PARENT_CACHE_PATH.exists():
+        return _empty_x_parent_cache()
+    cache = pd.read_parquet(X_PARENT_CACHE_PATH)
+    cache["tweet_id"] = cache["tweet_id"].astype(str)
+    if "fetch_status" not in cache.columns:
+        cache["fetch_status"] = "ok"
+    return cache
+
+
+def save_x_parent_cache(cache: pd.DataFrame) -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    out = cache.drop_duplicates("tweet_id", keep="last").reset_index(drop=True)
+    out.to_parquet(X_PARENT_CACHE_PATH, index=False)
+
+
+def _parse_x_tweet_row(tweet: dict) -> dict:
+    reply_to = None
+    quoted = None
+    for ref in tweet.get("referenced_tweets") or []:
+        typ = ref.get("type")
+        rid = ref.get("id")
+        if typ == "replied_to" and rid:
+            reply_to = str(rid)
+        elif typ == "quoted" and rid:
+            quoted = str(rid)
+    return {
+        "tweet_id": str(tweet["id"]),
+        "account_id": str(tweet["author_id"]) if tweet.get("author_id") is not None else pd.NA,
+        "full_text": tweet.get("text") or "",
+        "created_at": tweet.get("created_at"),
+        "reply_to_tweet_id": reply_to,
+        "quoted_tweet_id": quoted,
+        "fetch_status": "ok",
+        "fetched_at": pd.Timestamp.now(tz="UTC").isoformat(),
+    }
+
+
+def _x_error_status(err: dict) -> str:
+    title = str(err.get("title") or "").lower()
+    detail = str(err.get("detail") or "").lower()
+    typ = str(err.get("type") or "").lower()
+    blob = f"{title} {detail} {typ}"
+    if "not found" in blob or "could not find" in blob:
+        return "not_found"
+    if "forbidden" in blob or "not authorized" in blob or "protected" in blob:
+        return "forbidden"
+    return "not_found"
+
+
+def _is_quota_http_status(status: int) -> bool:
+    return status in {402, 429}
+
+
+def _x_parent_rows_from_cache(tweet_ids: list[str], cache: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Dump-shaped ok rows for ids already in the X parent cache (no API calls)."""
+    cols = [
+        "tweet_id",
+        "account_id",
+        "full_text",
+        "created_at",
+        "reply_to_tweet_id",
+        "quoted_tweet_id",
+    ]
+    empty = pd.DataFrame(columns=cols)
+    if not tweet_ids:
+        return empty
+    if cache is None:
+        cache = load_x_parent_cache()
+    if cache.empty:
+        return empty
+    want = set(tweet_ids)
+    ok = cache.loc[
+        (cache["tweet_id"].isin(want)) & (cache["fetch_status"] == "ok"),
+        cols,
+    ].copy()
+    if ok.empty:
+        return empty
+    ok["created_at"] = pd.to_datetime(ok["created_at"], utc=True, errors="coerce")
+    ok = ok.loc[ok["created_at"].notna()].copy()
+    return ok.reset_index(drop=True)
+
+
+def fetch_x_parent_tweets(
+    tweet_ids: pd.Series | list[str] | np.ndarray,
+    *,
+    force: bool = False,
+) -> pd.DataFrame:
+    """Lookup missing parents via X API; cache after every batch for resume.
+
+    Returns dump-shaped parent rows with fetch_status == 'ok' only.
+    On rate-limit / credit exhaustion, flushes the cache and raises
+    XParentFetchInterrupted so callers can keep going with partial coverage.
+    """
+    uniq = list(dict.fromkeys(str(t) for t in tweet_ids if pd.notna(t) and str(t)))
+    if not uniq:
+        return _x_parent_rows_from_cache([])
+
+    cache = _empty_x_parent_cache() if force else load_x_parent_cache()
+    if force and X_PARENT_CACHE_PATH.exists():
+        print(f"Force X parent refetch: ignoring {X_PARENT_CACHE_PATH.name}", flush=True)
+
+    have_done: set[str] = set()
+    if not cache.empty:
+        done = cache.loc[cache["fetch_status"].isin(X_PARENT_DONE_STATUSES), "tweet_id"]
+        have_done = set(done.astype(str))
+    miss = [tid for tid in uniq if tid not in have_done]
+    n_hit = len(uniq) - len(miss)
+    print(f"X parent cache: {n_hit:,}/{len(uniq):,} done, {len(miss):,} to fetch", flush=True)
+
+    if miss:
+        sess = _x_oauth_session()
+        if sess is None:
+            print(
+                "X parent fetch skipped: set X_CONSUMER_KEY / X_CONSUMER_KEY_SECRET / "
+                "X_ACCESS_TOKEN / X_ACCESS_TOKEN_SECRET to enable fallback",
+                flush=True,
+            )
+        else:
+            params_base = {
+                "tweet.fields": "created_at,author_id,text,referenced_tweets",
+            }
+            fetched = 0
+            now_iso = lambda: pd.Timestamp.now(tz="UTC").isoformat()
+            for start in range(0, len(miss), X_TWEETS_BATCH):
+                batch = miss[start : start + X_TWEETS_BATCH]
+                params = {**params_base, "ids": ",".join(batch)}
+                try:
+                    resp = sess.get(X_TWEETS_URL, params=params, timeout=60)
+                except requests.RequestException as exc:
+                    save_x_parent_cache(cache)
+                    raise XParentFetchInterrupted(
+                        f"X parent fetch network error after {fetched:,} new rows: {exc}",
+                        fetched=fetched,
+                        remaining=len(miss) - start,
+                    ) from exc
+
+                if _is_quota_http_status(resp.status_code) or resp.status_code in {401, 403}:
+                    save_x_parent_cache(cache)
+                    retry_after = resp.headers.get("retry-after") or resp.headers.get(
+                        "x-rate-limit-reset"
+                    )
+                    raise XParentFetchInterrupted(
+                        f"X parent fetch stopped on HTTP {resp.status_code}"
+                        f"{f' (retry-after/reset={retry_after})' if retry_after else ''}; "
+                        f"cache has {len(cache):,} rows. "
+                        f"Re-run: uv run prepare.py --parent-only",
+                        fetched=fetched,
+                        remaining=len(miss) - start,
+                    )
+
+                if resp.status_code != 200:
+                    save_x_parent_cache(cache)
+                    raise XParentFetchInterrupted(
+                        f"X parent fetch HTTP {resp.status_code}: {resp.text[:300]}",
+                        fetched=fetched,
+                        remaining=len(miss) - start,
+                    )
+
+                body = resp.json()
+                rows: list[dict] = []
+                seen: set[str] = set()
+                for tweet in body.get("data") or []:
+                    row = _parse_x_tweet_row(tweet)
+                    rows.append(row)
+                    seen.add(row["tweet_id"])
+                ts = now_iso()
+                for err in body.get("errors") or []:
+                    rid = err.get("resource_id") or err.get("value")
+                    if rid is None:
+                        continue
+                    tid = str(rid)
+                    if tid in seen:
+                        continue
+                    rows.append(
+                        {
+                            "tweet_id": tid,
+                            "account_id": pd.NA,
+                            "full_text": "",
+                            "created_at": pd.NaT,
+                            "reply_to_tweet_id": None,
+                            "quoted_tweet_id": None,
+                            "fetch_status": _x_error_status(err),
+                            "fetched_at": ts,
+                        }
+                    )
+                    seen.add(tid)
+                for tid in batch:
+                    if tid not in seen:
+                        rows.append(
+                            {
+                                "tweet_id": tid,
+                                "account_id": pd.NA,
+                                "full_text": "",
+                                "created_at": pd.NaT,
+                                "reply_to_tweet_id": None,
+                                "quoted_tweet_id": None,
+                                "fetch_status": "not_found",
+                                "fetched_at": ts,
+                            }
+                        )
+
+                batch_df = pd.DataFrame(rows)
+                cache = batch_df if cache.empty else pd.concat([cache, batch_df], ignore_index=True)
+                cache = cache.drop_duplicates("tweet_id", keep="last")
+                save_x_parent_cache(cache)
+                fetched += len(batch)
+                if start == 0 or ((start // X_TWEETS_BATCH) % 5 == 0) or start + X_TWEETS_BATCH >= len(miss):
+                    print(
+                        f"  X parents: {min(start + len(batch), len(miss)):,}/{len(miss):,} "
+                        f"(cache={len(cache):,})",
+                        flush=True,
+                    )
+                # Be polite on free/basic tiers; cache already durable if we die.
+                if start + X_TWEETS_BATCH < len(miss):
+                    time.sleep(0.5)
+
+    ok = _x_parent_rows_from_cache(uniq, cache)
+    print(f"  X parents usable: {len(ok):,}/{len(uniq):,} requested", flush=True)
+    return ok
+
+
 def load_tweets_by_id(tweet_ids: pd.Series) -> pd.DataFrame:
     """Fetch parent tweet rows from the dump (text + structure only; no fav/RT inputs)."""
     ids = pd.DataFrame({"tweet_id": tweet_ids.astype(str).dropna().unique()})
@@ -1406,8 +1668,27 @@ def _attach_one_parent_prefix(
     return out
 
 
-def attach_parent_context(df: pd.DataFrame, batch_size: int) -> pd.DataFrame:
-    """Join reply/quote parents from the dump; add leakage-safe context features."""
+def _empty_parent_feature_frame(out: pd.DataFrame) -> pd.DataFrame:
+    for prefix in ("reply", "quote"):
+        out[f"has_{prefix}_parent"] = 0
+        out[f"{prefix}_parent_emb_cos"] = 0.0
+        out[f"{prefix}_parent_log_text_len"] = 0.0
+        out[f"{prefix}_parent_is_reply"] = 0
+        out[f"{prefix}_parent_is_quote"] = 0
+        out[f"{prefix}_parent_same_author"] = 0
+        out[f"{prefix}_parent_age_hours"] = 0.0
+        out[f"{prefix}_parent_replies"] = 0.0
+    return out
+
+
+def attach_parent_context(
+    df: pd.DataFrame,
+    batch_size: int,
+    *,
+    use_x: bool = True,
+    force_x: bool = False,
+) -> pd.DataFrame:
+    """Join reply/quote parents from the dump (+ optional X API); leakage-safe context."""
     out = df.reset_index(drop=True).copy()
     if "reply_to_tweet_id" not in out.columns or "quoted_tweet_id" not in out.columns:
         raise RuntimeError("Dataset missing reply_to_tweet_id / quoted_tweet_id for parent join")
@@ -1421,28 +1702,50 @@ def attach_parent_context(df: pd.DataFrame, batch_size: int) -> pd.DataFrame:
         flush=True,
     )
     if all_ids.empty:
-        for prefix in ("reply", "quote"):
-            out[f"has_{prefix}_parent"] = 0
-            out[f"{prefix}_parent_emb_cos"] = 0.0
-            out[f"{prefix}_parent_log_text_len"] = 0.0
-            out[f"{prefix}_parent_is_reply"] = 0
-            out[f"{prefix}_parent_is_quote"] = 0
-            out[f"{prefix}_parent_same_author"] = 0
-            out[f"{prefix}_parent_age_hours"] = 0.0
-            out[f"{prefix}_parent_replies"] = 0.0
-        return out
+        return _empty_parent_feature_frame(out)
 
     parents = load_tweets_by_id(all_ids)
+    dump_ids = set(parents["tweet_id"].astype(str)) if not parents.empty else set()
+    missing = [tid for tid in all_ids.astype(str).tolist() if tid not in dump_ids]
+    print(f"  dump parents: {len(dump_ids):,}; missing for X fallback: {len(missing):,}", flush=True)
+
+    x_interrupted = False
+    if use_x and missing:
+        try:
+            x_parents = fetch_x_parent_tweets(missing, force=force_x)
+        except XParentFetchInterrupted as exc:
+            x_interrupted = True
+            print(f"WARNING: {exc}", flush=True)
+            # Cache was flushed before the raise; do not re-hit the API.
+            x_parents = _x_parent_rows_from_cache(missing)
+            print(
+                f"  continuing with {len(x_parents):,} cached X parents "
+                f"({exc.remaining:,} ids still pending)",
+                flush=True,
+            )
+        if not x_parents.empty:
+            parents = (
+                x_parents
+                if parents.empty
+                else pd.concat([parents, x_parents], ignore_index=True)
+            )
+            # Prefer dump row when both exist.
+            parents = parents.drop_duplicates("tweet_id", keep="first")
+            print(
+                f"  parents after X merge: {len(parents):,} "
+                f"(+{len(x_parents):,} from X/cache)",
+                flush=True,
+            )
+    elif missing and not use_x:
+        print("  X parent fallback disabled (--no-x-parents)", flush=True)
+
     if parents.empty:
-        for prefix in ("reply", "quote"):
-            out[f"has_{prefix}_parent"] = 0
-            out[f"{prefix}_parent_emb_cos"] = 0.0
-            out[f"{prefix}_parent_log_text_len"] = 0.0
-            out[f"{prefix}_parent_is_reply"] = 0
-            out[f"{prefix}_parent_is_quote"] = 0
-            out[f"{prefix}_parent_same_author"] = 0
-            out[f"{prefix}_parent_age_hours"] = 0.0
-            out[f"{prefix}_parent_replies"] = 0.0
+        out = _empty_parent_feature_frame(out)
+        if x_interrupted:
+            print(
+                "Parent features empty after interrupt; re-run: uv run prepare.py --parent-only",
+                flush=True,
+            )
         return out
 
     parents = parents.drop_duplicates("tweet_id", keep="first").set_index("tweet_id")
@@ -1468,6 +1771,12 @@ def attach_parent_context(df: pd.DataFrame, batch_size: int) -> pd.DataFrame:
         f"quote parent coverage: {out['has_quote_parent'].mean():.1%}",
         flush=True,
     )
+    if x_interrupted:
+        print(
+            "X parent fetch incomplete — cache is durable; "
+            "re-run: uv run prepare.py --parent-only",
+            flush=True,
+        )
     return out
 
 
@@ -1815,7 +2124,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--parent-only",
         action="store_true",
-        help="Only add reply/quote parent features onto an existing dataset.parquet",
+        help="Only add reply/quote parent features onto an existing dataset.parquet "
+        "(resumes X parent cache if a prior fetch stopped on rate/credits)",
+    )
+    p.add_argument(
+        "--no-x-parents",
+        action="store_true",
+        help="Do not call X API for reply/quote parents missing from the CA dump",
+    )
+    p.add_argument(
+        "--force-x-parents",
+        action="store_true",
+        help="Refetch X parents even when x_parent_cache.parquet already has the tweet_id",
     )
     p.add_argument(
         "--urls-only",
@@ -1955,6 +2275,14 @@ def main() -> None:
         dataset = dataset.drop_duplicates("tweet_id", keep="first")
         if len(dataset) != before:
             print(f"Dropped {before - len(dataset):,} duplicate tweet_id rows", flush=True)
+        before_cov = {
+            "reply": float(dataset["has_reply_parent"].mean())
+            if "has_reply_parent" in dataset.columns
+            else None,
+            "quote": float(dataset["has_quote_parent"].mean())
+            if "has_quote_parent" in dataset.columns
+            else None,
+        }
         drop_cols = [
             c
             for c in dataset.columns
@@ -1965,7 +2293,19 @@ def main() -> None:
         dataset = backfill_ref_ids_from_dump(dataset)
         if not any(c.startswith("emb_") for c in dataset.columns):
             raise SystemExit("Dataset has no emb_* columns; run full prepare first")
-        dataset = attach_parent_context(dataset, batch_size=args.embed_batch_size)
+        dataset = attach_parent_context(
+            dataset,
+            batch_size=args.embed_batch_size,
+            use_x=not args.no_x_parents,
+            force_x=args.force_x_parents,
+        )
+        if before_cov["reply"] is not None:
+            print(
+                f"Parent coverage: reply {before_cov['reply']:.1%} → "
+                f"{dataset['has_reply_parent'].mean():.1%}, "
+                f"quote {before_cov['quote']:.1%} → {dataset['has_quote_parent'].mean():.1%}",
+                flush=True,
+            )
         dataset.to_parquet(DATASET_PATH, index=False)
         print(f"Wrote {DATASET_PATH} ({len(dataset):,} rows, {dataset.shape[1]} cols)")
         print(f"Done in {time.time() - t0:.1f}s")
@@ -2023,7 +2363,12 @@ def main() -> None:
 
     dataset = attach_embeddings(featured, batch_size=args.embed_batch_size)
     del featured
-    dataset = attach_parent_context(dataset, batch_size=args.embed_batch_size)
+    dataset = attach_parent_context(
+        dataset,
+        batch_size=args.embed_batch_size,
+        use_x=not args.no_x_parents,
+        force_x=args.force_x_parents,
+    )
     dataset = attach_url_domains(dataset, force=args.force_urls)
     dataset = attach_upload_end_features(dataset, force=args.force_uploads)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
