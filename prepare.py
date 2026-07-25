@@ -38,6 +38,7 @@ RAW_PARQUET = CACHE_DIR / "enriched_tweets.parquet"
 DATASET_PATH = CACHE_DIR / "dataset.parquet"
 EMBED_CACHE_PATH = CACHE_DIR / "embed_cache.parquet"
 MENTION_CACHE_PATH = CACHE_DIR / "mention_cache.parquet"
+INTERLOCUTOR_CACHE_PATH = CACHE_DIR / "interlocutor_cache.parquet"
 UPLOAD_CACHE_PATH = CACHE_DIR / "archive_upload_cache.parquet"
 MEDIA_CACHE_PATH = CACHE_DIR / "media_cache.parquet"
 X_PARENT_CACHE_PATH = CACHE_DIR / "x_parent_cache.parquet"
@@ -791,6 +792,213 @@ def load_mention_times(account_ids: pd.Series, *, force: bool = False) -> dict[s
         flush=True,
     )
     return _sorted_time_map(usable, "mentioned_user_id")
+
+
+def _empty_interlocutor_cache() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=[
+            "ego_account_id",
+            "partner_account_id",
+            "tweet_id",
+            "created_at",
+            "kind",
+            "full_text",
+        ]
+    )
+
+
+def load_interlocutor_events(
+    account_ids: pd.Series,
+    *,
+    force: bool = False,
+    include_mentions: bool = True,
+) -> pd.DataFrame:
+    """Inbound reply/quote/(optional mention) tweets directed at sampled authors.
+
+    Cached by ego account_id. Used for interlocutor MiniLM affinity: mean of
+    pre-T interaction-tweet embeddings vs the author's current tweet.
+    """
+    accounts = sorted({str(a) for a in account_ids.astype(str).tolist()})
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cached = _empty_interlocutor_cache()
+    if INTERLOCUTOR_CACHE_PATH.exists() and not force:
+        cached = pd.read_parquet(INTERLOCUTOR_CACHE_PATH)
+        for col in ("ego_account_id", "partner_account_id", "tweet_id", "kind"):
+            if col in cached.columns:
+                cached[col] = cached[col].astype(str)
+        if "full_text" not in cached.columns:
+            cached["full_text"] = ""
+        print(f"Interlocutor cache: {len(cached):,} rows ({INTERLOCUTOR_CACHE_PATH.name})")
+    have = set(cached["ego_account_id"].unique()) if len(cached) else set()
+    # Sentinel rows mark egos with zero inbound events so we do not rescan.
+    missing = [a for a in accounts if a not in have]
+    if missing:
+        print(f"Scanning dump for interlocutor events on {len(missing):,} accounts…", flush=True)
+        tmp = CACHE_DIR / "_interlocutor_account_ids.parquet"
+        pd.DataFrame({"account_id": missing}).to_parquet(tmp, index=False)
+        path = str(RAW_PARQUET)
+        con = duckdb.connect()
+        con.execute(f"SET threads TO {max(1, os.cpu_count() or 4)}")
+        reply_df = con.execute(
+            f"""
+            WITH acc AS (SELECT account_id FROM read_parquet('{tmp}')),
+            auth AS (
+              SELECT CAST(t.tweet_id AS VARCHAR) AS tid,
+                     CAST(t.account_id AS VARCHAR) AS aid
+              FROM read_parquet('{path}') t
+              SEMI JOIN acc ON CAST(t.account_id AS VARCHAR) = acc.account_id
+              WHERE t.full_text IS NOT NULL AND t.full_text NOT LIKE 'RT @%'
+            )
+            SELECT
+              p.aid AS ego_account_id,
+              CAST(r.account_id AS VARCHAR) AS partner_account_id,
+              CAST(r.tweet_id AS VARCHAR) AS tweet_id,
+              r.created_at,
+              'reply' AS kind,
+              r.full_text
+            FROM read_parquet('{path}') r
+            JOIN auth p ON CAST(r.reply_to_tweet_id AS VARCHAR) = p.tid
+            WHERE r.reply_to_tweet_id IS NOT NULL
+              AND CAST(r.account_id AS VARCHAR) != p.aid
+              AND r.full_text IS NOT NULL
+              AND r.full_text NOT LIKE 'RT @%'
+            """
+        ).fetchdf()
+        quote_df = con.execute(
+            f"""
+            WITH acc AS (SELECT account_id FROM read_parquet('{tmp}')),
+            auth AS (
+              SELECT CAST(t.tweet_id AS VARCHAR) AS tid,
+                     CAST(t.account_id AS VARCHAR) AS aid
+              FROM read_parquet('{path}') t
+              SEMI JOIN acc ON CAST(t.account_id AS VARCHAR) = acc.account_id
+              WHERE t.full_text IS NOT NULL AND t.full_text NOT LIKE 'RT @%'
+            )
+            SELECT
+              p.aid AS ego_account_id,
+              CAST(r.account_id AS VARCHAR) AS partner_account_id,
+              CAST(r.tweet_id AS VARCHAR) AS tweet_id,
+              r.created_at,
+              'quote' AS kind,
+              r.full_text
+            FROM read_parquet('{path}') r
+            JOIN auth p ON CAST(r.quoted_tweet_id AS VARCHAR) = p.tid
+            WHERE r.quoted_tweet_id IS NOT NULL
+              AND CAST(r.account_id AS VARCHAR) != p.aid
+              AND r.full_text IS NOT NULL
+              AND r.full_text NOT LIKE 'RT @%'
+            """
+        ).fetchdf()
+        mention_df = _empty_interlocutor_cache()
+        if include_mentions and MENTION_CACHE_PATH.exists():
+            # Mention cache stores inbound @ events; join dump for mentioner + text.
+            mc = pd.read_parquet(MENTION_CACHE_PATH)
+            mc["mentioned_user_id"] = mc["mentioned_user_id"].astype(str)
+            mc["tweet_id"] = mc["tweet_id"].astype(str)
+            mc = mc[
+                mc["mentioned_user_id"].isin(missing)
+                & mc["tweet_id"].ne("")
+            ][["mentioned_user_id", "tweet_id"]].drop_duplicates()
+            if len(mc):
+                mt = CACHE_DIR / "_interlocutor_mention_ids.parquet"
+                mc.to_parquet(mt, index=False)
+                mention_df = con.execute(
+                    f"""
+                    SELECT
+                      m.mentioned_user_id AS ego_account_id,
+                      CAST(t.account_id AS VARCHAR) AS partner_account_id,
+                      CAST(t.tweet_id AS VARCHAR) AS tweet_id,
+                      t.created_at,
+                      'mention' AS kind,
+                      t.full_text
+                    FROM read_parquet('{mt}') m
+                    JOIN read_parquet('{path}') t
+                      ON CAST(t.tweet_id AS VARCHAR) = m.tweet_id
+                    WHERE t.full_text IS NOT NULL
+                      AND t.full_text NOT LIKE 'RT @%'
+                      AND CAST(t.account_id AS VARCHAR) != m.mentioned_user_id
+                    """
+                ).fetchdf()
+                try:
+                    mt.unlink()
+                except OSError:
+                    pass
+        con.close()
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+        new_parts = [p for p in (reply_df, quote_df, mention_df) if p is not None and len(p)]
+        fresh = pd.concat(new_parts, ignore_index=True) if new_parts else _empty_interlocutor_cache()
+        if len(fresh):
+            fresh["ego_account_id"] = fresh["ego_account_id"].astype(str)
+            fresh["partner_account_id"] = fresh["partner_account_id"].astype(str)
+            fresh["tweet_id"] = fresh["tweet_id"].astype(str)
+            fresh["kind"] = fresh["kind"].astype(str)
+            fresh["full_text"] = fresh["full_text"].fillna("").astype(str)
+            fresh["created_at"] = pd.to_datetime(fresh["created_at"], utc=True, errors="coerce")
+            fresh = fresh[fresh["created_at"].notna()]
+            fresh = fresh.drop_duplicates(["ego_account_id", "tweet_id", "kind"], keep="last")
+
+        seen_ego = set(fresh["ego_account_id"].unique()) if len(fresh) else set()
+        zero = [a for a in missing if a not in seen_ego]
+        pieces = [cached, fresh]
+        if zero:
+            pieces.append(
+                pd.DataFrame(
+                    {
+                        "ego_account_id": zero,
+                        "partner_account_id": [""] * len(zero),
+                        "tweet_id": [""] * len(zero),
+                        "created_at": pd.to_datetime([pd.NaT] * len(zero), utc=True),
+                        "kind": ["none"] * len(zero),
+                        "full_text": [""] * len(zero),
+                    }
+                )
+            )
+        cached = pd.concat([p for p in pieces if len(p)], ignore_index=True)
+        cached = cached.drop_duplicates(["ego_account_id", "tweet_id", "kind"], keep="last")
+        cached.to_parquet(INTERLOCUTOR_CACHE_PATH, index=False)
+        n_evt = int((cached["tweet_id"].astype(str) != "").sum())
+        print(
+            f"Wrote interlocutor cache: {n_evt:,} events / {len(cached):,} rows → "
+            f"{INTERLOCUTOR_CACHE_PATH} ({len(zero):,} zero-inbound accounts marked)",
+            flush=True,
+        )
+
+    usable = cached[
+        cached["ego_account_id"].isin(accounts)
+        & cached["tweet_id"].astype(str).ne("")
+        & cached["created_at"].notna()
+    ].copy()
+    usable["created_at"] = pd.to_datetime(usable["created_at"], utc=True, errors="coerce")
+    usable = usable[usable["created_at"].notna()]
+    print(
+        f"  usable interlocutor events: {len(usable):,} for "
+        f"{usable['ego_account_id'].nunique():,}/{len(accounts):,} accounts "
+        f"({(usable['ego_account_id'].nunique() / max(len(accounts), 1)):.1%} coverage)",
+        flush=True,
+    )
+    return usable.reset_index(drop=True)
+
+
+def ensure_interlocutor_embeddings(
+    events: pd.DataFrame,
+    *,
+    batch_size: int = 256,
+) -> pd.DataFrame:
+    """Ensure MiniLM vectors for interlocutor interaction tweets; return emb cols merged."""
+    if events.empty:
+        return events
+    cache = ensure_embed_cache(events["tweet_id"], events["full_text"], batch_size=batch_size)
+    emb_cols = [c for c in cache.columns if c.startswith("emb_")]
+    merged = events.drop(columns=[c for c in events.columns if c.startswith("emb_")], errors="ignore")
+    merged = merged.merge(cache[["tweet_id", *emb_cols]], on="tweet_id", how="left")
+    if merged[emb_cols[0]].isna().any():
+        n_miss = int(merged[emb_cols[0]].isna().sum())
+        raise RuntimeError(f"Missing interlocutor embeddings after cache merge ({n_miss})")
+    return merged
 
 
 def load_author_graph(account_ids: pd.Series) -> dict:
@@ -2327,6 +2535,17 @@ def parse_args() -> argparse.Namespace:
         help="Add timestamped inbound @-mention features onto an existing dataset.parquet",
     )
     p.add_argument(
+        "--interlocutor-only",
+        action="store_true",
+        help="Build/refresh interlocutor_cache.parquet (inbound reply/quote/mention texts) "
+        "and embed those tweets for train --interlocutor-emb-affinity",
+    )
+    p.add_argument(
+        "--force-interlocutor",
+        action="store_true",
+        help="Rescan dump interlocutor events even when interlocutor_cache.parquet has the account_id",
+    )
+    p.add_argument(
         "--provenance-only",
         action="store_true",
         help="Attach archive_upload_id / is_stream / upload-end features onto an existing dataset.parquet",
@@ -2374,6 +2593,19 @@ def main() -> None:
         dataset = attach_inbound_mentions(dataset, force=args.force_mentions)
         dataset.to_parquet(DATASET_PATH, index=False)
         print(f"Wrote {DATASET_PATH} ({len(dataset):,} rows, {dataset.shape[1]} cols)")
+        print(f"Done in {time.time() - t0:.1f}s")
+        return
+
+    if args.interlocutor_only:
+        if not DATASET_PATH.exists():
+            raise SystemExit(f"Missing {DATASET_PATH} for --interlocutor-only")
+        dataset = pd.read_parquet(DATASET_PATH)
+        events = load_interlocutor_events(
+            dataset["account_id"],
+            force=args.force_interlocutor,
+        )
+        if len(events):
+            ensure_interlocutor_embeddings(events, batch_size=args.embed_batch_size)
         print(f"Done in {time.time() - t0:.1f}s")
         return
 
