@@ -68,6 +68,7 @@ Any time you have to look up how to do something you might want to do again, add
 - Opt-in GPBoost account RE: `uv run train.py --model gpboost` (Apache-2.0; defaults `--no-account-te`; forces MSE — custom objectives unsupported with `gp_model`; set `bagging_freq=0`); **v27c regress** vs LGBM+TE — leave LGBM default.
 - Link/domain features: `uv run prepare.py --urls-only` caches CA `tweet_urls` domains in `~/.cache/will-it-bang/url_cache.parquet`; train adds train-fold `domain_mean_rate` (min_count=30). Flat on rate RMSE in v16 (~7% expanded-domain coverage).
 - LM tone labels (wrongheaded/infuriating): `uv run modal run label_provoke.py --nonreply-only` → `provoke_cache_Qwen__Qwen3-8B.parquet`; train with `--provoke-labels --provoke-cache …`. Default rater Qwen3-8B (Apache-2.0); Qwen3.6-27B works on A100 but ~20× slower without batched multimodal gen. Flat rate RMSE in v17b.
+- LM reply/quote agree–disagree vs parent: `uv run python label_stance.py --local --limit 500` (Qwen2.5-1.5B CPU smoke) or `uv run modal run label_stance.py` (Qwen3-8B); cache `stance_cache_<model>.parquet`; train `--stance-labels [--stance-cache …]`.
 - Vision smoke (Gemini vs SigLIP): `uv run vision_smoke.py --limit 500` with `GEMINI_API_KEY` in `.env`; model id `gemini-3.6-flash`; use `thinking_level=MINIMAL` + `MEDIA_RESOLUTION_MEDIUM` (~$0.002/image). Caches: `media_url_cache.parquet`, `vision_gemini_cache.parquet`, `vision_siglip_cache.parquet`; report `logs/vision_smoke.md`.
 
 ## Cursor Cloud specific instructions
