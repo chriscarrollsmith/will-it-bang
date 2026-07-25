@@ -17,6 +17,7 @@ import argparse
 import os
 import re
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import duckdb
@@ -571,8 +572,17 @@ def _count_window(times: np.ndarray | None, cutoff, days: float) -> int:
     return max(0, right - left)
 
 
-def _fetch_mention_events_api(account_ids: list[str], batch_size: int = 40) -> pd.DataFrame:
-    """Page CA user_mentions for mentioned_user_id ∈ accounts; join tweet created_at."""
+def _fetch_mention_events_api(
+    account_ids: list[str],
+    batch_size: int = 40,
+    *,
+    on_batch: Callable[[pd.DataFrame, list[str]], None] | None = None,
+) -> pd.DataFrame:
+    """Page CA user_mentions for mentioned_user_id ∈ accounts; join tweet created_at.
+
+    If on_batch is set, it is called after each account batch with the cumulative
+    events DataFrame so callers can flush a durable cache for resume.
+    """
     if not account_ids:
         return pd.DataFrame(columns=["mentioned_user_id", "tweet_id", "created_at"])
     session = requests.Session()
@@ -582,6 +592,7 @@ def _fetch_mention_events_api(account_ids: list[str], batch_size: int = 40) -> p
         joined = ",".join(f'"{aid}"' for aid in batch)
         last_id = 0
         page = 0
+        batch_rows_before = len(rows)
         while True:
             params = {
                 "select": "id,tweet_id,mentioned_user_id,tweets(created_at,account_id)",
@@ -625,12 +636,27 @@ def _fetch_mention_events_api(account_ids: list[str], batch_size: int = 40) -> p
                     f"{len(account_ids):,}: {len(rows):,} events (id>{last_id})",
                     flush=True,
                 )
-        if start == 0 or (start // batch_size) % 5 == 0:
+        # Zero-mention accounts in this batch: sentinel so they are not refetched.
+        seen_in_batch = {
+            str(r["mentioned_user_id"]) for r in rows[batch_rows_before:]
+        }
+        for aid in batch:
+            if aid not in seen_in_batch:
+                rows.append(
+                    {
+                        "mentioned_user_id": aid,
+                        "tweet_id": "",
+                        "created_at": None,
+                    }
+                )
+        if start == 0 or (start // batch_size) % 5 == 0 or start + batch_size >= len(account_ids):
             print(
                 f"  user_mentions: {min(start + batch_size, len(account_ids)):,}/"
                 f"{len(account_ids):,} accounts → {len(rows):,} events",
                 flush=True,
             )
+        if on_batch is not None:
+            on_batch(pd.DataFrame(rows), batch)
     return pd.DataFrame(rows)
 
 
@@ -695,7 +721,28 @@ def load_mention_times(account_ids: pd.Series, *, force: bool = False) -> dict[s
     missing = [a for a in accounts if a not in have]
     if missing:
         print(f"Fetching user_mentions for {len(missing):,} accounts…", flush=True)
-        fresh = _fetch_mention_events_api(missing)
+
+        def _flush_mention_progress(fresh_raw: pd.DataFrame, batch: list[str]) -> None:
+            """Persist each account batch so CA mention paging can resume after kills."""
+            nonlocal cached
+            if fresh_raw.empty:
+                return
+            # Only merge the just-finished batch accounts (raw times; dump backfill later).
+            piece = fresh_raw.loc[
+                fresh_raw["mentioned_user_id"].astype(str).isin(batch)
+            ].copy()
+            if piece.empty:
+                return
+            piece["mentioned_user_id"] = piece["mentioned_user_id"].astype(str)
+            piece["tweet_id"] = piece["tweet_id"].astype(str)
+            pieces = [cached] if len(cached) else []
+            pieces.append(piece)
+            cached = pd.concat(pieces, ignore_index=True)
+            cached = cached.drop_duplicates(["mentioned_user_id", "tweet_id"], keep="last")
+            cached.to_parquet(MENTION_CACHE_PATH, index=False)
+
+        fresh = _fetch_mention_events_api(missing, on_batch=_flush_mention_progress)
+        # Final merge + dump backfill for timestamps (idempotent with batch flushes).
         pieces = [cached] if len(cached) else []
         if not fresh.empty:
             fresh = _backfill_mention_times_from_dump(fresh)
@@ -716,6 +763,8 @@ def load_mention_times(account_ids: pd.Series, *, force: bool = False) -> dict[s
         cached = pd.concat(pieces, ignore_index=True) if pieces else cached
         if not fresh.empty:
             cached = cached.drop_duplicates(["mentioned_user_id", "tweet_id"], keep="last")
+        # Backfill created_at on any sentinel/partial rows still missing times.
+        cached = _backfill_mention_times_from_dump(cached)
         cached.to_parquet(MENTION_CACHE_PATH, index=False)
         print(
             f"Wrote mention cache: {len(cached):,} rows → {MENTION_CACHE_PATH} "
@@ -1737,7 +1786,7 @@ def attach_parent_context(
                 flush=True,
             )
     elif missing and not use_x:
-        print("  X parent fallback disabled (--no-x-parents)", flush=True)
+        print("  X parent fallback off (pass --x-parents to enable)", flush=True)
 
     if parents.empty:
         out = _empty_parent_feature_frame(out)
@@ -2125,17 +2174,19 @@ def parse_args() -> argparse.Namespace:
         "--parent-only",
         action="store_true",
         help="Only add reply/quote parent features onto an existing dataset.parquet "
-        "(resumes X parent cache if a prior fetch stopped on rate/credits)",
+        "(with --x-parents, resumes x_parent_cache after rate/credits stops)",
     )
     p.add_argument(
-        "--no-x-parents",
+        "--x-parents",
         action="store_true",
-        help="Do not call X API for reply/quote parents missing from the CA dump",
+        help="Opt-in: fetch reply/quote parents missing from the CA dump via X API "
+        "(resumable x_parent_cache.parquet). v39b: partial fill regressed wa_*; leave off "
+        "until a complete-fill ablation",
     )
     p.add_argument(
         "--force-x-parents",
         action="store_true",
-        help="Refetch X parents even when x_parent_cache.parquet already has the tweet_id",
+        help="With --x-parents, refetch even when x_parent_cache.parquet has the tweet_id",
     )
     p.add_argument(
         "--urls-only",
@@ -2296,7 +2347,7 @@ def main() -> None:
         dataset = attach_parent_context(
             dataset,
             batch_size=args.embed_batch_size,
-            use_x=not args.no_x_parents,
+            use_x=args.x_parents,
             force_x=args.force_x_parents,
         )
         if before_cov["reply"] is not None:
@@ -2366,7 +2417,7 @@ def main() -> None:
     dataset = attach_parent_context(
         dataset,
         batch_size=args.embed_batch_size,
-        use_x=not args.no_x_parents,
+        use_x=args.x_parents,
         force_x=args.force_x_parents,
     )
     dataset = attach_url_domains(dataset, force=args.force_urls)
