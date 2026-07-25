@@ -2944,7 +2944,9 @@ def load_parent_author_corpus_tweets(
     df = con.execute(
         f"""
         WITH caps AS (
-          SELECT account_id, max_created_at
+          SELECT
+            account_id,
+            CAST(max_created_at AS TIMESTAMPTZ) AS max_created_at
           FROM read_parquet('{tmp}')
         ),
         ranked AS (
@@ -2962,7 +2964,7 @@ def load_parent_author_corpus_tweets(
             ON CAST(t.account_id AS VARCHAR) = c.account_id
           WHERE t.full_text IS NOT NULL
             AND t.full_text NOT LIKE 'RT @%'
-            AND t.created_at < c.max_created_at
+            AND CAST(t.created_at AS TIMESTAMPTZ) < c.max_created_at
         )
         SELECT tweet_id, account_id, full_text, created_at
         FROM ranked

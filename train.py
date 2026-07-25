@@ -1448,7 +1448,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--reply-dyad",
         action="store_true",
-        help="Include reply/quote dyad + parent-author size features "
+        help="Include reply/quote dyad + parent-author size/corpus MiniLM features "
         "(prepare.py --dyad-only or full prepare). Opt-in until smoke clears gate",
     )
     p.add_argument(
