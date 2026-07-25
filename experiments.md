@@ -97,6 +97,16 @@ Dump-time fav/RT used as author history → optimistic RMSE ~0.82 (v5). Invalid 
 | v36b | 0.482† (rate) | 0.459† | `--holdout-policy upload_era` (cap ≤ last upload-linked `created_at` 2026-03-22): wa_nr **0.143** (−0.082), wa_rp **0.299** (+0.049); †different val — **do not promote** / keep `time` default |
 | v36c | **0.602** (rate) | **0.521** | `--provenance-features` on time holdout: wa_nr **0.249** (+0.024), wa_rp **0.276** (+0.025), global_nr 0.569 (−0.024); `stream_x_log_age` #21 gain; raw `is_stream` zero gain on ~pure-stream val; **promote / default on** |
 | v36d | 0.615† (rate) | 0.516† | `--holdout-policy stream_only`: wa_nr 0.239 / wa_rp 0.276; †near-identical corpus (dataset already 96.7% stream) — diagnostic only |
+| v38a | **0.600** (rate) | 0.521 | Media refresh 0%→9% (binary flags only): wa_nr **0.234** (−0.014 vs v36c), wa_rp 0.279, global_nr **0.587** |
+| v38b | 0.602 (rate) | 0.521 | `--media-types` (photo 7.7% / video 0.8% / gif 0.6%): wa_nr **0.252** (+0.018 vs v38a), wa_rp **0.267** (−0.013); `photo_x_inbound_replies` #33; **leave opt-in** |
+
+### v38 media types (same rebuild after `--media-only`)
+
+| Run | wa_nr | wa_rp | global_nr | rmse | Notes |
+|---|---:|---:|---:|---:|---|
+| v36c (0% media) | 0.249 | **0.276** | 0.569 | 0.602 | Prior default (skip-media) |
+| v38a binary media | 0.234 | 0.279 | 0.587 | **0.600** | Refresh only |
+| v38b + types | **0.252** | 0.267 | **0.589** | 0.602 | Opt-in `--media-types` |
 
 ### v36 regime holdout / provenance features (same rebuild)
 
