@@ -123,6 +123,17 @@ def _load_cache(path: Path):
     return cache
 
 
+def _merge_cache(cache, new_rows: list[dict]):
+    import pandas as pd
+
+    if not new_rows:
+        return cache
+    partial = pd.DataFrame(new_rows)
+    if cache is None or cache.empty:
+        return partial
+    return pd.concat([cache, partial], ignore_index=True)
+
+
 def _save_cache(cache, path: Path) -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     out = cache.drop_duplicates("tweet_id", keep="last")
@@ -294,10 +305,9 @@ def run_local(
             flush=True,
         )
         if done_n % max(bs * 10, 1) == 0 or done_n >= len(todo):
-            merged = pd.concat([cache, pd.DataFrame(new_rows)], ignore_index=True)
-            _save_cache(merged, out_path)
+            _save_cache(_merge_cache(cache, new_rows), out_path)
 
-    merged = pd.concat([cache, pd.DataFrame(new_rows)], ignore_index=True)
+    merged = _merge_cache(cache, new_rows)
     _save_cache(merged, out_path)
     ok = merged.loc[merged["ok"] == 1]
     means = " ".join(f"{k}={ok[k].mean():.2f}" for k in TAG_KEYS if k in ok.columns and len(ok))
@@ -407,10 +417,9 @@ try:
                 flush=True,
             )
             if done_n % max(batch_size * 20, 1) == 0 or done_n >= len(todo):
-                merged = pd.concat([cache, pd.DataFrame(new_rows)], ignore_index=True)
-                _save_cache(merged, out_path)
+                _save_cache(_merge_cache(cache, new_rows), out_path)
 
-        merged = pd.concat([cache, pd.DataFrame(new_rows)], ignore_index=True)
+        merged = _merge_cache(cache, new_rows)
         _save_cache(merged, out_path)
         ok = merged.loc[merged["ok"] == 1]
         means = " ".join(
