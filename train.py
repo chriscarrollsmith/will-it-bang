@@ -245,6 +245,26 @@ INTERLOCUTOR_FEATURES = [
     "interlocutor_n_partners",
 ]
 
+# Reply/quote dyad + parent-author size (--reply-dyad); prepare.py --dyad-only.
+DYAD_FEATURES = [
+    "reply_parent_author_known",
+    "reply_parent_author_hist_n",
+    "reply_parent_author_inbound",
+    "reply_parent_author_inbound_per",
+    "reply_dyad_inbound",
+    "reply_dyad_outbound",
+    "reply_dyad_has_prior",
+    "reply_dyad_bidir",
+    "quote_parent_author_known",
+    "quote_parent_author_hist_n",
+    "quote_parent_author_inbound",
+    "quote_parent_author_inbound_per",
+    "quote_dyad_inbound",
+    "quote_dyad_outbound",
+    "quote_dyad_has_prior",
+    "quote_dyad_bidir",
+]
+
 # TE × own-corpus novelty (needs affinity + account TE columns).
 BREAKOUT_FEATURES = [
     "author_emb_novelty",
@@ -271,6 +291,7 @@ def feature_matrix(df: pd.DataFrame, skip_embeddings: bool) -> tuple[np.ndarray,
         for c in (
             AFFINITY_FEATURES
             + INTERLOCUTOR_FEATURES
+            + DYAD_FEATURES
             + BREAKOUT_FEATURES
             + DESCRIPTIVE_TEXT_FEATURES
             + URL_DOMAIN_FEATURES
@@ -1415,6 +1436,12 @@ def parse_args() -> argparse.Namespace:
         help="Add pre-T inbound interlocutor MiniLM affinity (reply/quote texts to "
         "the author by default; sweet-spot + 30d). Builds interlocutor_cache via "
         "prepare helpers; off by default until promoted",
+    )
+    p.add_argument(
+        "--reply-dyad",
+        action="store_true",
+        help="Include reply/quote dyad + parent-author size features "
+        "(prepare.py --dyad-only or full prepare). Opt-in until smoke clears gate",
     )
     p.add_argument(
         "--force-interlocutor",
@@ -2947,6 +2974,16 @@ def main() -> None:
         print(
             "Warning: --media-types on but has_photo missing; "
             "run: uv run prepare.py --media-only",
+            flush=True,
+        )
+    if not args.reply_dyad:
+        drop_dyad = [c for c in DYAD_FEATURES if c in df.columns]
+        if drop_dyad:
+            df = df.drop(columns=drop_dyad)
+    elif "reply_dyad_has_prior" not in df.columns:
+        print(
+            "Warning: --reply-dyad on but dyad columns missing; "
+            "run: uv run prepare.py --dyad-only",
             flush=True,
         )
     if args.max_rows and args.max_rows > 0 and len(df) > args.max_rows:
