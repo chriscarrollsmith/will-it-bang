@@ -42,6 +42,7 @@ INTERLOCUTOR_CACHE_PATH = CACHE_DIR / "interlocutor_cache.parquet"
 UPLOAD_CACHE_PATH = CACHE_DIR / "archive_upload_cache.parquet"
 MEDIA_CACHE_PATH = CACHE_DIR / "media_cache.parquet"
 X_PARENT_CACHE_PATH = CACHE_DIR / "x_parent_cache.parquet"
+DYAD_CACHE_PATH = CACHE_DIR / "dyad_cache.parquet"
 # CA tweet_media.media_type values observed in the public API.
 MEDIA_TYPE_KEYS = ("photo", "video", "animated_gif")
 # Terminal X lookup statuses — do not re-request on resume.
@@ -1009,7 +1010,13 @@ def ensure_interlocutor_embeddings(
     return merged
 
 
-def load_author_graph(account_ids: pd.Series) -> dict:
+def load_author_graph(
+    account_ids: pd.Series,
+    *,
+    include_mentions: bool = True,
+    include_quotes: bool = True,
+    include_reply_to_tweet: bool = True,
+) -> dict:
     """Leakage-safe inbound graph events from the full dump for sampled authors.
 
     Returns dict with:
@@ -1018,6 +1025,10 @@ def load_author_graph(account_ids: pd.Series) -> dict:
       quote_to_user: account_id → times of quotes of that user's tweets
       mention_to_user: account_id → times of @-mentions of that user (CA user_mentions ⋊ tweet time)
       author_timeline: account_id → (tweet_ids, created_at ns) for all dump tweets
+
+    Parent-author size (dyad) only needs timeline + reply_to_user — pass
+    include_mentions=False / include_quotes=False / include_reply_to_tweet=False
+    to skip the expensive mention API and unused edges.
     """
     accounts = pd.DataFrame({"account_id": account_ids.astype(str).unique()})
     tmp_accounts = CACHE_DIR / "_target_account_ids.parquet"
@@ -1056,17 +1067,20 @@ def load_author_graph(account_ids: pd.Series) -> dict:
     )
     print(f"  author tweets in dump: {len(author_tweets_df):,}")
 
-    reply_to_tweet_df = con.execute(
-        f"""
-        SELECT
-          CAST(r.reply_to_tweet_id AS VARCHAR) AS parent_id,
-          r.created_at
-        FROM read_parquet('{path}') r
-        SEMI JOIN author_tweets p
-          ON CAST(r.reply_to_tweet_id AS VARCHAR) = p.tweet_id
-        WHERE r.reply_to_tweet_id IS NOT NULL
-        """
-    ).fetchdf()
+    if include_reply_to_tweet:
+        reply_to_tweet_df = con.execute(
+            f"""
+            SELECT
+              CAST(r.reply_to_tweet_id AS VARCHAR) AS parent_id,
+              r.created_at
+            FROM read_parquet('{path}') r
+            SEMI JOIN author_tweets p
+              ON CAST(r.reply_to_tweet_id AS VARCHAR) = p.tweet_id
+            WHERE r.reply_to_tweet_id IS NOT NULL
+            """
+        ).fetchdf()
+    else:
+        reply_to_tweet_df = pd.DataFrame(columns=["parent_id", "created_at"])
 
     # Prefer dump reply_to_user_id; when null (common on stream-era rows), recover
     # from parent tweet's account_id if that parent is by a sampled author.
@@ -1095,17 +1109,20 @@ def load_author_graph(account_ids: pd.Series) -> dict:
         """
     ).fetchdf()
 
-    quote_to_user_df = con.execute(
-        f"""
-        SELECT
-          p.account_id,
-          r.created_at
-        FROM read_parquet('{path}') r
-        JOIN author_tweets p
-          ON CAST(r.quoted_tweet_id AS VARCHAR) = p.tweet_id
-        WHERE r.quoted_tweet_id IS NOT NULL
-        """
-    ).fetchdf()
+    if include_quotes:
+        quote_to_user_df = con.execute(
+            f"""
+            SELECT
+              p.account_id,
+              r.created_at
+            FROM read_parquet('{path}') r
+            JOIN author_tweets p
+              ON CAST(r.quoted_tweet_id AS VARCHAR) = p.tweet_id
+            WHERE r.quoted_tweet_id IS NOT NULL
+            """
+        ).fetchdf()
+    else:
+        quote_to_user_df = pd.DataFrame(columns=["account_id", "created_at"])
     con.close()
     try:
         tmp_accounts.unlink()
@@ -1134,7 +1151,9 @@ def load_author_graph(account_ids: pd.Series) -> dict:
         f"reply→user: {n_reply_user:,} ({n_from_parent:,} via parent account_id) | "
         f"quote→user: {len(quote_to_user_df):,}"
     )
-    mention_to_user = load_mention_times(accounts["account_id"])
+    mention_to_user = (
+        load_mention_times(accounts["account_id"]) if include_mentions else {}
+    )
     return {
         "reply_to_tweet": reply_to_tweet,
         "reply_to_user": reply_to_user,
@@ -1993,6 +2012,7 @@ def _attach_one_parent_prefix(
     same_author = np.zeros(n, dtype=np.int8)
     age_h = np.zeros(n, dtype=np.float64)
     replies = np.zeros(n, dtype=np.float64)
+    parent_aid = np.full(n, None, dtype=object)
 
     raw_ids = out[id_col]
     valid = raw_ids.notna()
@@ -2005,6 +2025,7 @@ def _attach_one_parent_prefix(
         out[f"{prefix}_parent_same_author"] = same_author
         out[f"{prefix}_parent_age_hours"] = age_h
         out[f"{prefix}_parent_replies"] = replies
+        out[f"{prefix}_parent_account_id"] = parent_aid
         return out
 
     keys = raw_ids.map(lambda x: str(x) if pd.notna(x) else None)
@@ -2022,8 +2043,10 @@ def _attach_one_parent_prefix(
         log_len[ok] = np.log1p(np.fromiter((len(t) for t in text_arr[ok]), dtype=np.float64, count=int(ok.sum())))
         is_reply[ok] = meta["reply_to_tweet_id"].notna().to_numpy(dtype=np.int8)[ok]
         is_quote[ok] = meta["quoted_tweet_id"].notna().to_numpy(dtype=np.int8)[ok]
+        aids = meta["account_id"].astype(str).to_numpy()[ok]
+        parent_aid[ok] = aids
         same_author[ok] = (
-            meta["account_id"].astype(str).to_numpy()[ok] == out["account_id"].astype(str).to_numpy()[ok]
+            aids == out["account_id"].astype(str).to_numpy()[ok]
         ).astype(np.int8)
         delta_h = (
             (child_t.to_numpy()[ok] - parent_t.to_numpy()[ok]).astype("timedelta64[s]").astype(np.float64)
@@ -2051,6 +2074,7 @@ def _attach_one_parent_prefix(
     out[f"{prefix}_parent_same_author"] = same_author
     out[f"{prefix}_parent_age_hours"] = age_h
     out[f"{prefix}_parent_replies"] = replies
+    out[f"{prefix}_parent_account_id"] = parent_aid
     return out
 
 
@@ -2064,6 +2088,7 @@ def _empty_parent_feature_frame(out: pd.DataFrame) -> pd.DataFrame:
         out[f"{prefix}_parent_same_author"] = 0
         out[f"{prefix}_parent_age_hours"] = 0.0
         out[f"{prefix}_parent_replies"] = 0.0
+        out[f"{prefix}_parent_account_id"] = None
     return out
 
 
@@ -2497,6 +2522,502 @@ def attach_inbound_mentions(df: pd.DataFrame, *, force: bool = False) -> pd.Data
     return out
 
 
+# ---------------------------------------------------------------------------
+# Reply / quote dyad + parent-author size (leakage-safe, pre-T only)
+# ---------------------------------------------------------------------------
+
+DYAD_FEATURE_SUFFIXES = (
+    "parent_author_known",
+    "parent_author_hist_n",
+    "parent_author_inbound",
+    "parent_author_inbound_per",
+    "dyad_inbound",
+    "dyad_outbound",
+    "dyad_has_prior",
+    "dyad_bidir",
+)
+
+
+def dyad_feature_columns() -> list[str]:
+    cols: list[str] = []
+    for prefix in ("reply", "quote"):
+        for suf in DYAD_FEATURE_SUFFIXES:
+            cols.append(f"{prefix}_{suf}")
+    return cols
+
+
+def load_parent_author_size_maps(account_ids: pd.Series) -> dict:
+    """Pre-T size proxies for parent authors: tweet times + inbound reply times.
+
+    Lighter than load_author_graph: no tweet_id arrays, quotes, or mention API.
+    """
+    accounts = pd.DataFrame({"account_id": account_ids.astype(str).unique()})
+    if accounts.empty:
+        return {"author_times": {}, "reply_to_user": {}}
+    tmp_accounts = CACHE_DIR / "_parent_author_ids.parquet"
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    accounts.to_parquet(tmp_accounts, index=False)
+    path = str(RAW_PARQUET)
+    print(f"Scanning dump for parent-author size on {len(accounts):,} accounts…", flush=True)
+    con = duckdb.connect()
+    con.execute(f"SET threads TO {max(1, os.cpu_count() or 4)}")
+    author_times_df = con.execute(
+        f"""
+        SELECT
+          CAST(t.account_id AS VARCHAR) AS account_id,
+          t.created_at
+        FROM read_parquet('{path}') t
+        SEMI JOIN read_parquet('{tmp_accounts}') a
+          ON CAST(t.account_id AS VARCHAR) = a.account_id
+        WHERE t.full_text IS NOT NULL
+          AND t.full_text NOT LIKE 'RT @%'
+        """
+    ).fetchdf()
+    # reply→user with parent-account coalesce (same repair as load_author_graph).
+    reply_to_user_df = con.execute(
+        f"""
+        WITH target AS (SELECT account_id FROM read_parquet('{tmp_accounts}')),
+        author_tweets AS (
+          SELECT CAST(t.tweet_id AS VARCHAR) AS tweet_id,
+                 CAST(t.account_id AS VARCHAR) AS account_id
+          FROM read_parquet('{path}') t
+          SEMI JOIN target a ON CAST(t.account_id AS VARCHAR) = a.account_id
+        ),
+        resolved AS (
+          SELECT
+            COALESCE(CAST(r.reply_to_user_id AS VARCHAR), p.account_id) AS account_id,
+            r.created_at
+          FROM read_parquet('{path}') r
+          LEFT JOIN author_tweets p
+            ON CAST(r.reply_to_tweet_id AS VARCHAR) = p.tweet_id
+          WHERE COALESCE(CAST(r.reply_to_user_id AS VARCHAR), p.account_id) IS NOT NULL
+        )
+        SELECT account_id, created_at
+        FROM resolved
+        SEMI JOIN target a ON resolved.account_id = a.account_id
+        """
+    ).fetchdf()
+    con.close()
+    try:
+        tmp_accounts.unlink()
+    except OSError:
+        pass
+    author_times = _sorted_time_map(author_times_df, "account_id")
+    reply_to_user = _sorted_time_map(reply_to_user_df, "account_id")
+    print(
+        f"  parent-author tweets: {len(author_times_df):,} | "
+        f"reply→user events: {len(reply_to_user_df):,}",
+        flush=True,
+    )
+    return {"author_times": author_times, "reply_to_user": reply_to_user}
+
+
+def resolve_parent_account_ids(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure reply/quote_parent_account_id from dump (+ X parent cache when present)."""
+    out = df.reset_index(drop=True).copy()
+    out = _normalize_ref_id_columns(out)
+    for prefix, id_col in (("reply", "reply_to_tweet_id"), ("quote", "quoted_tweet_id")):
+        aid_col = f"{prefix}_parent_account_id"
+        if aid_col not in out.columns:
+            out[aid_col] = pd.NA
+        else:
+            # Normalize empty strings / "None" from prior object columns.
+            out[aid_col] = out[aid_col].map(
+                lambda x: str(x) if pd.notna(x) and str(x) not in {"", "None", "nan", "<NA>"} else pd.NA
+            )
+
+    need_ids: list[str] = []
+    for prefix, id_col in (("reply", "reply_to_tweet_id"), ("quote", "quoted_tweet_id")):
+        aid_col = f"{prefix}_parent_account_id"
+        if id_col not in out.columns:
+            continue
+        need = out[id_col].notna() & out[aid_col].isna()
+        if need.any():
+            need_ids.extend(out.loc[need, id_col].astype(str).tolist())
+
+    if not need_ids:
+        return out
+
+    uniq = pd.Series(pd.unique(pd.Series(need_ids)))
+    parents = load_tweets_by_id(uniq)
+    by_id: dict[str, str] = {}
+    if not parents.empty:
+        for _, row in parents.iterrows():
+            aid = row["account_id"]
+            if pd.notna(aid):
+                by_id[str(row["tweet_id"])] = str(aid)
+
+    missing = [tid for tid in uniq.astype(str).tolist() if tid not in by_id]
+    if missing and X_PARENT_CACHE_PATH.exists():
+        xcache = load_x_parent_cache()
+        ok = xcache["fetch_status"].astype(str).eq("ok") if "fetch_status" in xcache.columns else True
+        xok = xcache.loc[ok].copy()
+        xok = xok[xok["tweet_id"].astype(str).isin(missing)]
+        for _, row in xok.iterrows():
+            aid = row.get("account_id")
+            if pd.notna(aid) and str(aid) not in {"", "None", "nan"}:
+                by_id[str(row["tweet_id"])] = str(aid)
+
+    filled = 0
+    for prefix, id_col in (("reply", "reply_to_tweet_id"), ("quote", "quoted_tweet_id")):
+        aid_col = f"{prefix}_parent_account_id"
+        if id_col not in out.columns:
+            continue
+        need = out[id_col].notna() & out[aid_col].isna()
+        if not need.any():
+            continue
+        mapped = out.loc[need, id_col].astype(str).map(by_id)
+        out.loc[need, aid_col] = mapped
+        filled += int(mapped.notna().sum())
+    print(f"Parent author ids: filled {filled:,} missing reply/quote parent accounts", flush=True)
+    return out
+
+
+def load_dyad_events(
+    ego_ids: pd.Series,
+    partner_ids: pd.Series,
+    *,
+    force: bool = False,
+) -> pd.DataFrame:
+    """Reply/quote interactions between ego authors and partner (parent) authors.
+
+    Returns ego_account_id, partner_account_id, created_at, direction ∈ {inbound,outbound}.
+    Cached by ego so --dyad-only / rebuilds can resume.
+    """
+    egos = sorted({str(a) for a in ego_ids.astype(str).tolist() if a and a != "nan"})
+    partners = sorted({str(a) for a in partner_ids.astype(str).tolist() if a and a != "nan"})
+    if not egos or not partners:
+        return pd.DataFrame(
+            columns=["ego_account_id", "partner_account_id", "created_at", "direction"]
+        )
+
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cached = pd.DataFrame(
+        columns=["ego_account_id", "partner_account_id", "created_at", "direction"]
+    )
+    if DYAD_CACHE_PATH.exists() and not force:
+        cached = pd.read_parquet(DYAD_CACHE_PATH)
+        for col in ("ego_account_id", "partner_account_id", "direction"):
+            if col in cached.columns:
+                cached[col] = cached[col].astype(str)
+        print(f"Dyad cache: {len(cached):,} rows ({DYAD_CACHE_PATH.name})", flush=True)
+
+    have = set(cached["ego_account_id"].unique()) if len(cached) else set()
+    missing = [a for a in egos if a not in have]
+    if missing:
+        # Full ego history (any partner): cache is complete per ego, then filter
+        # to requested parent authors at read time.
+        print(f"Scanning dump for dyad events on {len(missing):,} ego accounts…", flush=True)
+        tmp_ego = CACHE_DIR / "_dyad_ego_ids.parquet"
+        pd.DataFrame({"account_id": missing}).to_parquet(tmp_ego, index=False)
+        path = str(RAW_PARQUET)
+        con = duckdb.connect()
+        con.execute(f"SET threads TO {max(1, os.cpu_count() or 4)}")
+        # Materialize ego tweet ids + outbound parent refs so partner lookup
+        # is a small SEMI JOIN rather than a full dump self-join.
+        ego_rows = con.execute(
+            f"""
+            SELECT
+              CAST(t.tweet_id AS VARCHAR) AS tweet_id,
+              CAST(t.account_id AS VARCHAR) AS account_id,
+              CAST(t.reply_to_tweet_id AS VARCHAR) AS reply_to_tweet_id,
+              CAST(t.quoted_tweet_id AS VARCHAR) AS quoted_tweet_id,
+              t.created_at
+            FROM read_parquet('{path}') t
+            SEMI JOIN read_parquet('{tmp_ego}') e
+              ON CAST(t.account_id AS VARCHAR) = e.account_id
+            WHERE t.full_text IS NOT NULL AND t.full_text NOT LIKE 'RT @%'
+            """
+        ).fetchdf()
+        tmp_ego_tweets = CACHE_DIR / "_dyad_ego_tweets.parquet"
+        ego_rows.to_parquet(tmp_ego_tweets, index=False)
+        parent_ids = sorted(
+            {
+                str(x)
+                for x in pd.concat(
+                    [ego_rows["reply_to_tweet_id"], ego_rows["quoted_tweet_id"]],
+                    ignore_index=True,
+                )
+                .dropna()
+                .astype(str)
+                .tolist()
+                if x and x not in {"None", "nan", "<NA>"}
+            }
+        )
+        tmp_parents = CACHE_DIR / "_dyad_outbound_parent_ids.parquet"
+        pd.DataFrame({"tweet_id": parent_ids}).to_parquet(tmp_parents, index=False)
+        parent_authors = (
+            con.execute(
+                f"""
+                SELECT
+                  CAST(t.tweet_id AS VARCHAR) AS tweet_id,
+                  CAST(t.account_id AS VARCHAR) AS account_id
+                FROM read_parquet('{path}') t
+                SEMI JOIN read_parquet('{tmp_parents}') p
+                  ON CAST(t.tweet_id AS VARCHAR) = p.tweet_id
+                """
+            ).fetchdf()
+            if parent_ids
+            else pd.DataFrame(columns=["tweet_id", "account_id"])
+        )
+        tmp_parent_authors = CACHE_DIR / "_dyad_parent_authors.parquet"
+        parent_authors.to_parquet(tmp_parent_authors, index=False)
+
+        fresh = con.execute(
+            f"""
+            WITH ego_tweets AS (
+              SELECT tweet_id, account_id, reply_to_tweet_id, quoted_tweet_id, created_at
+              FROM read_parquet('{tmp_ego_tweets}')
+            ),
+            parent_authors AS (
+              SELECT tweet_id, account_id FROM read_parquet('{tmp_parent_authors}')
+            ),
+            inbound_reply AS (
+              SELECT e.account_id AS ego_account_id,
+                     CAST(r.account_id AS VARCHAR) AS partner_account_id,
+                     r.created_at,
+                     'inbound' AS direction
+              FROM read_parquet('{path}') r
+              JOIN ego_tweets e ON CAST(r.reply_to_tweet_id AS VARCHAR) = e.tweet_id
+              WHERE r.reply_to_tweet_id IS NOT NULL
+                AND CAST(r.account_id AS VARCHAR) != e.account_id
+            ),
+            inbound_quote AS (
+              SELECT e.account_id AS ego_account_id,
+                     CAST(r.account_id AS VARCHAR) AS partner_account_id,
+                     r.created_at,
+                     'inbound' AS direction
+              FROM read_parquet('{path}') r
+              JOIN ego_tweets e ON CAST(r.quoted_tweet_id AS VARCHAR) = e.tweet_id
+              WHERE r.quoted_tweet_id IS NOT NULL
+                AND CAST(r.account_id AS VARCHAR) != e.account_id
+            ),
+            outbound_reply AS (
+              SELECT e.account_id AS ego_account_id,
+                     p.account_id AS partner_account_id,
+                     e.created_at,
+                     'outbound' AS direction
+              FROM ego_tweets e
+              JOIN parent_authors p ON e.reply_to_tweet_id = p.tweet_id
+              WHERE e.reply_to_tweet_id IS NOT NULL
+                AND e.account_id != p.account_id
+            ),
+            outbound_quote AS (
+              SELECT e.account_id AS ego_account_id,
+                     p.account_id AS partner_account_id,
+                     e.created_at,
+                     'outbound' AS direction
+              FROM ego_tweets e
+              JOIN parent_authors p ON e.quoted_tweet_id = p.tweet_id
+              WHERE e.quoted_tweet_id IS NOT NULL
+                AND e.account_id != p.account_id
+            )
+            SELECT * FROM inbound_reply
+            UNION ALL SELECT * FROM inbound_quote
+            UNION ALL SELECT * FROM outbound_reply
+            UNION ALL SELECT * FROM outbound_quote
+            """
+        ).fetchdf()
+        con.close()
+        for tmp in (tmp_ego, tmp_ego_tweets, tmp_parents, tmp_parent_authors):
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+        if len(fresh):
+            fresh["ego_account_id"] = fresh["ego_account_id"].astype(str)
+            fresh["partner_account_id"] = fresh["partner_account_id"].astype(str)
+            fresh["direction"] = fresh["direction"].astype(str)
+            fresh["created_at"] = pd.to_datetime(fresh["created_at"], utc=True, errors="coerce")
+            fresh = fresh[fresh["created_at"].notna()]
+        else:
+            fresh = pd.DataFrame(
+                columns=["ego_account_id", "partner_account_id", "created_at", "direction"]
+            )
+
+        seen_ego = set(fresh["ego_account_id"].unique()) if len(fresh) else set()
+        zero = [a for a in missing if a not in seen_ego]
+        pieces = [cached, fresh]
+        if zero:
+            # Sentinel so we do not rescan egos with no dyad events vs current partners.
+            pieces.append(
+                pd.DataFrame(
+                    {
+                        "ego_account_id": zero,
+                        "partner_account_id": [""] * len(zero),
+                        "created_at": pd.to_datetime([pd.NaT] * len(zero), utc=True),
+                        "direction": ["none"] * len(zero),
+                    }
+                )
+            )
+        cached = pd.concat([p for p in pieces if len(p)], ignore_index=True)
+        cached.to_parquet(DYAD_CACHE_PATH, index=False)
+        n_evt = int(
+            (cached["partner_account_id"].astype(str) != "").sum()
+            if len(cached)
+            else 0
+        )
+        print(
+            f"Wrote dyad cache: {n_evt:,} events / {len(cached):,} rows → {DYAD_CACHE_PATH} "
+            f"({len(zero):,} zero-dyad egos marked)",
+            flush=True,
+        )
+
+    partner_set = set(partners)
+    usable = cached[
+        cached["ego_account_id"].isin(egos)
+        & cached["partner_account_id"].astype(str).isin(partner_set)
+        & cached["direction"].astype(str).isin({"inbound", "outbound"})
+        & cached["created_at"].notna()
+    ].copy()
+    if len(usable):
+        usable["created_at"] = pd.to_datetime(usable["created_at"], utc=True, errors="coerce")
+        usable = usable[usable["created_at"].notna()]
+    print(
+        f"  usable dyad events: {len(usable):,} "
+        f"({usable['ego_account_id'].nunique() if len(usable) else 0:,} egos × "
+        f"{usable['partner_account_id'].nunique() if len(usable) else 0:,} partners)",
+        flush=True,
+    )
+    return usable.reset_index(drop=True)
+
+
+def _dyad_time_maps(
+    events: pd.DataFrame,
+) -> tuple[dict[tuple[str, str], np.ndarray], dict[tuple[str, str], np.ndarray]]:
+    """(ego, partner) → sorted inbound / outbound times."""
+    inbound: dict[tuple[str, str], np.ndarray] = {}
+    outbound: dict[tuple[str, str], np.ndarray] = {}
+    if events.empty:
+        return inbound, outbound
+    for (ego, partner, direction), g in events.groupby(
+        ["ego_account_id", "partner_account_id", "direction"], sort=False
+    ):
+        key = (str(ego), str(partner))
+        times = np.sort(g["created_at"].to_numpy(dtype="datetime64[ns]"))
+        if direction == "inbound":
+            inbound[key] = times
+        elif direction == "outbound":
+            outbound[key] = times
+    return inbound, outbound
+
+
+def attach_reply_dyad_features(df: pd.DataFrame, *, force: bool = False) -> pd.DataFrame:
+    """Parent-author size + prior reciprocal reply/quote interaction (pre-T).
+
+    Does not use dump fav/RT or current follower counts. Parent author ids come
+    from dump / X parent cache; dyad events are reply/quote edges only (mentions
+    omitted — overlap inbound_mentions and drown the pair signal).
+    """
+    out = resolve_parent_account_ids(df)
+    drop_cols = [c for c in dyad_feature_columns() if c in out.columns]
+    if drop_cols:
+        out = out.drop(columns=drop_cols)
+
+    partner_series = pd.concat(
+        [
+            out["reply_parent_account_id"]
+            if "reply_parent_account_id" in out.columns
+            else pd.Series(dtype=object),
+            out["quote_parent_account_id"]
+            if "quote_parent_account_id" in out.columns
+            else pd.Series(dtype=object),
+        ],
+        ignore_index=True,
+    ).dropna()
+    partner_series = partner_series.astype(str)
+    partner_series = partner_series[partner_series.ne("")]
+
+    size_maps = (
+        load_parent_author_size_maps(partner_series)
+        if len(partner_series)
+        else {"author_times": {}, "reply_to_user": {}}
+    )
+    reply_to_user = size_maps.get("reply_to_user", {})
+    author_times = size_maps.get("author_times", {})
+
+    dyad_events = load_dyad_events(out["account_id"], partner_series, force=force)
+    inbound_map, outbound_map = _dyad_time_maps(dyad_events)
+
+    n = len(out)
+    child_t = pd.to_datetime(out["created_at"], utc=True)
+    ego_ids = out["account_id"].astype(str).to_numpy()
+
+    for prefix in ("reply", "quote"):
+        aid_col = f"{prefix}_parent_account_id"
+        known = np.zeros(n, dtype=np.int8)
+        hist_n = np.zeros(n, dtype=np.float64)
+        inbound = np.zeros(n, dtype=np.float64)
+        inbound_per = np.zeros(n, dtype=np.float64)
+        dyad_in = np.zeros(n, dtype=np.float64)
+        dyad_out = np.zeros(n, dtype=np.float64)
+        has_prior = np.zeros(n, dtype=np.int8)
+        bidir = np.zeros(n, dtype=np.int8)
+
+        if aid_col not in out.columns:
+            out[f"{prefix}_parent_author_known"] = known
+            out[f"{prefix}_parent_author_hist_n"] = hist_n
+            out[f"{prefix}_parent_author_inbound"] = inbound
+            out[f"{prefix}_parent_author_inbound_per"] = inbound_per
+            out[f"{prefix}_dyad_inbound"] = dyad_in
+            out[f"{prefix}_dyad_outbound"] = dyad_out
+            out[f"{prefix}_dyad_has_prior"] = has_prior
+            out[f"{prefix}_dyad_bidir"] = bidir
+            continue
+
+        aids = out[aid_col]
+        for i in range(n):
+            raw = aids.iloc[i]
+            if pd.isna(raw):
+                continue
+            pid = str(raw)
+            if not pid or pid in {"None", "nan", "<NA>"}:
+                continue
+            ego = ego_ids[i]
+            if pid == ego:
+                # Self-reply / self-quote: size is own hist (redundant); dyad undefined.
+                known[i] = 1
+                continue
+            known[i] = 1
+            cutoff = child_t.iloc[i]
+            dump_times = author_times.get(pid)
+            n_prior = _count_before(dump_times, cutoff)
+            n_in = _count_before(reply_to_user.get(pid), cutoff)
+            hist_n[i] = float(np.log1p(n_prior))
+            inbound[i] = float(np.log1p(n_in))
+            inbound_per[i] = float(np.log1p(n_in / max(n_prior, 1)))
+
+            key = (ego, pid)
+            c_in = _count_before(inbound_map.get(key), cutoff)
+            c_out = _count_before(outbound_map.get(key), cutoff)
+            dyad_in[i] = float(np.log1p(c_in))
+            dyad_out[i] = float(np.log1p(c_out))
+            has_prior[i] = int(c_in > 0 or c_out > 0)
+            bidir[i] = int(c_in > 0 and c_out > 0)
+
+        out[f"{prefix}_parent_author_known"] = known
+        out[f"{prefix}_parent_author_hist_n"] = hist_n
+        out[f"{prefix}_parent_author_inbound"] = inbound
+        out[f"{prefix}_parent_author_inbound_per"] = inbound_per
+        out[f"{prefix}_dyad_inbound"] = dyad_in
+        out[f"{prefix}_dyad_outbound"] = dyad_out
+        out[f"{prefix}_dyad_has_prior"] = has_prior
+        out[f"{prefix}_dyad_bidir"] = bidir
+
+        among = known.astype(bool)
+        n_among = int(among.sum())
+        print(
+            f"  {prefix} dyad: parent_author known {known.mean():.1%} rows; "
+            f"among known n={n_among:,} prior_dyad="
+            f"{(has_prior[among].mean() if n_among else 0):.1%} "
+            f"bidir={(bidir[among].mean() if n_among else 0):.1%} "
+            f"mean_hist_n={(hist_n[among].mean() if n_among else 0):.3f}",
+            flush=True,
+        )
+    return out
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--max-tweets", type=int, default=120000, help="Cap on sampled original tweets")
@@ -2584,6 +3105,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Refetch tweet_media even when media_cache.parquet has the tweet_id",
     )
+    p.add_argument(
+        "--dyad-only",
+        action="store_true",
+        help="Add reply/quote dyad + parent-author size features onto an existing "
+        "dataset.parquet (train with --reply-dyad)",
+    )
+    p.add_argument(
+        "--force-dyad",
+        action="store_true",
+        help="With --dyad-only (or full prepare), rescan dump dyad events even when "
+        "dyad_cache.parquet has the ego account_id",
+    )
     return p.parse_args()
 
 
@@ -2599,6 +3132,19 @@ def main() -> None:
         pass
 
     download_parquet(force=args.force_download)
+
+    if args.dyad_only:
+        if not DATASET_PATH.exists():
+            raise SystemExit(f"Missing {DATASET_PATH} for --dyad-only")
+        dataset = pd.read_parquet(DATASET_PATH)
+        dataset["tweet_id"] = dataset["tweet_id"].astype(str)
+        dataset["created_at"] = pd.to_datetime(dataset["created_at"], utc=True)
+        dataset = backfill_ref_ids_from_dump(dataset)
+        dataset = attach_reply_dyad_features(dataset, force=args.force_dyad)
+        dataset.to_parquet(DATASET_PATH, index=False)
+        print(f"Wrote {DATASET_PATH} ({len(dataset):,} rows, {dataset.shape[1]} cols)")
+        print(f"Done in {time.time() - t0:.1f}s")
+        return
 
     if args.mentions_only:
         if not DATASET_PATH.exists():
@@ -2707,7 +3253,10 @@ def main() -> None:
         drop_cols = [
             c
             for c in dataset.columns
-            if c.startswith(("has_reply_parent", "has_quote_parent", "reply_parent_", "quote_parent_"))
+            if (
+                c.startswith(("has_reply_parent", "has_quote_parent", "reply_parent_", "quote_parent_"))
+                and not c.startswith(("reply_parent_author_", "quote_parent_author_"))
+            )
         ]
         if drop_cols:
             dataset = dataset.drop(columns=drop_cols)
@@ -2790,6 +3339,7 @@ def main() -> None:
         use_x=args.x_parents,
         force_x=args.force_x_parents,
     )
+    dataset = attach_reply_dyad_features(dataset, force=args.force_dyad)
     dataset = attach_url_domains(dataset, force=args.force_urls)
     dataset = attach_upload_end_features(dataset, force=args.force_uploads)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)

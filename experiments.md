@@ -183,6 +183,7 @@ Fair revisit of prior ablations after the metric lock. Control = asymmetric leve
 - High-engagement **non-replies** (viral under-prediction); often already-hot authors. Improved by SERA (v28b: mean under-pred 2.22→2.04) but still open.
 - **Media** / short+image posts — API refresh restores ~9% coverage (v18/v38a); binary-only refresh can regress wa_nr vs 0% media; type breakdown (v38b) recovers NR at reply cost — `--media-types` opt-in. Vision smoke: Gemini tags fail CV gate; SigLIP PCA-8 marginal — no full Gemini spend.
 - **Quote** / reply parents missing from CA — X fallback **complete** (**v39d**): among-reply 73%→97%, quote 70%→99%; wa_rp +0.006 / wa_nr −0.009 / rmse flat; keep default on.
+- Reply **dyad** / parent-author size — **v41 smoke** dense coverage but weak rate corr; wa_rp flat on small set; `--reply-dyad` stays opt-in (`logs/v41_reply_dyad_smoke.md`).
 
 ---
 
@@ -230,11 +231,10 @@ Check off when tried; note outcome in one line.
 
 ### Reply dyad / parent context
 Mostly helps replies (not the main under-prediction bucket); still cheap if parent/dyad coverage exists.
-- [ ] Prior reciprocal interaction: has this author and the parent author exchanged replies/mentions before *T*? (likely re-interact)
+- [x] Prior reciprocal interaction (reply/quote edges; mentions omitted) + leakage-safe parent-author size — **v41 smoke** (`logs/v41_reply_dyad_smoke.md`): among-reply parent-author **81%**, prior_dyad **74%** / bidir **56%**; global spearman(rate)≲0.02 (fails ~0.06 content gate); within-account outbound/hist_n ~0.05–0.06; small-scale train wa_nr +0.012 / wa_rp −0.006 / rmse −0.007. Harness: `prepare.py --dyad-only` + `train.py --reply-dyad` — **leave opt-in**; full-scale only if pursuing a new within-author angle
 - [ ] Agree vs disagree with the parent tweet (LM or reply−parent embedding/stance; text-only)
-- [ ] Leakage-safe “size” of parent author (pre-T proxies only: prior tweet count, inbound reply rates — never dump `num_followers`)
-- [ ] Leakage-safe parent-tweet heat (pre-T reply/quote arrivals on the parent — not dump fav/RT; partly in v11 parent_replies)
-- [ ] Reply earliness: hours since parent `created_at` (halo if early on a tweet that later goes viral; parent maturity is post-time observable)
+- [x] Leakage-safe parent-tweet heat — already in stack as `reply_parent_replies` / `quote_parent_replies` (v11+)
+- [x] Reply earliness — already in stack as `reply_parent_age_hours` / `quote_parent_age_hours` (log1p hours)
 - [ ] Semantic similarity of reply text to the **parent author’s** pre-T MiniLM corpus mean (distinct from cosine to the single parent tweet)
 
 ### Standalone / author–audience corpus affinity
