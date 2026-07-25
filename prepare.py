@@ -1010,7 +1010,13 @@ def ensure_interlocutor_embeddings(
     return merged
 
 
-def load_author_graph(account_ids: pd.Series) -> dict:
+def load_author_graph(
+    account_ids: pd.Series,
+    *,
+    include_mentions: bool = True,
+    include_quotes: bool = True,
+    include_reply_to_tweet: bool = True,
+) -> dict:
     """Leakage-safe inbound graph events from the full dump for sampled authors.
 
     Returns dict with:
@@ -1019,6 +1025,10 @@ def load_author_graph(account_ids: pd.Series) -> dict:
       quote_to_user: account_id → times of quotes of that user's tweets
       mention_to_user: account_id → times of @-mentions of that user (CA user_mentions ⋊ tweet time)
       author_timeline: account_id → (tweet_ids, created_at ns) for all dump tweets
+
+    Parent-author size (dyad) only needs timeline + reply_to_user — pass
+    include_mentions=False / include_quotes=False / include_reply_to_tweet=False
+    to skip the expensive mention API and unused edges.
     """
     accounts = pd.DataFrame({"account_id": account_ids.astype(str).unique()})
     tmp_accounts = CACHE_DIR / "_target_account_ids.parquet"
@@ -1057,17 +1067,20 @@ def load_author_graph(account_ids: pd.Series) -> dict:
     )
     print(f"  author tweets in dump: {len(author_tweets_df):,}")
 
-    reply_to_tweet_df = con.execute(
-        f"""
-        SELECT
-          CAST(r.reply_to_tweet_id AS VARCHAR) AS parent_id,
-          r.created_at
-        FROM read_parquet('{path}') r
-        SEMI JOIN author_tweets p
-          ON CAST(r.reply_to_tweet_id AS VARCHAR) = p.tweet_id
-        WHERE r.reply_to_tweet_id IS NOT NULL
-        """
-    ).fetchdf()
+    if include_reply_to_tweet:
+        reply_to_tweet_df = con.execute(
+            f"""
+            SELECT
+              CAST(r.reply_to_tweet_id AS VARCHAR) AS parent_id,
+              r.created_at
+            FROM read_parquet('{path}') r
+            SEMI JOIN author_tweets p
+              ON CAST(r.reply_to_tweet_id AS VARCHAR) = p.tweet_id
+            WHERE r.reply_to_tweet_id IS NOT NULL
+            """
+        ).fetchdf()
+    else:
+        reply_to_tweet_df = pd.DataFrame(columns=["parent_id", "created_at"])
 
     # Prefer dump reply_to_user_id; when null (common on stream-era rows), recover
     # from parent tweet's account_id if that parent is by a sampled author.
@@ -1096,17 +1109,20 @@ def load_author_graph(account_ids: pd.Series) -> dict:
         """
     ).fetchdf()
 
-    quote_to_user_df = con.execute(
-        f"""
-        SELECT
-          p.account_id,
-          r.created_at
-        FROM read_parquet('{path}') r
-        JOIN author_tweets p
-          ON CAST(r.quoted_tweet_id AS VARCHAR) = p.tweet_id
-        WHERE r.quoted_tweet_id IS NOT NULL
-        """
-    ).fetchdf()
+    if include_quotes:
+        quote_to_user_df = con.execute(
+            f"""
+            SELECT
+              p.account_id,
+              r.created_at
+            FROM read_parquet('{path}') r
+            JOIN author_tweets p
+              ON CAST(r.quoted_tweet_id AS VARCHAR) = p.tweet_id
+            WHERE r.quoted_tweet_id IS NOT NULL
+            """
+        ).fetchdf()
+    else:
+        quote_to_user_df = pd.DataFrame(columns=["account_id", "created_at"])
     con.close()
     try:
         tmp_accounts.unlink()
@@ -1135,7 +1151,9 @@ def load_author_graph(account_ids: pd.Series) -> dict:
         f"reply→user: {n_reply_user:,} ({n_from_parent:,} via parent account_id) | "
         f"quote→user: {len(quote_to_user_df):,}"
     )
-    mention_to_user = load_mention_times(accounts["account_id"])
+    mention_to_user = (
+        load_mention_times(accounts["account_id"]) if include_mentions else {}
+    )
     return {
         "reply_to_tweet": reply_to_tweet,
         "reply_to_user": reply_to_user,
@@ -2528,6 +2546,72 @@ def dyad_feature_columns() -> list[str]:
     return cols
 
 
+def load_parent_author_size_maps(account_ids: pd.Series) -> dict:
+    """Pre-T size proxies for parent authors: tweet times + inbound reply times.
+
+    Lighter than load_author_graph: no tweet_id arrays, quotes, or mention API.
+    """
+    accounts = pd.DataFrame({"account_id": account_ids.astype(str).unique()})
+    if accounts.empty:
+        return {"author_times": {}, "reply_to_user": {}}
+    tmp_accounts = CACHE_DIR / "_parent_author_ids.parquet"
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    accounts.to_parquet(tmp_accounts, index=False)
+    path = str(RAW_PARQUET)
+    print(f"Scanning dump for parent-author size on {len(accounts):,} accounts…", flush=True)
+    con = duckdb.connect()
+    con.execute(f"SET threads TO {max(1, os.cpu_count() or 4)}")
+    author_times_df = con.execute(
+        f"""
+        SELECT
+          CAST(t.account_id AS VARCHAR) AS account_id,
+          t.created_at
+        FROM read_parquet('{path}') t
+        SEMI JOIN read_parquet('{tmp_accounts}') a
+          ON CAST(t.account_id AS VARCHAR) = a.account_id
+        WHERE t.full_text IS NOT NULL
+          AND t.full_text NOT LIKE 'RT @%'
+        """
+    ).fetchdf()
+    # reply→user with parent-account coalesce (same repair as load_author_graph).
+    reply_to_user_df = con.execute(
+        f"""
+        WITH target AS (SELECT account_id FROM read_parquet('{tmp_accounts}')),
+        author_tweets AS (
+          SELECT CAST(t.tweet_id AS VARCHAR) AS tweet_id,
+                 CAST(t.account_id AS VARCHAR) AS account_id
+          FROM read_parquet('{path}') t
+          SEMI JOIN target a ON CAST(t.account_id AS VARCHAR) = a.account_id
+        ),
+        resolved AS (
+          SELECT
+            COALESCE(CAST(r.reply_to_user_id AS VARCHAR), p.account_id) AS account_id,
+            r.created_at
+          FROM read_parquet('{path}') r
+          LEFT JOIN author_tweets p
+            ON CAST(r.reply_to_tweet_id AS VARCHAR) = p.tweet_id
+          WHERE COALESCE(CAST(r.reply_to_user_id AS VARCHAR), p.account_id) IS NOT NULL
+        )
+        SELECT account_id, created_at
+        FROM resolved
+        SEMI JOIN target a ON resolved.account_id = a.account_id
+        """
+    ).fetchdf()
+    con.close()
+    try:
+        tmp_accounts.unlink()
+    except OSError:
+        pass
+    author_times = _sorted_time_map(author_times_df, "account_id")
+    reply_to_user = _sorted_time_map(reply_to_user_df, "account_id")
+    print(
+        f"  parent-author tweets: {len(author_times_df):,} | "
+        f"reply→user events: {len(reply_to_user_df):,}",
+        flush=True,
+    )
+    return {"author_times": author_times, "reply_to_user": reply_to_user}
+
+
 def resolve_parent_account_ids(df: pd.DataFrame) -> pd.DataFrame:
     """Ensure reply/quote_parent_account_id from dump (+ X parent cache when present)."""
     out = df.reset_index(drop=True).copy()
@@ -2845,12 +2929,13 @@ def attach_reply_dyad_features(df: pd.DataFrame, *, force: bool = False) -> pd.D
     partner_series = partner_series.astype(str)
     partner_series = partner_series[partner_series.ne("")]
 
-    parent_graph = load_author_graph(partner_series) if len(partner_series) else {
-        "reply_to_user": {},
-        "author_timeline": {},
-    }
-    reply_to_user = parent_graph.get("reply_to_user", {})
-    author_timeline = parent_graph.get("author_timeline", {})
+    size_maps = (
+        load_parent_author_size_maps(partner_series)
+        if len(partner_series)
+        else {"author_times": {}, "reply_to_user": {}}
+    )
+    reply_to_user = size_maps.get("reply_to_user", {})
+    author_times = size_maps.get("author_times", {})
 
     dyad_events = load_dyad_events(out["account_id"], partner_series, force=force)
     inbound_map, outbound_map = _dyad_time_maps(dyad_events)
@@ -2896,10 +2981,8 @@ def attach_reply_dyad_features(df: pd.DataFrame, *, force: bool = False) -> pd.D
                 continue
             known[i] = 1
             cutoff = child_t.iloc[i]
-            _, dump_times = author_timeline.get(
-                pid, (np.array([], dtype=object), np.array([], dtype="datetime64[ns]"))
-            )
-            n_prior = _count_before(dump_times, cutoff) if len(dump_times) else 0
+            dump_times = author_times.get(pid)
+            n_prior = _count_before(dump_times, cutoff)
             n_in = _count_before(reply_to_user.get(pid), cutoff)
             hist_n[i] = float(np.log1p(n_prior))
             inbound[i] = float(np.log1p(n_in))
@@ -2933,6 +3016,9 @@ def attach_reply_dyad_features(df: pd.DataFrame, *, force: bool = False) -> pd.D
             flush=True,
         )
     return out
+
+
+def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--max-tweets", type=int, default=120000, help="Cap on sampled original tweets")
     p.add_argument("--per-account-cap", type=int, default=180, help="Max tweets kept per account")
