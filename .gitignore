@@ -14,3 +14,5 @@ results.tsv
 *.parquet
 !.cache/
 logs/*.log
+logs/rescore_within_account/
+logs/v33_sera/
