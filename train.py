@@ -98,8 +98,14 @@ TABULAR_FEATURES = [
     "inbound_quotes_7d",
     "inbound_quotes_30d",
     "inbound_quotes_per_tweet",
+    "inbound_mentions",
+    "inbound_mentions_7d",
+    "inbound_mentions_30d",
+    "inbound_mentions_per_tweet",
     "media_x_inbound_replies",
     "reply_x_inbound_replies",
+    "media_x_inbound_mentions",
+    "reply_x_inbound_mentions",
     "has_reply_parent",
     "reply_parent_emb_cos",
     "reply_parent_log_text_len",
@@ -125,6 +131,16 @@ TABULAR_FEATURES = [
     "era_pre_musk",
     "era_musk_early",
     "era_musk_late",
+]
+
+# Opt-in CA provenance / upload-regime features (--provenance-features).
+PROVENANCE_FEATURES = [
+    "is_stream",
+    "has_upload_end",
+    "hours_since_upload_end",
+    "log_hours_since_upload_end",
+    "stream_x_log_age",
+    "stream_x_inbound_replies",
 ]
 
 # Opt-in descriptive text tags (--descriptive-text); flat on rate RMSE in v15.
@@ -213,6 +229,11 @@ BREAKOUT_FEATURES = [
 
 
 def feature_matrix(df: pd.DataFrame, skip_embeddings: bool) -> tuple[np.ndarray, list[str]]:
+    # Provenance raw cols (is_stream, …) live on the dataset for holdout/analyze;
+    # only include them when --provenance-features has built the derived marker col.
+    provenance_cols = (
+        PROVENANCE_FEATURES if "log_hours_since_upload_end" in df.columns else []
+    )
     extra = [
         c
         for c in (
@@ -225,6 +246,7 @@ def feature_matrix(df: pd.DataFrame, skip_embeddings: bool) -> tuple[np.ndarray,
             + EMB_KNN_TE_FEATURES
             + EMB_CAV_FEATURES
             + EMB_CLUSTER_TE_FEATURES
+            + provenance_cols
         )
         if c in df.columns
     ]
@@ -275,7 +297,174 @@ def time_split(df: pd.DataFrame, val_frac: float) -> tuple[pd.DataFrame, pd.Data
         f"val={val['account_id'].nunique():,} "
         f"overlap={len(set(train['account_id']) & set(val['account_id'])):,}"
     )
+    if "is_stream" in train.columns:
+        print(
+            f"Provenance: train stream={train['is_stream'].mean():.1%} "
+            f"val stream={val['is_stream'].mean():.1%}",
+            flush=True,
+        )
     return train, val
+
+
+def prior_upload_hist_counts(df: pd.DataFrame) -> np.ndarray:
+    """Per-row count of earlier upload-linked tweets by the same account (pre-T)."""
+    if "is_stream" not in df.columns:
+        return np.zeros(len(df), dtype=np.int32)
+    ordered = df.sort_values(["account_id", "created_at"], kind="mergesort")
+    is_upload = (ordered["is_stream"].to_numpy() == 0).astype(np.int32)
+    # Cumsum within account, then subtract current row ⇒ strictly earlier uploads.
+    prior = (
+        pd.Series(is_upload, index=ordered.index)
+        .groupby(ordered["account_id"], sort=False)
+        .cumsum()
+        .to_numpy(dtype=np.int32)
+        - is_upload
+    )
+    out = np.zeros(len(df), dtype=np.int32)
+    out[ordered.index.to_numpy()] = prior
+    return out
+
+
+def apply_holdout_policy(
+    df: pd.DataFrame,
+    *,
+    policy: str,
+    min_upload_hist: int = 0,
+) -> pd.DataFrame:
+    """Filter rows before the global time split by CA ingestion regime.
+
+    Policies:
+      time         — no regime filter (default global time holdout)
+      upload_era   — cap at the latest upload-linked created_at (drop pure-stream tail)
+      stream_only  — keep only browser-extension stream rows (null archive_upload_id)
+    """
+    out = df.copy()
+    if policy not in {"time", "upload_era", "stream_only"}:
+        raise SystemExit(f"Unknown holdout policy: {policy}")
+    if policy != "time" or min_upload_hist > 0:
+        if "is_stream" not in out.columns:
+            raise SystemExit(
+                "Holdout policy requires is_stream; run: uv run prepare.py --provenance-only"
+            )
+
+    if min_upload_hist > 0:
+        prior = prior_upload_hist_counts(out)
+        keep = prior >= int(min_upload_hist)
+        print(
+            f"min_upload_hist={min_upload_hist}: kept {int(keep.sum()):,}/{len(out):,} "
+            f"(mean prior upload-linked={float(prior.mean()):.2f})",
+            flush=True,
+        )
+        out = out.loc[keep].reset_index(drop=True)
+
+    if policy == "upload_era":
+        upload_times = out.loc[out["is_stream"].to_numpy() == 0, "created_at"]
+        if upload_times.empty:
+            raise SystemExit("upload_era holdout: no upload-linked rows in dataset")
+        cap = upload_times.max()
+        before = len(out)
+        out = out.loc[out["created_at"] <= cap].reset_index(drop=True)
+        print(
+            f"Holdout policy=upload_era: cap created_at≤{cap} "
+            f"kept {len(out):,}/{before:,} "
+            f"(stream after filter={out['is_stream'].mean():.1%})",
+            flush=True,
+        )
+    elif policy == "stream_only":
+        before = len(out)
+        out = out.loc[out["is_stream"].to_numpy() == 1].reset_index(drop=True)
+        print(
+            f"Holdout policy=stream_only: kept {len(out):,}/{before:,} stream rows",
+            flush=True,
+        )
+    else:
+        print("Holdout policy=time (global time split, no regime filter)", flush=True)
+
+    if len(out) < 50:
+        raise SystemExit(f"Holdout policy left only {len(out)} rows; need a denser dataset")
+    return out
+
+
+def add_provenance_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Build opt-in is_stream / upload-end features + light interactions."""
+    if "is_stream" not in df.columns:
+        raise SystemExit(
+            "Missing is_stream; run: uv run prepare.py --provenance-only"
+        )
+    out = df.copy()
+    out["is_stream"] = out["is_stream"].fillna(0).astype(np.int8)
+    if "has_upload_end" not in out.columns:
+        out["has_upload_end"] = np.int8(0)
+    if "hours_since_upload_end" not in out.columns:
+        out["hours_since_upload_end"] = np.float32(0.0)
+    hours = out["hours_since_upload_end"].to_numpy(dtype=np.float64)
+    # log1p of non-negative hours; negative ⇒ still inside prior archive coverage window.
+    out["log_hours_since_upload_end"] = np.log1p(np.clip(hours, 0.0, None)).astype(np.float32)
+    if "exposure_age_days" in out.columns:
+        age = out["exposure_age_days"].to_numpy(dtype=np.float64)
+    else:
+        # Fallback: age vs dataset max (same dump-time proxy as exposure rate).
+        dump_time = pd.Timestamp(out["created_at"].max())
+        age = (dump_time - pd.to_datetime(out["created_at"], utc=True)).dt.total_seconds().to_numpy()
+        age = np.clip(age / 86400.0, 0.0, None)
+    out["stream_x_log_age"] = (
+        out["is_stream"].to_numpy(dtype=np.float64) * np.log1p(age)
+    ).astype(np.float32)
+    if "inbound_replies" in out.columns:
+        out["stream_x_inbound_replies"] = (
+            out["is_stream"].to_numpy(dtype=np.float64)
+            * out["inbound_replies"].to_numpy(dtype=np.float64)
+        ).astype(np.float32)
+    else:
+        out["stream_x_inbound_replies"] = np.float32(0.0)
+    print(
+        f"Provenance features: stream={out['is_stream'].mean():.1%} "
+        f"has_upload_end={out['has_upload_end'].mean():.1%}",
+        flush=True,
+    )
+    return out
+
+
+def stream_fresh_sample_weights(
+    train_df: pd.DataFrame,
+    base_weights: np.ndarray,
+    *,
+    fresh_days: float,
+    floor: float = 0.25,
+) -> np.ndarray:
+    """Down-weight very fresh stream rows (as-observed eng; maturity still uncertain)."""
+    w = np.asarray(base_weights, dtype=np.float64).copy()
+    if fresh_days <= 0 or "is_stream" not in train_df.columns:
+        return w
+    if "exposure_age_days" in train_df.columns:
+        age = train_df["exposure_age_days"].to_numpy(dtype=np.float64)
+    else:
+        dump_time = pd.Timestamp(train_df["created_at"].max())
+        age = (
+            dump_time - pd.to_datetime(train_df["created_at"], utc=True)
+        ).dt.total_seconds().to_numpy() / 86400.0
+        age = np.clip(age, 0.0, None)
+    stream = train_df["is_stream"].to_numpy() == 1
+    # Linear ramp: age=0 → floor, age≥fresh_days → 1.
+    ramp = np.clip(age / float(fresh_days), 0.0, 1.0)
+    mult = floor + (1.0 - floor) * ramp
+    w[stream] *= mult[stream]
+    n_affected = int((stream & (mult < 1.0 - 1e-12)).sum())
+    print(
+        f"Stream-fresh weights: days={fresh_days:g} floor={floor:g} "
+        f"n_stream={int(stream.sum()):,} n_affected={n_affected:,} "
+        f"mean_mult={float(mult[stream].mean()) if stream.any() else 1.0:.3f} "
+        f"train_age_min={float(age.min()):.1f}d",
+        flush=True,
+    )
+    if stream.any() and n_affected == 0:
+        print(
+            "Warning: stream-fresh affected 0 train rows — under a time holdout, "
+            "train ages are ≥ the val-window span; raise --stream-fresh-days "
+            f"(need >~{float(age.min()):.0f}d here) or the knob is a no-op",
+            flush=True,
+        )
+    return w
 
 
 def evaluate(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
@@ -476,17 +665,43 @@ def apply_sera_sample_weights(
     sera_floor: float = 0.05,
     high_only: bool = True,
     seed: int = 0,
+    apply_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, float]]:
-    """Multiply sample weights by floor+(1−floor)·φ(y) for SERA-weighted MSE."""
-    phi, meta = relevance_phi_sera(y_train, high_only=high_only, seed=seed)
+    """Multiply sample weights by floor+(1−floor)·φ(y) for SERA-weighted MSE.
+
+    If ``apply_mask`` is set, fit φ on the masked rows only and leave unmasked
+    rows at their base weight (used for non-reply-stratum SERA).
+    """
+    y_train = np.asarray(y_train, dtype=np.float64)
     floor = float(np.clip(sera_floor, 0.0, 1.0))
-    sera_w = floor + (1.0 - floor) * phi
     base = np.ones(y_train.shape[0], dtype=np.float64) if weight_train is None else np.asarray(
         weight_train, dtype=np.float64
     )
+    if apply_mask is None:
+        phi, meta = relevance_phi_sera(y_train, high_only=high_only, seed=seed)
+        sera_w = floor + (1.0 - floor) * phi
+        out = base * sera_w
+    else:
+        mask = np.asarray(apply_mask, dtype=bool)
+        if mask.shape[0] != y_train.shape[0]:
+            raise ValueError(
+                f"SERA apply_mask length {mask.shape[0]} != y_train {y_train.shape[0]}"
+            )
+        if not mask.any():
+            phi, meta = relevance_phi_sera(y_train, high_only=high_only, seed=seed)
+            out = base.copy()
+        else:
+            phi_sub, meta = relevance_phi_sera(y_train[mask], high_only=high_only, seed=seed)
+            sera_w = np.ones(y_train.shape[0], dtype=np.float64)
+            sera_w[mask] = floor + (1.0 - floor) * phi_sub
+            out = base * sera_w
+            meta["sera_frac_pos"] = float(np.mean(phi_sub > 1e-6))
+            meta["sera_mean_phi"] = float(np.mean(phi_sub))
+            meta["sera_n_apply"] = float(mask.sum())
     meta["sera_floor"] = floor
     meta["sera_high_only"] = float(high_only)
-    return base * sera_w, meta
+    meta["sera_nonreply_only"] = float(apply_mask is not None)
+    return out, meta
 
 
 def _spearman_nonreply_feval(is_nonreply: np.ndarray):
@@ -590,8 +805,10 @@ def train_model(
     asymmetric_under_weight: float = 3.0,
     sera_floor: float = 0.05,
     sera_high_only: bool = True,
+    sera_nonreply_only: bool = False,
     early_stop_metric: str = "rmse",
     val_is_nonreply: np.ndarray | None = None,
+    train_is_nonreply: np.ndarray | None = None,
     group_train: np.ndarray | None = None,
     group_val: np.ndarray | None = None,
 ) -> tuple[lgb.Booster, dict[str, float]]:
@@ -600,16 +817,24 @@ def train_model(
     effective_loss = loss
     if loss == "sera":
         # SERA ∝ Σ φ(y)·(ŷ−y)² — optimize via MSE + relevance sample weights.
+        apply_mask = None
+        if sera_nonreply_only:
+            if train_is_nonreply is None:
+                raise ValueError("sera_nonreply_only requires train_is_nonreply")
+            apply_mask = train_is_nonreply
         effective_weight, sera_meta = apply_sera_sample_weights(
             y_train,
             weight_train,
             sera_floor=sera_floor,
             high_only=sera_high_only,
             seed=seed,
+            apply_mask=apply_mask,
         )
         effective_loss = "mse"
+        scope = "nonreply-only" if sera_nonreply_only else "all"
         print(
-            f"SERA relevance: med={sera_meta['sera_med']:.4f} upper={sera_meta['sera_upper']:.4f} "
+            f"SERA relevance ({scope}): med={sera_meta['sera_med']:.4f} "
+            f"upper={sera_meta['sera_upper']:.4f} "
             f"mc={sera_meta['sera_mc']:.3f} mean_phi={sera_meta['sera_mean_phi']:.3f} "
             f"frac_pos={sera_meta['sera_frac_pos']:.3f} floor={sera_floor:g}",
             flush=True,
@@ -684,9 +909,16 @@ def train_model(
         under_w = float(asymmetric_under_weight)
 
         def asymmetric_mse(y_pred: np.ndarray, dataset: lgb.Dataset):
+            # Custom objectives must apply Dataset weights themselves (LightGBM
+            # does not multiply them into grad/hess for Python objectives).
             y_true = dataset.get_label()
+            sw = dataset.get_weight()
+            if sw is None:
+                sw = np.ones_like(y_true, dtype=np.float64)
+            else:
+                sw = np.asarray(sw, dtype=np.float64)
             resid = y_true - y_pred
-            w = np.where(resid > 0.0, under_w, 1.0)
+            w = np.where(resid > 0.0, under_w, 1.0) * sw
             grad = -2.0 * w * resid
             hess = 2.0 * w
             return grad, hess
@@ -705,7 +937,12 @@ def train_model(
         f"Loss: {loss}"
         + (f" alpha={quantile_alpha:g}" if loss == "quantile" else "")
         + (f" under_weight={asymmetric_under_weight:g}" if loss == "asymmetric" else "")
-        + (f" floor={sera_floor:g}" if loss == "sera" else "")
+        + (
+            f" floor={sera_floor:g}"
+            + (" nonreply_only" if sera_nonreply_only else "")
+            if loss == "sera"
+            else ""
+        )
         + f" | early_stop={stop_metric}",
         flush=True,
     )
@@ -752,6 +989,8 @@ def train_gpboost_model(
     quantile_alpha: float = 0.65,
     sera_floor: float = 0.05,
     sera_high_only: bool = True,
+    sera_nonreply_only: bool = False,
+    train_is_nonreply: np.ndarray | None = None,
 ) -> tuple[Any, Any, dict[str, float]]:
     """Train GPBoost with a grouped Gaussian random intercept on account_id.
 
@@ -770,16 +1009,24 @@ def train_gpboost_model(
     effective_weight = weight_train
     effective_loss = loss
     if loss == "sera":
+        apply_mask = None
+        if sera_nonreply_only:
+            if train_is_nonreply is None:
+                raise ValueError("sera_nonreply_only requires train_is_nonreply")
+            apply_mask = train_is_nonreply
         effective_weight, sera_meta = apply_sera_sample_weights(
             y_train,
             weight_train,
             sera_floor=sera_floor,
             high_only=sera_high_only,
             seed=seed,
+            apply_mask=apply_mask,
         )
         effective_loss = "mse"
+        scope = "nonreply-only" if sera_nonreply_only else "all"
         print(
-            f"SERA relevance: med={sera_meta['sera_med']:.4f} upper={sera_meta['sera_upper']:.4f} "
+            f"SERA relevance ({scope}): med={sera_meta['sera_med']:.4f} "
+            f"upper={sera_meta['sera_upper']:.4f} "
             f"mc={sera_meta['sera_mc']:.3f} mean_phi={sera_meta['sera_mean_phi']:.3f} "
             f"frac_pos={sera_meta['sera_frac_pos']:.3f} floor={sera_floor:g}",
             flush=True,
@@ -1024,6 +1271,40 @@ def parse_args() -> argparse.Namespace:
         help="Optional row cap after time-sort (smoke tests); 0 = full dataset",
     )
     p.add_argument(
+        "--holdout-policy",
+        choices=("time", "upload_era", "stream_only"),
+        default="time",
+        help="Regime filter before the global time split: upload_era caps at the "
+        "latest upload-linked tweet; stream_only trains/evals on extension rows only",
+    )
+    p.add_argument(
+        "--min-upload-hist",
+        type=int,
+        default=0,
+        help="Drop rows whose author has fewer than N prior upload-linked tweets (0=off)",
+    )
+    p.add_argument(
+        "--provenance-features",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Add is_stream / upload-end / provenance×age features (default on; "
+        "v36c: +wa_nr/+wa_rp vs same-rebuild; --no-provenance-features to ablate)",
+    )
+    p.add_argument(
+        "--stream-fresh-days",
+        type=float,
+        default=0.0,
+        help="Down-weight stream rows with dump-age < this many days (0=off); "
+        "linear ramp from --stream-fresh-floor to 1.0. Under a time holdout, "
+        "must exceed the val-window age span or no train rows are affected",
+    )
+    p.add_argument(
+        "--stream-fresh-floor",
+        type=float,
+        default=0.25,
+        help="Minimum sample-weight multiplier for brand-new stream rows",
+    )
+    p.add_argument(
         "--residual",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -1166,6 +1447,12 @@ def parse_args() -> argparse.Namespace:
         help="SERA relevance on high extremes only (default); --no-sera-high-only uses both tails",
     )
     p.add_argument(
+        "--sera-nonreply-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="When --loss sera, fit/apply φ on non-replies only; replies keep base weight",
+    )
+    p.add_argument(
         "--early-stop-metric",
         choices=("rmse", "spearman_nonreply", "ndcg"),
         default="rmse",
@@ -1224,7 +1511,7 @@ def parse_args() -> argparse.Namespace:
         "--fail-clusters-quantile",
         type=float,
         default=0.1,
-        help="Top under-pred mass used as failure set (0.1 → worst 10%)",
+        help="Top under-pred mass used as failure set (0.1 → worst 10%%)",
     )
     p.add_argument(
         "--fail-clusters-mode",
@@ -2244,11 +2531,14 @@ def fit_predict_group(
     asymmetric_under_weight: float = 3.0,
     sera_floor: float = 0.05,
     sera_high_only: bool = True,
+    sera_nonreply_only: bool = False,
     early_stop_metric: str = "rmse",
     rank_nonreply_only: bool = True,
     rank_min_group: int = 2,
     hybrid_rank: bool = True,
     model_kind: str = "lgbm",
+    stream_fresh_days: float = 0.0,
+    stream_fresh_floor: float = 0.25,
 ) -> tuple[np.ndarray, Any, list[str], dict[str, float]]:
     x_train, feature_names = feature_matrix(train_df, skip_embeddings=skip_embeddings)
     x_val, _ = feature_matrix(val_df, skip_embeddings=skip_embeddings)
@@ -2267,6 +2557,14 @@ def fit_predict_group(
         nonreply_weight,
         1.0,
     ).astype(np.float64)
+    if stream_fresh_days > 0:
+        weight_train = stream_fresh_sample_weights(
+            train_df,
+            weight_train,
+            fresh_days=stream_fresh_days,
+            floor=stream_fresh_floor,
+        )
+    train_is_nonreply = train_df["is_reply"].to_numpy() == 0
     val_is_nonreply = val_df["is_reply"].to_numpy() == 0
     account_train = train_df["account_id"].astype(str).to_numpy()
     account_val = val_df["account_id"].astype(str).to_numpy()
@@ -2314,8 +2612,10 @@ def fit_predict_group(
             asymmetric_under_weight=asymmetric_under_weight,
             sera_floor=sera_floor,
             sera_high_only=sera_high_only,
+            sera_nonreply_only=False,
             early_stop_metric="ndcg" if early_stop_metric == "rmse" else early_stop_metric,
             val_is_nonreply=None,
+            train_is_nonreply=None,
             group_train=g_tr,
             group_val=g_va,
         )
@@ -2344,6 +2644,8 @@ def fit_predict_group(
             quantile_alpha=quantile_alpha,
             sera_floor=sera_floor,
             sera_high_only=sera_high_only,
+            sera_nonreply_only=sera_nonreply_only,
+            train_is_nonreply=train_is_nonreply,
         )
         raw = _gpboost_response_mean(
             model.predict(
@@ -2370,8 +2672,10 @@ def fit_predict_group(
             asymmetric_under_weight=asymmetric_under_weight,
             sera_floor=sera_floor,
             sera_high_only=sera_high_only,
+            sera_nonreply_only=sera_nonreply_only,
             early_stop_metric=early_stop_metric if early_stop_metric != "ndcg" else "rmse",
             val_is_nonreply=val_is_nonreply,
+            train_is_nonreply=train_is_nonreply,
         )
         extra_metrics.update(sera_meta)
         level_raw = np.asarray(
@@ -2417,8 +2721,10 @@ def fit_predict_group(
             asymmetric_under_weight=asymmetric_under_weight,
             sera_floor=sera_floor,
             sera_high_only=sera_high_only,
+            sera_nonreply_only=sera_nonreply_only,
             early_stop_metric=early_stop_metric,
             val_is_nonreply=val_is_nonreply,
+            train_is_nonreply=train_is_nonreply,
         )
         extra_metrics.update(sera_meta)
         raw = model.predict(x_val, num_iteration=model.best_iteration)
@@ -2459,6 +2765,12 @@ def main() -> None:
 
     df = add_time_regime_features(df)
 
+    df = apply_holdout_policy(
+        df,
+        policy=args.holdout_policy,
+        min_upload_hist=args.min_upload_hist,
+    )
+
     dump_time = pd.Timestamp(df["created_at"].max())
     y_train_raw_ref: np.ndarray | None = None
     y_val_raw_ref: np.ndarray | None = None
@@ -2473,6 +2785,16 @@ def main() -> None:
             beta=args.exposure_beta,
             eps=args.exposure_eps,
         )
+
+    if args.provenance_features:
+        if "is_stream" not in df.columns:
+            print(
+                "Warning: --provenance-features on but is_stream missing; "
+                "skipping (run: uv run prepare.py --provenance-only)",
+                flush=True,
+            )
+        else:
+            df = add_provenance_features(df)
 
     train_df, val_df = time_split(df, args.val_frac)
     if args.exposure_correct and args.exposure_mode == "resid":
@@ -2635,11 +2957,14 @@ def main() -> None:
             asymmetric_under_weight=args.asymmetric_under_weight,
             sera_floor=args.sera_floor,
             sera_high_only=args.sera_high_only,
+            sera_nonreply_only=args.sera_nonreply_only,
             early_stop_metric=args.early_stop_metric,
             rank_nonreply_only=args.rank_nonreply_only,
             rank_min_group=args.rank_min_group,
             hybrid_rank=args.hybrid_rank,
             model_kind=args.model,
+            stream_fresh_days=args.stream_fresh_days,
+            stream_fresh_floor=args.stream_fresh_floor,
         )
         # Score full val with the non-reply model, then overwrite replies.
         x_val_full, _ = feature_matrix(val_df, skip_embeddings=args.skip_embeddings)
@@ -2689,11 +3014,14 @@ def main() -> None:
                 asymmetric_under_weight=args.asymmetric_under_weight,
                 sera_floor=args.sera_floor,
                 sera_high_only=args.sera_high_only,
+                sera_nonreply_only=args.sera_nonreply_only,
                 early_stop_metric=args.early_stop_metric,
                 rank_nonreply_only=args.rank_nonreply_only,
                 rank_min_group=args.rank_min_group,
                 hybrid_rank=args.hybrid_rank,
                 model_kind=args.model,
+                stream_fresh_days=args.stream_fresh_days,
+                stream_fresh_floor=args.stream_fresh_floor,
             )
             pred[val_df["is_reply"].to_numpy() == mask_val] = p
             models.append(model)
@@ -2713,11 +3041,14 @@ def main() -> None:
             asymmetric_under_weight=args.asymmetric_under_weight,
             sera_floor=args.sera_floor,
             sera_high_only=args.sera_high_only,
+            sera_nonreply_only=args.sera_nonreply_only,
             early_stop_metric=args.early_stop_metric,
             rank_nonreply_only=args.rank_nonreply_only,
             rank_min_group=args.rank_min_group,
             hybrid_rank=args.hybrid_rank,
             model_kind=args.model,
+            stream_fresh_days=args.stream_fresh_days,
+            stream_fresh_floor=args.stream_fresh_floor,
         )
 
     # Primary prediction/label are in training-target space.
@@ -2823,6 +3154,9 @@ def main() -> None:
     metrics["loss"] = args.loss
     metrics["sera_floor"] = float(args.sera_floor) if args.loss == "sera" else 0.0
     metrics["sera_high_only"] = float(args.sera_high_only) if args.loss == "sera" else 0.0
+    metrics["sera_nonreply_only"] = (
+        float(args.sera_nonreply_only) if args.loss == "sera" else 0.0
+    )
     metrics["early_stop_metric"] = args.early_stop_metric
     metrics["hybrid_rank"] = float(args.hybrid_rank)
     metrics["rank_nonreply_only"] = (
@@ -2831,6 +3165,10 @@ def main() -> None:
     metrics["rank_min_group"] = (
         float(args.rank_min_group) if args.loss == "lambdarank" or args.hybrid_rank else 0.0
     )
+    metrics["holdout_policy"] = args.holdout_policy
+    metrics["min_upload_hist"] = float(args.min_upload_hist)
+    metrics["provenance_features"] = float(args.provenance_features)
+    metrics["stream_fresh_days"] = float(args.stream_fresh_days)
     metrics.update(gpboost_meta)
     metrics["seconds"] = round(time.time() - t0, 2)
 
@@ -2855,6 +3193,8 @@ def main() -> None:
                 "log_engagement",
                 "is_reply",
                 "is_quote",
+                "is_stream",
+                "archive_upload_id",
                 "has_media",
                 "has_url",
                 "text_len",

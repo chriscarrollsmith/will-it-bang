@@ -20,13 +20,16 @@ Process retrospective (what moved the scoreboard vs what burned cycles): [`logs/
 
 | Objective | Run | wa_nr_wmean | wa_rp_wmean | global_nr | rmse_log | Notes |
 |---|---|---:|---:|---:|---:|---|
-| **Default stack** | **v31b** | **0.227** | **0.280** | 0.518 | 0.608 | Hybrid level + stratum LambdaRank blend (default) |
+| **Default stack** | **v36c** | **0.249** | **0.276** | 0.569 | **0.602** | Hybrid + mentions + provenance features (`stream_x_log_age` #21 gain) |
+| Prior (no provenance feats) | v36a / v35b | 0.225 / 0.242 | 0.251 / 0.266 | **0.593** / **0.579** | 0.602 / 0.605 | v36a = same-rebuild control (0% media); v35b had refreshed media |
+| Prior hybrid (no mentions) | v31b / v35a | 0.227 / 0.237 | 0.280 / 0.275 | 0.518 | 0.608 / 0.620 | v35a = same-rebuild control for v35b |
 | Level-only (ablation) | v31a | 0.187 | 0.172 | 0.508 | 0.610 | Asymmetric without hybrid blend |
-| Magnitude (opt-in SERA) | v28b / rescore | 0.204 | 0.140 | 0.474 | **0.590** | Level-only rescore: +wa_nr, −wa_rp; better RMSE |
+| Magnitude (opt-in SERA) | v28b / v33b | 0.227† | 0.280† | 0.483 | **0.584** | †wa_* frozen by hybrid ranker; level SERA only moves RMSE/global |
 | Dump total | v13 | — | — | — | 0.967 | Legacy objective |
 
-Rebuild: `uv run prepare.py --skip-media` (defaults are the v12 scale knobs).  
-Train: `uv run train.py --description "…"`.
+Rebuild: `uv run prepare.py --skip-media` (defaults are the v12 scale knobs; mentions + provenance/upload-end included).  
+Train: `uv run train.py --description "…"`. Patch older datasets with `--mentions-only` / `--provenance-only`.  
+Ablate provenance feats with `--no-provenance-features`. Regime holdouts: `--holdout-policy upload_era|stream_only` (opt-in; do not change locked scoreboard lightly).
 
 ## Timeline (curated)
 
@@ -82,7 +85,48 @@ Dump-time fav/RT used as author history → optimistic RMSE ~0.82 (v5). Invalid 
 | v31a | 0.610 (rate) | 0.460 | Asymmetric control with new primaries: wa_nr_wmean **0.187**, wa_rp_wmean **0.172**; global_nr 0.508; under-pred 2.22 |
 | v31b | 0.608 (rate) | 0.490 | Hybrid `--hybrid-rank`: wa_nr_wmean **0.227** (+0.040), wa_rp_wmean **0.280** (+0.108); global_nr 0.518; under-pred 2.21; **promote / new default** |
 | v31c | — | — | Policy: lock primary = within-account Spearman by stratum (NR + reply); global Spearman secondary |
-| v32 | — | — | Rescore shortlist on level-only stack (`--no-hybrid-rank`) vs control wa_nr **0.187** / wa_rp **0.172** / rmse 0.610 / global_nr 0.508. Artifacts: `logs/rescore_within_account/`. **SERA:** wa_nr **0.204** (+0.017), wa_rp **0.140** (−0.032), rmse **0.590**, global_nr 0.474 — NR within-author + magnitude help, reply within-author and global rank hurt; stay opt-in (consider NR-stratum / hybrid×SERA later). **PLS-8:** wa_nr +0.008 / wa_rp −0.012 / rmse flat — marginal, leave opt-in. **fail-clusters:** noise. **CAV / author affinity:** flat-to-worse. **cluster TE:** still regresses (wa_nr −0.037, wa_rp −0.057). Do not revive CAV/affinity/cluster-TE without a new angle |
+| v32 | — | — | Rescore shortlist on level-only stack (`--no-hybrid-rank`) vs control wa_nr **0.187** / wa_rp **0.172** / rmse 0.610 / global_nr 0.508. Artifacts: `logs/rescore_within_account/`. **SERA:** wa_nr **0.204** (+0.017), wa_rp **0.140** (−0.032), rmse **0.590**, global_nr 0.474 — NR within-author + magnitude help, reply within-author and global rank hurt; stay opt-in. **PLS-8:** wa_nr +0.008 / wa_rp −0.012 / rmse flat — marginal, leave opt-in. **fail-clusters:** noise. **CAV / author affinity:** flat-to-worse. **cluster TE:** still regresses (wa_nr −0.037, wa_rp −0.057). Do not revive CAV/affinity/cluster-TE without a new angle |
+| v33a | 0.608 (rate) | 0.490 | Hybrid asymmetric control (= v31b): wa_nr **0.227**, wa_rp **0.280**, global_nr 0.518 |
+| v33b | **0.584** (rate) | 0.460 | Hybrid × SERA: wa_* **unchanged** (ranker sets within-author order); RMSE −0.024 / under-pred 2.21→2.04; global_nr 0.518→0.483 — magnitude-only; **do not promote** |
+| v33c | 0.601 (rate) | 0.474 | Hybrid × SERA `--sera-nonreply-only`: same frozen wa_*; milder RMSE/global trade vs v33b |
+| v33d | 0.604 (rate) | 0.453 | Level SERA NR-only: wa_nr **0.138** (−0.049 vs level control), wa_rp 0.170 (flat); **regress** on locked primary — NR-stratum SERA fails |
+| v35a | 0.620 (rate) | 0.503 | Same-rebuild hybrid control **without** mention cols (0% media): wa_nr **0.237**, wa_rp **0.275**, global_nr 0.518; under-pred 2.22 |
+| v35b | **0.605** (rate) | **0.521** | Timestamped inbound @-mentions (`user_mentions` ⋊ tweet time; 99.7% accounts / 98.7% rows): wa_nr **0.242** (+0.006), wa_rp **0.266** (−0.009), global_nr **0.579** (+0.061), under-pred 2.15; smoke NR spearman(mentions,rate)≈0.55; `reply_x_inbound_mentions` / `inbound_mentions_per_tweet` top gains; **keep default** (NR + magnitude/global win; mild reply within-author cost) |
+| v36a | **0.602** (rate) | **0.521** | Same-rebuild control after reply-uid backfill + upload-end cols (0% media via `--skip-media`): wa_nr **0.225**, wa_rp **0.251**, global_nr **0.593**; val 100% stream |
+| v36b | 0.482† (rate) | 0.459† | `--holdout-policy upload_era` (cap ≤ last upload-linked `created_at` 2026-03-22): wa_nr **0.143** (−0.082), wa_rp **0.299** (+0.049); †different val — **do not promote** / keep `time` default |
+| v36c | **0.602** (rate) | **0.521** | `--provenance-features` on time holdout: wa_nr **0.249** (+0.024), wa_rp **0.276** (+0.025), global_nr 0.569 (−0.024); `stream_x_log_age` #21 gain; raw `is_stream` zero gain on ~pure-stream val; **promote / default on** |
+| v36d | 0.615† (rate) | 0.516† | `--holdout-policy stream_only`: wa_nr 0.239 / wa_rp 0.276; †near-identical corpus (dataset already 96.7% stream) — diagnostic only |
+| v37a2 | **0.602** (rate) | **0.521** | Control after asymmetric sample-weight fix (= v36c; uniform weights unchanged) |
+| v37b2 | 0.603 (rate) | 0.521 | `--stream-fresh-days 90`: wa_* **frozen** (hybrid ranker); global_nr 0.569→**0.577**; rmse 0.602→0.603; under-pred flat; **leave opt-in** |
+| v37d | 0.604 (rate) | 0.521 | `--stream-fresh-days 180` (35% train affected): wa_* frozen; global_nr 0.575; rmse worse — no promote |
+| v37c | — | — | `--stream-fresh-days 30`: **no-op** under time holdout (train ages ≥~37d); harness now warns |
+
+### v37 stream-fresh weights (same rebuild; after asymmetric weight fix)
+
+| Run | fresh_days | wa_nr | wa_rp | global_nr | rmse | Notes |
+|---|---:|---:|---:|---:|---:|---|
+| v37a2 control | 0 | 0.249 | 0.276 | 0.569 | 0.602 | Uniform weights; matches v36c |
+| v37b2 | 90 | 0.249 | 0.276 | **0.577** | 0.603 | 9.5k train rows affected (mean_mult 0.97); wa_* frozen |
+| v37d | 180 | 0.249 | 0.276 | 0.575 | 0.604 | 31k affected (mean_mult 0.90); still no wa_* move |
+| v37c | 30 | 0.249 | 0.276 | 0.569 | 0.602 | 0 affected — time-holdout no-op |
+
+Bugfix: custom asymmetric MSE ignored `Dataset` sample weights (LightGBM does not apply them to Python objectives). Pre-fix v37b matched control bit-for-bit despite n_affected>0. Fix is neutral when weights are uniform (default stack). `--nonreply-weight` under asymmetric was similarly inert before the fix.
+
+### v36 regime holdout / provenance features (same rebuild)
+
+| Run | wa_nr | wa_rp | global_nr | rmse | Notes |
+|---|---:|---:|---:|---:|---|
+| v36a time control | 0.225 | 0.251 | **0.593** | 0.602 | Reply-uid densification + upload-end metadata |
+| v36b upload_era | **0.143** | **0.299** | 0.590 | 0.482† | Caps timeline; val still ~100% stream; hurts wa_nr |
+| v36c + provenance feats | **0.249** | **0.276** | 0.569 | 0.602 | Promote; `--no-provenance-features` to ablate |
+| v36d stream_only | 0.239 | 0.276 | 0.567 | 0.615† | Diagnostic (dataset already stream-dominated) |
+
+### v35 inbound mentions (same rebuild)
+
+| Run | wa_nr | wa_rp | global_nr | rmse | Notes |
+|---|---:|---:|---:|---:|---|
+| v35a no mentions | 0.237 | **0.275** | 0.518 | 0.620 | Control |
+| v35b + mentions | **0.242** | 0.266 | **0.579** | **0.605** | Promote / default on |
 
 ### Rescore shortlist (level-only, locked primaries)
 
@@ -96,6 +140,15 @@ Fair revisit of prior ablations after the metric lock. Control = asymmetric leve
 | emb_cav | −0.004 | −0.006 | +0.002 | −0.008 | Flat/worse — do not revive |
 | author_emb_affinity | −0.009 | −0.012 | +0.002 | −0.007 | Flat/worse — do not revive |
 | emb_cluster_te | **−0.037** | **−0.057** | +0.014 | −0.025 | Still regresses |
+
+### v33 SERA × hybrid / NR-stratum
+
+| Run | wa_nr | wa_rp | global_nr | rmse | Notes |
+|---|---:|---:|---:|---:|---|
+| v33a hybrid asym | 0.227 | 0.280 | 0.518 | 0.608 | Control |
+| v33b hybrid sera | 0.227 | 0.280 | 0.483 | **0.584** | wa_* frozen; better magnitude |
+| v33c hybrid sera NR | 0.227 | 0.280 | 0.494 | 0.601 | Same; milder tradeoff |
+| v33d level sera NR | **0.138** | 0.170 | 0.469 | 0.604 | Primary regress vs level control 0.187 |
 
 ## Failure modes (still open)
 
@@ -113,8 +166,14 @@ Check off when tried; note outcome in one line.
 - [x] Calendar / era features (year, month seasonality, platform eras) — **v13: 0.978 → 0.967**
 - [x] Exposure-rate target as default objective — **v14e: rate rmse 0.642** (vs train-mean 0.701); dump-total decode intentionally weaker
 - [ ] Train-fit regime-specific baselines or separate heads by era
-- [ ] Explicit “CA corpus quality over time” proxies (upload density, archive coverage)
+- [x] Explicit “CA corpus quality over time” proxies (upload density, archive coverage) — **audit 2026-07-24:** stream (`archive_upload_id` null) is 62% of 2025 / 98% of 2026 dump rows; latest time-quintile on eligible accounts is ~100% stream with ~73% replies missing `reply_to_user_id` (breaks inbound `reply_to_user` hist). Likes/followers only from archive uploads (extension does not capture). Report: `logs/ca_data_quality_audit.md`; re-run `uv run audit_ca_quality.py`.
+- [x] Provenance-aware eval: `analyze.py` slices wa_* by upload-linked vs stream (`is_stream` from null `archive_upload_id`; carried in prepare / joined from dump if missing).
+- [x] Backfill `reply_to_user_id` from parent `account_id` when parent ∈ dump — in `load_author_graph` (inbound hist) + sampled-row coalesce for `is_self_reply`; rebuild densifies `inbound_replies*` (v36a).
+- [x] Holdout / train policy by ingestion regime — **v36b `upload_era`:** wa_nr regresses on new val (still ~stream); **v36d `stream_only`:** ≈ time on today’s corpus; keep `--holdout-policy time` default; knobs remain for regime-specific scoreboards. `--min-upload-hist` still unused.
+- [x] Optional train feature `is_stream` / hours since pre-T `archive_upload.end_date` — **v36c: promote / default on** (`stream_x_log_age` #21; wa_nr +0.024 / wa_rp +0.025 / global_nr −0.024 vs v36a); `--no-provenance-features` to ablate
+- [x] Label honesty for stream eng via `--stream-fresh-days` — **v37b2/d:** under hybrid, wa_* frozen (ranker dominates); mild global_nr lift / flat-to-worse RMSE; leave **opt-in**. Note: d must exceed val-window span (~37d) or train coverage is 0; asymmetric custom obj now honors sample weights
 - [ ] Fixed-horizon labels if CA/X ever provide time-series engagement (cleaner maturity control)
+- [ ] Do **not** build liker / likes-graph features until CA streams likes with usable timestamps (extension omits likes; upload likes undated) — revisit only if #427 lands or a dated source appears
 
 ### Language-model labels (post-time text only)
 - Prefer descriptive tags of tweet text (sentiment, humor, controversy, narrative, CTA, gender presentation). Avoid fame/quality/influence scores on text or handles — cutoff/reputation leakage risk.
@@ -136,7 +195,7 @@ Check off when tried; note outcome in one line.
 - [ ] Media-type breakdown (photo / gif / video) if available
 
 ### Graph / archive denser still
-- [ ] Timestamped mention joins (via dump tweet join; `user_mentions` alone has no time)
+- [x] Timestamped mention joins (via dump tweet join; `user_mentions` alone has no time) — **v35b: keep default**; vs same-rebuild wa_nr +0.006 / wa_rp −0.009 / rmse −0.015 / global_nr +0.061; `prepare.py --mentions-only`
 - [ ] X API fallback for missing reply/quote parents
 - [ ] Quote-of-quote / deeper parent chain (1–2 hops, still pre-T)
 - Note: CA `followers`/`following` are archive **snapshots** (no follow/unfollow event times) — not usable as pre-T graph history.
@@ -170,11 +229,11 @@ Heavier / researchy:
 
 ### Modeling
 - [x] Quantile / pinball or underprediction-asymmetric loss — **v20a asymmetric: 0.639→0.607 rate RMSE** (default); **v20b quantile α=0.65: worse RMSE** (0.647), slight Spearman lift
-- [x] SERA / relevance-weighted extreme loss — **v28b** RMSE lift / global rank hurt; **v32 rescore:** wa_nr +0.017, wa_rp −0.032 — stay **opt-in**; next angle: NR-stratum SERA or hybrid×SERA (not blanket default)
+- [x] SERA / relevance-weighted extreme loss — **v28b/v32** level: +wa_nr/−wa_rp; **v33b** hybrid×SERA: wa_* frozen, RMSE↑/global↓; stay **opt-in** for magnitude only
 - [x] Early-stop on `spearman_nonreply` — **v29b: tiny lift** (0.508→0.509); guardrails flat; `--early-stop-metric spearman_nonreply` opt-in (default stays rmse)
 - [x] Pairwise / listwise LambdaRank on non-replies by `account_id` — **v30b: fail on global spearman_nr** (0.051); slight **within-account** rank lift (wmean 0.187→0.211); `--loss lambdarank` opt-in only
 - [x] Hybrid level + stratum within-author ranker — **v31b: lift** wa_nr 0.187→0.227, wa_rp 0.172→0.280; guardrails flat/up; **default on** (`--no-hybrid-rank` to ablate)
-- [ ] SERA on NR stratum only / hybrid level=SERA + ranker (follow-up from v32 rescore)
+- [x] SERA on NR stratum / hybrid×SERA — **v33:** hybrid freezes wa_*; level `--sera-nonreply-only` **regress** wa_nr 0.187→0.138; leave opt-in, no promote
 - [ ] Larger frozen encoder (Modal credits) vs MiniLM
 - [ ] Further scale (>120k / more accounts with lower `min-account-tweets`)
 - [x] Account-level **target encoding** (train-fold LOO, leakage-safe) — **v19: 0.642 → 0.639 rate RMSE**, Spearman 0.441→0.452; default on (`--no-account-te` to ablate)
