@@ -1412,14 +1412,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--interlocutor-emb-affinity",
         action="store_true",
-        help="Add pre-T inbound interlocutor MiniLM affinity (reply/quote/mention texts to "
-        "the author; sweet-spot + 30d). Builds interlocutor_cache via prepare helpers; "
-        "off by default until promoted",
+        help="Add pre-T inbound interlocutor MiniLM affinity (reply/quote texts to "
+        "the author by default; sweet-spot + 30d). Builds interlocutor_cache via "
+        "prepare helpers; off by default until promoted",
     )
     p.add_argument(
         "--force-interlocutor",
         action="store_true",
         help="With --interlocutor-emb-affinity, rescan dump interlocutor events",
+    )
+    p.add_argument(
+        "--interlocutor-include-mentions",
+        action="store_true",
+        help="Pool inbound @-mention tweets into interlocutor affinity (off by default)",
     )
     p.add_argument(
         "--interlocutor-sweet-cos",
@@ -2043,14 +2048,15 @@ def add_interlocutor_emb_affinity(
     df: pd.DataFrame,
     *,
     force: bool = False,
+    include_mentions: bool = False,
     sweet_cos: float = 0.5,
     embed_batch_size: int = 256,
 ) -> pd.DataFrame:
     """Cosine / L2 vs mean of pre-T inbound interlocutor MiniLM vectors.
 
-    Interlocutor texts are reply/quote/mention tweets directed at the author
-    (dump + mention cache), not the author's own history. Includes quadratic
-    and distance-to-sweet-spot terms for a non-linear audience-fit effect.
+    Interlocutor texts are reply/quote tweets directed at the author (dump),
+    optionally mentions. Includes quadratic and distance-to-sweet-spot terms
+    for a non-linear audience-fit effect.
     """
     emb_cols = [c for c in df.columns if re.fullmatch(r"emb_\d+", c)]
     if not emb_cols:
@@ -2061,7 +2067,11 @@ def add_interlocutor_emb_affinity(
     # Local import keeps prepare's heavy deps out of the default train path.
     from prepare import ensure_interlocutor_embeddings, load_interlocutor_events
 
-    events = load_interlocutor_events(df["account_id"], force=force)
+    events = load_interlocutor_events(
+        df["account_id"],
+        force=force,
+        include_mentions=include_mentions,
+    )
     if events.empty:
         print("Interlocutor emb affinity: no inbound events; features left at 0")
         out = df.copy()
@@ -2958,6 +2968,7 @@ def main() -> None:
         df = add_interlocutor_emb_affinity(
             df,
             force=args.force_interlocutor,
+            include_mentions=args.interlocutor_include_mentions,
             sweet_cos=args.interlocutor_sweet_cos,
         )
     if args.descriptive_text:

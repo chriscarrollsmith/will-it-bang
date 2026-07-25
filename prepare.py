@@ -811,12 +811,15 @@ def load_interlocutor_events(
     account_ids: pd.Series,
     *,
     force: bool = False,
-    include_mentions: bool = True,
+    include_mentions: bool = False,
 ) -> pd.DataFrame:
     """Inbound reply/quote/(optional mention) tweets directed at sampled authors.
 
     Cached by ego account_id. Used for interlocutor MiniLM affinity: mean of
     pre-T interaction-tweet embeddings vs the author's current tweet.
+
+    Mentions are off by default: they dominate event volume and largely
+    duplicate inbound_mentions counts already in the tabular stack.
     """
     accounts = sorted({str(a) for a in account_ids.astype(str).tolist()})
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -972,12 +975,17 @@ def load_interlocutor_events(
         & cached["tweet_id"].astype(str).ne("")
         & cached["created_at"].notna()
     ].copy()
+    kinds = {"reply", "quote"}
+    if include_mentions:
+        kinds.add("mention")
+    usable = usable[usable["kind"].astype(str).isin(kinds)]
     usable["created_at"] = pd.to_datetime(usable["created_at"], utc=True, errors="coerce")
     usable = usable[usable["created_at"].notna()]
     print(
         f"  usable interlocutor events: {len(usable):,} for "
         f"{usable['ego_account_id'].nunique():,}/{len(accounts):,} accounts "
-        f"({(usable['ego_account_id'].nunique() / max(len(accounts), 1)):.1%} coverage)",
+        f"({(usable['ego_account_id'].nunique() / max(len(accounts), 1)):.1%} coverage; "
+        f"kinds={sorted(kinds)})",
         flush=True,
     )
     return usable.reset_index(drop=True)
@@ -2546,6 +2554,12 @@ def parse_args() -> argparse.Namespace:
         help="Rescan dump interlocutor events even when interlocutor_cache.parquet has the account_id",
     )
     p.add_argument(
+        "--interlocutor-include-mentions",
+        action="store_true",
+        help="Include inbound @-mention tweets in interlocutor_cache / affinity pool "
+        "(off by default; mentions drown reply/quote signal and overlap inbound_mentions)",
+    )
+    p.add_argument(
         "--provenance-only",
         action="store_true",
         help="Attach archive_upload_id / is_stream / upload-end features onto an existing dataset.parquet",
@@ -2603,6 +2617,7 @@ def main() -> None:
         events = load_interlocutor_events(
             dataset["account_id"],
             force=args.force_interlocutor,
+            include_mentions=args.interlocutor_include_mentions,
         )
         if len(events):
             ensure_interlocutor_embeddings(events, batch_size=args.embed_batch_size)
