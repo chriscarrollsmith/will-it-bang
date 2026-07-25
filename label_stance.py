@@ -167,8 +167,12 @@ def build_pair_frame(
         "has_quote_parent",
         "engagement",
     ]
-    have = set(pd.read_parquet(DATASET_PATH, columns=[]).columns)
+    import pyarrow.parquet as pq
+
+    have = set(pq.ParquetFile(DATASET_PATH).schema_arrow.names)
     cols = [c for c in cols if c in have]
+    if "tweet_id" not in cols or "full_text" not in cols:
+        raise SystemExit(f"Dataset missing tweet_id/full_text; have={sorted(have)[:20]}…")
     df = pd.read_parquet(DATASET_PATH, columns=cols)
     df["tweet_id"] = df["tweet_id"].astype(str)
     df["created_at"] = pd.to_datetime(df["created_at"], utc=True)
