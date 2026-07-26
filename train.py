@@ -1713,9 +1713,11 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--residual-emb-cav",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="CAV on MiniLM residualized vs account TE / reply baselines "
-        "(res_emb_cav_proj; uses --emb-cav-quantile / --emb-cav-nonreply-only)",
+        "(res_emb_cav_proj; uses --emb-cav-quantile / --emb-cav-nonreply-only; "
+        "default on after v47; --no-residual-emb-cav to ablate)",
     )
     p.add_argument(
         "--fail-clusters",
