@@ -187,7 +187,7 @@ Fair revisit of prior ablations after the metric lock. Control = asymmetric leve
 - Parent-author **corpus MiniLM** — **v41d** 75% reply coverage but cos anti-aligned within-author; wa_* regress; stays under opt-in dyad (`logs/v41_parent_author_emb_smoke.md`).
 - Reply **LM stance** (agree/disagree vs parent) — **v42** Modal Qwen3-8B calibrated but dense corr fails gate (0.021); wa_rp regress; `--stance-labels` opt-in (`logs/v42_stance_smoke.md`).
 - Richer **descriptive LM tags** (humor/controversy/narrative/CTA/news/dunk) — **v43** 1.5B NR smoke: humor/narrative ρ≈0.14 (gate pass); overconfident ≥7 on humor/controversy; sparse train +wa_nr +0.016 / wa_rp frozen; `--desc-labels` opt-in (`logs/v43_desc_tags_smoke.md`). Revisit denser/8B before promote (Modal token required; blocked in 2026-07-26 cloud run).
-- Residual emb CAV/PLS — **v44 smoke** (`logs/v44_residual_emb_smoke.md`): mean R²(emb\|TE/reply)≈0.015 so residual≈raw; `--residual-emb-pls 8` flat/worse (global_nr 0.394→0.309); `--residual-emb-cav` smoke +wa_nr +0.024/−wa_rp — leave **opt-in**, larger-scale confirm before promote.
+- Residual emb CAV/PLS — **v44** (`logs/v44_residual_emb_smoke.md`): R²(emb\|Z)≈0.01; `--residual-emb-pls 8` wa_nr regress (medium −0.027); `--residual-emb-cav` medium wa_nr **+0.025** / wa_rp +0.007 vs control and beats raw `--emb-cav` twin (wa_nr −0.010) — **opt-in**, full-scale confirm before promote.
 
 ---
 
@@ -255,7 +255,7 @@ Cheap first bets (smoke: train-fold corr of 1–8 derived dims vs rate; then ful
 - [x] **Cluster TE:** — **v26a/b: regress**; **v32 rescore:** still regresses on wa_* (−0.037 / −0.057); `--emb-cluster-te` stays off. Cheap emb-discovery lane exhausted
 
 Heavier / researchy:
-- [x] Residual emb after regressing out account TE / reply baseline, then redo direction or PLS — **v44 smoke** (`logs/v44_residual_emb_smoke.md`): R²(emb\|Z)≈0.015; `--residual-emb-pls 8` worse global_nr; `--residual-emb-cav` smoke +wa_nr (noisy) — **opt-in**, do not promote without larger-scale confirm
+- [x] Residual emb after regressing out account TE / reply baseline, then redo direction or PLS — **v44** (`logs/v44_residual_emb_smoke.md`): PLS regresses wa_nr; residual CAV medium +0.025 wa_nr vs control (raw CAV twin −0.010) — **opt-in**; full ~110k confirm before promote
 - [x] Error-driven clusters: — **v25a/b: flat**; **v32 rescore:** noise on wa_*; `--fail-clusters` stays opt-in
 - [ ] Supervised manifold (UMAP on RF-leaf similarity, etc.) — usually for analysis, not tabular features; only promote if a cheap projection beats PLS
 
