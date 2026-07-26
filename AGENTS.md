@@ -16,6 +16,8 @@ Run Python code with `uv run`.
 
 Any time you have to look up how to do something you might want to do again, add a single line to this document to record the information so you don't have to look it up next time.
 
+- Shared ML cache across Cursor cloud containers: S3 triage bucket via `AWS_S3_TRIAGE_BUCKET` + `scripts/s3_cache_sync.sh` (see Cursor Cloud § below); `pip install --user awscli` if `aws` is missing.
+
 - API docs live at https://github.com/TheExGenesis/community-archive/blob/main/docs/api-doc.md (also https://www.community-archive.org/docs); Supabase REST at https://fabxmporizzqflnftavs.supabase.co.
 - Public anon key (send as both `apikey` and `Authorization: Bearer`): `eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZhYnhtcG9yaXp6cWZsbmZ0YXZzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3MjIyNDQ5MTIsImV4cCI6MjAzNzgyMDkxMn0.UIEJiUNkLsW28tBHmG-RQDW-I5JNlJLt62CSk9D_qG8`
 - Count rows with `Prefer: count=exact` + `Range: 0-0`; total is in the `Content-Range` header (e.g. `0-0/11703`). Filter usernames with `username=ilike.handle` on `enriched_tweets` or `all_account`.
@@ -81,3 +83,16 @@ Any time you have to look up how to do something you might want to do again, add
 - `--skip-media` reuses media flags from any existing `dataset.parquet` (0% if none) and skips the slow CA media API — good for cloud runs where the media join dominates wall time.
 - There is **no test suite and no configured linter** (nothing in `pyproject.toml`); "running the app" means the `prepare.py` → `train.py` (→ optional `analyze.py`) pipeline. `train.py` on a prepared `dataset.parquet` finishes in seconds.
 - Metrics on a small scaled sample will not match the full-scale `experiments.md` numbers (fewer accounts/rows); that is expected — use full scale for real comparisons.
+
+### Shared S3 cache (cross-container)
+
+Cursor cloud containers do not share `~/.cache/will-it-bang/`. Use the triage bucket to hand off prepared artifacts between agents.
+
+- Env (injected into the cloud environment): `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`, `AWS_S3_TRIAGE_BUCKET`. Install CLI once if missing: `pip install --user awscli` (or `uv tool install awscli`).
+- Layout: `s3://$AWS_S3_TRIAGE_BUCKET/incoming/` is a producer drop zone (variant names OK); `s3://$AWS_S3_TRIAGE_BUCKET/cache/will-it-bang/` is the canonical shared cache mirroring local filenames.
+- Share: `dataset.parquet` (and named full-scale variants), `embed_cache.parquet`, graph/parent caches (`mention_`, `x_parent_`, `dyad_`, `media_`, `url_`, `archive_upload_`), `model.txt`, `val_predictions.parquet`, `metrics.json`. Usually skip `enriched_tweets.parquet` (re-fetch from CA). Never upload `.env` or API secrets.
+- Helper: `bash scripts/s3_cache_sync.sh {pull|push|pull-incoming|promote-incoming|ls}`.
+  - Consumer (cache already promoted): `bash scripts/s3_cache_sync.sh pull` then `uv run train.py` / `uv run analyze.py` (skip `prepare.py` unless feature code changed).
+  - Consumer (only `incoming/` populated): `bash scripts/s3_cache_sync.sh pull-incoming` (maps `dataset_xcomplete_full.parquet` → `dataset.parquet` when present).
+  - Producer (after a successful full prepare/train): `bash scripts/s3_cache_sync.sh push`.
+  - One-time promote drop zone → canonical: `bash scripts/s3_cache_sync.sh promote-incoming`.
