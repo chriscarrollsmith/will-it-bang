@@ -186,7 +186,7 @@ Fair revisit of prior ablations after the metric lock. Control = asymmetric leve
 - Reply **dyad** / parent-author size — **v41 smoke** dense coverage but weak rate corr; wa_rp flat on small set; `--reply-dyad` stays opt-in (`logs/v41_reply_dyad_smoke.md`).
 - Parent-author **corpus MiniLM** — **v41d** 75% reply coverage but cos anti-aligned within-author; wa_* regress; stays under opt-in dyad (`logs/v41_parent_author_emb_smoke.md`).
 - Reply **LM stance** (agree/disagree vs parent) — **v42** Modal Qwen3-8B calibrated but dense corr fails gate (0.021); wa_rp regress; `--stance-labels` opt-in (`logs/v42_stance_smoke.md`).
-- Richer **descriptive LM tags** (humor/controversy/narrative/CTA/news/dunk) — **v43** 1.5B NR smoke: humor/narrative ρ≈0.14 (gate pass); overconfident ≥7 on humor/controversy; sparse train +wa_nr +0.016 / wa_rp frozen; `--desc-labels` opt-in (`logs/v43_desc_tags_smoke.md`). Revisit denser/8B before promote (Modal token required; blocked in 2026-07-26 cloud run).
+- Richer **descriptive LM tags** (humor/controversy/narrative/CTA/news/dunk) — **v43** 1.5B sparse smoke +wa_nr; **v45** Modal Qwen3-8B densifies all NR on medium (19% rows; better calibrated): dense narrative ρ=0.137 / humor 0.077; train wa_nr **−0.011** / rmse −0.005 — **leave opt-in**, do not promote (`logs/v45_desc_tags_8b.md`).
 - Residual emb CAV/PLS — **v44** (`logs/v44_residual_emb_smoke.md`): R²(emb\|Z)≈0.01; `--residual-emb-pls 8` wa_nr regress (medium −0.027); `--residual-emb-cav` medium wa_nr **+0.025** / wa_rp +0.007 vs control and beats raw `--emb-cav` twin (wa_nr −0.010) — **opt-in**, full-scale confirm before promote.
 
 ---
@@ -211,7 +211,7 @@ Check off when tried; note outcome in one line.
 ### Language-model labels (post-time text only)
 - Prefer descriptive tags of tweet text (sentiment, humor, controversy, narrative, CTA, gender presentation). Avoid fame/quality/influence scores on text or handles — cutoff/reputation leakage risk.
 - [x] Lexical VADER sentiment + first-person ratio — **v15: flat rate RMSE** (0.644 vs 0.642); Spearman +0.016
-- [x] Richer descriptive tags: humor, controversy, personal narrative, CTA, news, dunk/quote-bait — **v43 smoke** (`logs/v43_desc_tags_smoke.md`): Qwen2.5-1.5B local 500 NR; humor/narrative spearman(rate)≈0.14 (gate pass); humor/controversy overconfident (≥7 ~45%); train wa_nr 0.148→0.165 / wa_rp frozen / rmse −0.007. Harness: `label_desc.py --local` / Modal Qwen3-8B; train `--desc-labels` — **leave opt-in**; denser+8B before scoreboard
+- [x] Richer descriptive tags: humor, controversy, personal narrative, CTA, news, dunk/quote-bait — **v43** 1.5B sparse smoke +wa_nr; **v45** Modal Qwen3-8B dense all NR on medium (`logs/v45_desc_tags_8b.md`): calibrated; narrative ρ=0.137; train wa_nr **−0.011** vs control — **leave opt-in**, do not promote / no full-scale spend without new angle
 - [x] **Wrongheaded / mildly infuriating** LM labels — **v17** (Qwen2.5-1.5B): flat + noisy labeler; **v17b** (Qwen3-8B): better calibrated (inf≥7 ≈3.7%), still **flat rate RMSE** (0.643 vs 0.642), Spearman 0.434; Qwen3.6-27B smoke OK but ~20× slower one-at-a-time
 - [ ] Breakout-likelihood score from a small LM head (text-only; no user fame priors; treat as higher leakage risk)
 - [ ] Thread / reply-intent classification
