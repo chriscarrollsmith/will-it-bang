@@ -316,6 +316,28 @@ DYAD_FEATURES = [
     "quote_parent_author_emb_has",
 ]
 
+# 2nd-hop reply/quote parents (--parent-chain); prepare --parent-chain-only / --parent-only.
+PARENT_CHAIN_FEATURES = [
+    "has_reply_chain_parent",
+    "reply_chain_emb_cos",
+    "reply_chain_parent_cos",
+    "reply_chain_log_text_len",
+    "reply_chain_same_author",
+    "reply_chain_age_hours",
+    "reply_chain_replies",
+    "reply_chain_via_reply",
+    "reply_chain_via_quote",
+    "has_quote_chain_parent",
+    "quote_chain_emb_cos",
+    "quote_chain_parent_cos",
+    "quote_chain_log_text_len",
+    "quote_chain_same_author",
+    "quote_chain_age_hours",
+    "quote_chain_replies",
+    "quote_chain_via_reply",
+    "quote_chain_via_quote",
+]
+
 # TE × own-corpus novelty (needs affinity + account TE columns).
 BREAKOUT_FEATURES = [
     "author_emb_novelty",
@@ -343,6 +365,7 @@ def feature_matrix(df: pd.DataFrame, skip_embeddings: bool) -> tuple[np.ndarray,
             AFFINITY_FEATURES
             + INTERLOCUTOR_FEATURES
             + DYAD_FEATURES
+            + PARENT_CHAIN_FEATURES
             + BREAKOUT_FEATURES
             + DESCRIPTIVE_TEXT_FEATURES
             + URL_DOMAIN_FEATURES
@@ -1501,6 +1524,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Include reply/quote dyad + parent-author size/corpus MiniLM features "
         "(prepare.py --dyad-only or full prepare). Opt-in until smoke clears gate",
+    )
+    p.add_argument(
+        "--parent-chain",
+        action="store_true",
+        help="Include 2nd-hop reply/quote chain features (quote-of-quote / "
+        "reply-of-reply; prepare.py --parent-chain-only). Opt-in until smoke clears gate",
     )
     p.add_argument(
         "--force-interlocutor",
@@ -3464,6 +3493,16 @@ def main() -> None:
         print(
             "Warning: --reply-dyad on but dyad columns missing; "
             "run: uv run prepare.py --dyad-only",
+            flush=True,
+        )
+    if not args.parent_chain:
+        drop_chain = [c for c in PARENT_CHAIN_FEATURES if c in df.columns]
+        if drop_chain:
+            df = df.drop(columns=drop_chain)
+    elif "has_reply_chain_parent" not in df.columns:
+        print(
+            "Warning: --parent-chain on but chain columns missing; "
+            "run: uv run prepare.py --parent-chain-only",
             flush=True,
         )
     if args.max_rows and args.max_rows > 0 and len(df) > args.max_rows:

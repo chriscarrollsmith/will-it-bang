@@ -2118,12 +2118,346 @@ def _empty_parent_feature_frame(out: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _load_referenced_tweets(
+    tweet_ids: pd.Series | list[str] | np.ndarray,
+    *,
+    use_x: bool = True,
+    force_x: bool = False,
+    label: str = "parents",
+) -> tuple[pd.DataFrame, bool]:
+    """Load dump (+ optional X) rows for tweet ids. Returns (rows, x_interrupted)."""
+    ids = pd.Series(pd.unique(pd.Series(list(tweet_ids)).dropna().astype(str)))
+    if ids.empty:
+        return (
+            pd.DataFrame(
+                columns=[
+                    "tweet_id",
+                    "account_id",
+                    "full_text",
+                    "created_at",
+                    "reply_to_tweet_id",
+                    "quoted_tweet_id",
+                ]
+            ),
+            False,
+        )
+    rows = load_tweets_by_id(ids)
+    dump_ids = set(rows["tweet_id"].astype(str)) if not rows.empty else set()
+    missing = [tid for tid in ids.astype(str).tolist() if tid not in dump_ids]
+    print(
+        f"  dump {label}: {len(dump_ids):,}; missing for X fallback: {len(missing):,}",
+        flush=True,
+    )
+    x_interrupted = False
+    if use_x and missing:
+        try:
+            x_rows = fetch_x_parent_tweets(missing, force=force_x)
+        except XParentFetchInterrupted as exc:
+            x_interrupted = True
+            print(f"WARNING: {exc}", flush=True)
+            x_rows = _x_parent_rows_from_cache(missing)
+            print(
+                f"  continuing with {len(x_rows):,} cached X {label} "
+                f"({exc.remaining:,} ids still pending)",
+                flush=True,
+            )
+        if not x_rows.empty:
+            rows = x_rows if rows.empty else pd.concat([rows, x_rows], ignore_index=True)
+            rows = rows.drop_duplicates("tweet_id", keep="first")
+            print(
+                f"  {label} after X merge: {len(rows):,} (+{len(x_rows):,} from X/cache)",
+                flush=True,
+            )
+    elif missing and not use_x:
+        print(f"  X {label} fallback off (--no-x-parents)", flush=True)
+    return rows, x_interrupted
+
+
+def _empty_chain_feature_frame(out: pd.DataFrame) -> pd.DataFrame:
+    for prefix in ("reply", "quote"):
+        out[f"has_{prefix}_chain_parent"] = 0
+        out[f"{prefix}_chain_emb_cos"] = 0.0
+        out[f"{prefix}_chain_parent_cos"] = 0.0
+        out[f"{prefix}_chain_log_text_len"] = 0.0
+        out[f"{prefix}_chain_same_author"] = 0
+        out[f"{prefix}_chain_age_hours"] = 0.0
+        out[f"{prefix}_chain_replies"] = 0.0
+        out[f"{prefix}_chain_via_reply"] = 0
+        out[f"{prefix}_chain_via_quote"] = 0
+    return out
+
+
+def _pick_chain_ids(
+    hop1_meta: pd.DataFrame,
+    *,
+    prefer: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Choose hop-2 id from hop-1 reply_to / quoted. prefer in {'reply','quote'}."""
+    n = len(hop1_meta)
+    reply_raw = hop1_meta["reply_to_tweet_id"].to_numpy(dtype=object)
+    quote_raw = hop1_meta["quoted_tweet_id"].to_numpy(dtype=object)
+    reply_ids = np.array([normalize_tweet_id(x) for x in reply_raw], dtype=object)
+    quote_ids = np.array([normalize_tweet_id(x) for x in quote_raw], dtype=object)
+    has_reply = np.array([x is not None for x in reply_ids], dtype=bool)
+    has_quote = np.array([x is not None for x in quote_ids], dtype=bool)
+    via_reply = np.zeros(n, dtype=np.int8)
+    via_quote = np.zeros(n, dtype=np.int8)
+    chain = np.full(n, None, dtype=object)
+    if prefer == "reply":
+        use_r = has_reply
+        use_q = (~has_reply) & has_quote
+    else:
+        use_q = has_quote
+        use_r = (~has_quote) & has_reply
+    via_reply[use_r] = 1
+    via_quote[use_q] = 1
+    chain[use_r] = reply_ids[use_r]
+    chain[use_q] = quote_ids[use_q]
+    return chain, via_reply, via_quote
+
+
+def _attach_one_chain_prefix(
+    out: pd.DataFrame,
+    hop1_id_col: str,
+    prefix: str,
+    *,
+    prefer: str,
+    hop1: pd.DataFrame,
+    hop2: pd.DataFrame,
+    hop1_emb: pd.DataFrame,
+    hop2_emb: pd.DataFrame,
+    reply_times: dict[str, np.ndarray],
+    child_emb: np.ndarray,
+) -> pd.DataFrame:
+    """Write 2nd-hop chain features for reply/quote immediate parents."""
+    n = len(out)
+    has = np.zeros(n, dtype=np.int8)
+    cos_child = np.zeros(n, dtype=np.float64)
+    cos_parent = np.zeros(n, dtype=np.float64)
+    log_len = np.zeros(n, dtype=np.float64)
+    same_author = np.zeros(n, dtype=np.int8)
+    age_h = np.zeros(n, dtype=np.float64)
+    replies = np.zeros(n, dtype=np.float64)
+    via_reply = np.zeros(n, dtype=np.int8)
+    via_quote = np.zeros(n, dtype=np.int8)
+
+    raw_hop1 = out[hop1_id_col]
+    hop1_keys = raw_hop1.map(lambda x: normalize_tweet_id(x)).to_numpy(dtype=object)
+    hop1_meta = hop1.reindex(hop1_keys)
+    hop1_found = hop1_meta["created_at"].notna().to_numpy()
+    chain_ids, via_r, via_q = _pick_chain_ids(hop1_meta, prefer=prefer)
+    via_reply[:] = via_r
+    via_quote[:] = via_q
+    # No chain edge unless hop-1 itself was found.
+    no_edge = (~hop1_found) | ((via_r == 0) & (via_q == 0))
+    chain_ids = chain_ids.copy()
+    chain_ids[no_edge] = None
+    via_reply[no_edge] = 0
+    via_quote[no_edge] = 0
+
+    hop2_meta = hop2.reindex(chain_ids)
+    hop2_found = hop2_meta["created_at"].notna().to_numpy()
+    child_t = pd.to_datetime(out["created_at"], utc=True)
+    hop2_t = pd.to_datetime(hop2_meta["created_at"], utc=True)
+    ok = hop2_found & (hop2_t.to_numpy() < child_t.to_numpy())
+    # Also require hop-2 strictly before hop-1 when both timestamps exist.
+    hop1_t = pd.to_datetime(hop1_meta["created_at"], utc=True)
+    ok = ok & hop1_found & (hop2_t.to_numpy() < hop1_t.to_numpy())
+    has[ok] = 1
+    via_reply[~ok] = 0
+    via_quote[~ok] = 0
+
+    if ok.any():
+        text_arr = hop2_meta["full_text"].fillna("").astype(str).to_numpy()
+        log_len[ok] = np.log1p(
+            np.fromiter((len(t) for t in text_arr[ok]), dtype=np.float64, count=int(ok.sum()))
+        )
+        aids = hop2_meta["account_id"].astype(str).to_numpy()[ok]
+        same_author[ok] = (aids == out["account_id"].astype(str).to_numpy()[ok]).astype(np.int8)
+        delta_h = (
+            (child_t.to_numpy()[ok] - hop2_t.to_numpy()[ok]).astype("timedelta64[s]").astype(np.float64)
+            / 3600.0
+        )
+        age_h[ok] = np.log1p(np.clip(delta_h, 0, None))
+        pids = np.array([str(x) for x in chain_ids[ok]], dtype=object)
+        cuts = child_t.to_numpy()[ok]
+        replies[ok] = np.log1p(_count_replies_before_cutoffs(pids, cuts, reply_times))
+
+    cemb = hop2_emb.reindex(chain_ids).to_numpy(dtype=np.float32)
+    row_ok = ok & np.isfinite(cemb[:, 0])
+    if row_ok.any():
+        cos_child[row_ok] = np.sum(child_emb[row_ok] * cemb[row_ok], axis=1)
+    pemb = hop1_emb.reindex(hop1_keys).to_numpy(dtype=np.float32)
+    both = row_ok & np.isfinite(pemb[:, 0])
+    if both.any():
+        cos_parent[both] = np.sum(pemb[both] * cemb[both], axis=1)
+
+    out[f"has_{prefix}_chain_parent"] = has
+    out[f"{prefix}_chain_emb_cos"] = cos_child
+    out[f"{prefix}_chain_parent_cos"] = cos_parent
+    out[f"{prefix}_chain_log_text_len"] = log_len
+    out[f"{prefix}_chain_same_author"] = same_author
+    out[f"{prefix}_chain_age_hours"] = age_h
+    out[f"{prefix}_chain_replies"] = replies
+    out[f"{prefix}_chain_via_reply"] = via_reply
+    out[f"{prefix}_chain_via_quote"] = via_quote
+    return out
+
+
+def attach_parent_chain_context(
+    df: pd.DataFrame,
+    batch_size: int,
+    *,
+    use_x: bool = True,
+    force_x: bool = False,
+    hop1_parents: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """2nd-hop parent chain (reply-of-reply / quote-of-quote); leakage-safe.
+
+    For reply parents, prefer following reply_to_tweet_id then quoted_tweet_id.
+    For quote parents, prefer quoted_tweet_id then reply_to_tweet_id.
+    Never uses dump-time fav/RT; hop-2 reply heat is pre-T arrivals only.
+    """
+    out = df.reset_index(drop=True).copy()
+    if "reply_to_tweet_id" not in out.columns or "quoted_tweet_id" not in out.columns:
+        raise RuntimeError("Dataset missing reply_to_tweet_id / quoted_tweet_id for chain join")
+    out = _normalize_ref_id_columns(out)
+
+    reply_ids = out["reply_to_tweet_id"].dropna().astype(str)
+    quote_ids = out["quoted_tweet_id"].dropna().astype(str)
+    hop1_ids = pd.Series(pd.unique(pd.concat([reply_ids, quote_ids], ignore_index=True)))
+    print(
+        f"Parent chain: {reply_ids.nunique():,} reply hop-1, "
+        f"{quote_ids.nunique():,} quote hop-1, {len(hop1_ids):,} unique",
+        flush=True,
+    )
+    if hop1_ids.empty:
+        return _empty_chain_feature_frame(out)
+
+    if hop1_parents is None or hop1_parents.empty:
+        hop1_rows, x_interrupted = _load_referenced_tweets(
+            hop1_ids, use_x=use_x, force_x=force_x, label="hop-1 parents"
+        )
+    else:
+        hop1_rows = hop1_parents
+        if "tweet_id" not in hop1_rows.columns:
+            hop1_rows = hop1_rows.reset_index()
+        if "tweet_id" not in hop1_rows.columns:
+            raise RuntimeError("hop1_parents must include a tweet_id column or index")
+        x_interrupted = False
+
+    if hop1_rows.empty:
+        out = _empty_chain_feature_frame(out)
+        if x_interrupted:
+            print(
+                "Chain hop-1 empty after interrupt; re-run: "
+                "uv run prepare.py --parent-chain-only",
+                flush=True,
+            )
+        return out
+
+    hop1 = hop1_rows.drop_duplicates("tweet_id", keep="first").copy()
+    hop1 = _normalize_ref_id_columns(hop1).set_index("tweet_id")
+
+    # Collect candidate hop-2 ids from all hop-1 reply/quote edges.
+    r_ids = hop1["reply_to_tweet_id"].map(normalize_tweet_id)
+    q_ids = hop1["quoted_tweet_id"].map(normalize_tweet_id)
+    hop2_ids = pd.Series(
+        pd.unique(pd.concat([r_ids.dropna().astype(str), q_ids.dropna().astype(str)], ignore_index=True))
+    )
+    print(f"  unique hop-2 candidates: {len(hop2_ids):,}", flush=True)
+    if hop2_ids.empty:
+        return _empty_chain_feature_frame(out)
+
+    hop2_rows, x2_interrupted = _load_referenced_tweets(
+        hop2_ids, use_x=use_x, force_x=force_x, label="hop-2 parents"
+    )
+    x_interrupted = x_interrupted or x2_interrupted
+    if hop2_rows.empty:
+        out = _empty_chain_feature_frame(out)
+        if x_interrupted:
+            print(
+                "Chain hop-2 empty after interrupt; re-run: "
+                "uv run prepare.py --parent-chain-only",
+                flush=True,
+            )
+        return out
+
+    hop2 = hop2_rows.drop_duplicates("tweet_id", keep="first").copy()
+    hop2 = _normalize_ref_id_columns(hop2).set_index("tweet_id")
+
+    reply_times = load_reply_arrival_times(pd.Series(hop2.index.astype(str)))
+
+    # Embed hop-1 + hop-2 into shared cache (child emb already on dataset).
+    all_meta = pd.concat(
+        [
+            hop1.reset_index()[["tweet_id", "full_text"]],
+            hop2.reset_index()[["tweet_id", "full_text"]],
+        ],
+        ignore_index=True,
+    ).drop_duplicates("tweet_id", keep="first")
+    cache = ensure_embed_cache(
+        all_meta["tweet_id"], all_meta["full_text"].fillna("").astype(str), batch_size=batch_size
+    )
+    emb_cols = [c for c in cache.columns if c.startswith("emb_")]
+    emb = cache.set_index("tweet_id")[emb_cols]
+    hop1_emb = emb.reindex(hop1.index)
+    hop2_emb = emb.reindex(hop2.index)
+
+    child_emb_cols = [c for c in out.columns if c.startswith("emb_")]
+    if not child_emb_cols:
+        raise RuntimeError("Dataset has no emb_* columns; run full prepare first")
+    child_emb = out[child_emb_cols].to_numpy(dtype=np.float32)
+
+    out = _attach_one_chain_prefix(
+        out,
+        "reply_to_tweet_id",
+        "reply",
+        prefer="reply",
+        hop1=hop1,
+        hop2=hop2,
+        hop1_emb=hop1_emb,
+        hop2_emb=hop2_emb,
+        reply_times=reply_times,
+        child_emb=child_emb,
+    )
+    out = _attach_one_chain_prefix(
+        out,
+        "quoted_tweet_id",
+        "quote",
+        prefer="quote",
+        hop1=hop1,
+        hop2=hop2,
+        hop1_emb=hop1_emb,
+        hop2_emb=hop2_emb,
+        reply_times=reply_times,
+        child_emb=child_emb,
+    )
+    print(
+        f"  reply chain coverage: {out['has_reply_chain_parent'].mean():.1%} "
+        f"(via_reply {out['reply_chain_via_reply'].mean():.1%} / "
+        f"via_quote {out['reply_chain_via_quote'].mean():.1%}), "
+        f"quote chain coverage: {out['has_quote_chain_parent'].mean():.1%} "
+        f"(via_quote {out['quote_chain_via_quote'].mean():.1%} / "
+        f"via_reply {out['quote_chain_via_reply'].mean():.1%})",
+        flush=True,
+    )
+    if x_interrupted:
+        print(
+            "X chain fetch incomplete — cache is durable; "
+            "re-run: uv run prepare.py --parent-chain-only",
+            flush=True,
+        )
+    return out
+
+
 def attach_parent_context(
     df: pd.DataFrame,
     batch_size: int,
     *,
     use_x: bool = True,
     force_x: bool = False,
+    with_chain: bool = True,
 ) -> pd.DataFrame:
     """Join reply/quote parents from the dump (+ optional X API); leakage-safe context."""
     out = df.reset_index(drop=True).copy()
@@ -2140,45 +2474,17 @@ def attach_parent_context(
         flush=True,
     )
     if all_ids.empty:
-        return _empty_parent_feature_frame(out)
+        out = _empty_parent_feature_frame(out)
+        return _empty_chain_feature_frame(out) if with_chain else out
 
-    parents = load_tweets_by_id(all_ids)
-    dump_ids = set(parents["tweet_id"].astype(str)) if not parents.empty else set()
-    missing = [tid for tid in all_ids.astype(str).tolist() if tid not in dump_ids]
-    print(f"  dump parents: {len(dump_ids):,}; missing for X fallback: {len(missing):,}", flush=True)
-
-    x_interrupted = False
-    if use_x and missing:
-        try:
-            x_parents = fetch_x_parent_tweets(missing, force=force_x)
-        except XParentFetchInterrupted as exc:
-            x_interrupted = True
-            print(f"WARNING: {exc}", flush=True)
-            # Cache was flushed before the raise; do not re-hit the API.
-            x_parents = _x_parent_rows_from_cache(missing)
-            print(
-                f"  continuing with {len(x_parents):,} cached X parents "
-                f"({exc.remaining:,} ids still pending)",
-                flush=True,
-            )
-        if not x_parents.empty:
-            parents = (
-                x_parents
-                if parents.empty
-                else pd.concat([parents, x_parents], ignore_index=True)
-            )
-            # Prefer dump row when both exist.
-            parents = parents.drop_duplicates("tweet_id", keep="first")
-            print(
-                f"  parents after X merge: {len(parents):,} "
-                f"(+{len(x_parents):,} from X/cache)",
-                flush=True,
-            )
-    elif missing and not use_x:
-        print("  X parent fallback off (--no-x-parents)", flush=True)
+    parents, x_interrupted = _load_referenced_tweets(
+        all_ids, use_x=use_x, force_x=force_x, label="parents"
+    )
 
     if parents.empty:
         out = _empty_parent_feature_frame(out)
+        if with_chain:
+            out = _empty_chain_feature_frame(out)
         if x_interrupted:
             print(
                 "Parent features empty after interrupt; re-run: uv run prepare.py --parent-only",
@@ -2209,6 +2515,14 @@ def attach_parent_context(
         f"quote parent coverage: {out['has_quote_parent'].mean():.1%}",
         flush=True,
     )
+    if with_chain:
+        out = attach_parent_chain_context(
+            out,
+            batch_size=batch_size,
+            use_x=use_x,
+            force_x=force_x,
+            hop1_parents=parents,
+        )
     if x_interrupted:
         print(
             "X parent fetch incomplete — cache is durable; "
@@ -3307,7 +3621,14 @@ def parse_args() -> argparse.Namespace:
         "--parent-only",
         action="store_true",
         help="Only add reply/quote parent features onto an existing dataset.parquet "
-        "(resumes x_parent_cache after rate/credits stops; default --x-parents)",
+        "(resumes x_parent_cache after rate/credits stops; default --x-parents; "
+        "also rebuilds 2nd-hop chain features)",
+    )
+    p.add_argument(
+        "--parent-chain-only",
+        action="store_true",
+        help="Only add 2nd-hop reply/quote chain features onto an existing "
+        "dataset.parquet (quote-of-quote / reply-of-reply; train with --parent-chain)",
     )
     p.add_argument(
         "--x-parents",
@@ -3524,6 +3845,44 @@ def main() -> None:
         print(f"Done in {time.time() - t0:.1f}s")
         return
 
+    if args.parent_chain_only:
+        if not DATASET_PATH.exists():
+            raise SystemExit(f"Missing {DATASET_PATH} for --parent-chain-only")
+        dataset = pd.read_parquet(DATASET_PATH)
+        dataset["tweet_id"] = dataset["tweet_id"].astype(str)
+        dataset["created_at"] = pd.to_datetime(dataset["created_at"], utc=True)
+        before = len(dataset)
+        dataset = dataset.drop_duplicates("tweet_id", keep="first")
+        if len(dataset) != before:
+            print(f"Dropped {before - len(dataset):,} duplicate tweet_id rows", flush=True)
+        drop_cols = [
+            c
+            for c in dataset.columns
+            if c.startswith(
+                (
+                    "has_reply_chain_parent",
+                    "has_quote_chain_parent",
+                    "reply_chain_",
+                    "quote_chain_",
+                )
+            )
+        ]
+        if drop_cols:
+            dataset = dataset.drop(columns=drop_cols)
+        dataset = backfill_ref_ids_from_dump(dataset)
+        if not any(c.startswith("emb_") for c in dataset.columns):
+            raise SystemExit("Dataset has no emb_* columns; run full prepare first")
+        dataset = attach_parent_chain_context(
+            dataset,
+            batch_size=args.embed_batch_size,
+            use_x=args.x_parents,
+            force_x=args.force_x_parents,
+        )
+        dataset.to_parquet(DATASET_PATH, index=False)
+        print(f"Wrote {DATASET_PATH} ({len(dataset):,} rows, {dataset.shape[1]} cols)")
+        print(f"Done in {time.time() - t0:.1f}s")
+        return
+
     if args.parent_only:
         if not DATASET_PATH.exists():
             raise SystemExit(f"Missing {DATASET_PATH} for --parent-only")
@@ -3546,8 +3905,20 @@ def main() -> None:
             c
             for c in dataset.columns
             if (
-                c.startswith(("has_reply_parent", "has_quote_parent", "reply_parent_", "quote_parent_"))
-                and not c.startswith(("reply_parent_author_", "quote_parent_author_"))
+                (
+                    c.startswith(
+                        ("has_reply_parent", "has_quote_parent", "reply_parent_", "quote_parent_")
+                    )
+                    and not c.startswith(("reply_parent_author_", "quote_parent_author_"))
+                )
+                or c.startswith(
+                    (
+                        "has_reply_chain_parent",
+                        "has_quote_chain_parent",
+                        "reply_chain_",
+                        "quote_chain_",
+                    )
+                )
             )
         ]
         if drop_cols:
@@ -3560,6 +3931,7 @@ def main() -> None:
             batch_size=args.embed_batch_size,
             use_x=args.x_parents,
             force_x=args.force_x_parents,
+            with_chain=True,
         )
         if before_cov["reply"] is not None:
             print(
