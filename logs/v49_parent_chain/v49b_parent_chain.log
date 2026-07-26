@@ -1,0 +1,95 @@
+Time regimes: {0: 29, 1: 49, 2: 1107, 3: 1214, 4: 108226}
+Holdout policy=time (global time split, no regime filter)
+Exposure rate: dump=2026-07-24 cap=30d beta=1 eps=1 | age p50=188.0 eff p50=30.0 | log_raw mean=1.184 → log_rate mean=0.204
+Provenance features: stream=96.8% has_upload_end=18.0%
+Time split: train=88,500 [2007-05-04 16:25:58+00:00 → 2026-06-17 09:42:09+00:00], val=22,125 [2026-06-17 09:56:39+00:00 → 2026-07-24 04:12:41+00:00]
+Accounts: train=868 val=594 overlap=528
+Provenance: train stream=95.9% val stream=100.0%
+Domain priors: 10 domains with n>=30 (coverage train=7.1%, mapped=4.7%)
+/workspace/train.py:2195: RuntimeWarning: invalid value encountered in divide
+  loo = np.where(n > 1.0, (s - y) / (n - 1.0), global_mean)
+Account TE: prior_m=20 global=0.1513 train accounts=868 val overlap=47.8% val te p50=0.1513
+Emb kNN TE: k=40 exclude_same_account=True val_cold=53.8% knn_mean p50=0.1245 sim p50=0.475
+Residual emb: baselines=['intercept', 'account_mean_rate', 'is_reply', 'inbound_replies_per_tweet'] mean R²(emb|Z)=0.0113 residual ||.||_rms train=0.0471
+Residual emb CAV: q=0.1 nonreply_only=True hot=1,486 cold=2,907 |μh−μc|=0.1096 train corr(proj,y)=0.0843
+/workspace/train.py:3204: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`
+  train_out[f"emb_{i}"] = train_z[:, i]
+/workspace/train.py:3205: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`
+  val_out[f"emb_{i}"] = val_z[:, i]
+/workspace/train.py:3204: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`
+  train_out[f"emb_{i}"] = train_z[:, i]
+/workspace/train.py:3205: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`
+  val_out[f"emb_{i}"] = val_z[:, i]
+/workspace/.venv/lib/python3.12/site-packages/scipy/stats/_stats_py.py:5445: ConstantInputWarning: An input array is constant; the correlation coefficient is not defined.
+  warnings.warn(stats.ConstantInputWarning(warn_msg))
+PCA embeddings: 384 → 96 (var=0.656)
+TF-IDF SVD: vocab=50,000 → 128 (var=0.145)
+Baseline (train-mean, target space): {'rmse_log': 0.7146, 'mae_log': 0.3636, 'r2_log': -0.1546, 'spearman': nan, 'mae_engagement': 2.9964}
+Note: reply-history baselines skipped as primary comps under rate target (hist_replies rmse vs rate=0.711, not comparable)
+Target: absolute | model=lgbm | baseline=context_replies | split_reply=False | nonreply_weight=1.0 | breakout_head=False | account_te=True | exposure=True:rate
+Loss: asymmetric under_weight=3 | early_stop=rmse
+[100]	val's rmse: 0.612754
+[200]	val's rmse: 0.608004
+LambdaRank[nr]: train rows=14,637 accounts=706 (mean=20.7); val rows=6,891 accounts=420
+Loss: lambdarank | early_stop=ndcg
+[100]	val's ndcg@10: 0.789013	val's ndcg@20: 0.816194
+LambdaRank[reply]: train rows=73,776 accounts=865 (mean=85.3); val rows=14,994 accounts=268
+Loss: lambdarank | early_stop=ndcg
+[100]	val's ndcg@10: 0.758913	val's ndcg@20: 0.780653
+[200]	val's ndcg@10: 0.767248	val's ndcg@20: 0.785345
+Hybrid-rank: blended level + stratum LambdaRank within accounts
+/workspace/.venv/lib/python3.12/site-packages/scipy/stats/_stats_py.py:5445: ConstantInputWarning: An input array is constant; the correlation coefficient is not defined.
+  warnings.warn(stats.ConstantInputWarning(warn_msg))
+Within-account Spearman NR: mean=0.2481 wmean=0.2533 (n=415); reply: mean=0.2729 wmean=0.2903 (n=267)
+Hot non-reply (top10% thr=1.955): rmse=2.4284 mean_underpred=2.1536
+Diagnostic dump-total decode: {'rmse_log': 1.0484, 'spearman': 0.4321}
+Wrote val predictions: /home/ubuntu/.cache/will-it-bang/val_predictions.parquet
+
+Top features by gain:
+                   feature          gain
+         account_mean_rate 136237.535094
+                  is_reply  55074.081885
+              te_minus_knn  22803.302211
+   reply_x_inbound_replies  16058.360112
+         emb_knn_mean_rate  14074.841513
+           hist_frac_reply  13232.008020
+  reply_x_inbound_mentions  11385.628340
+      quote_parent_replies  11003.921417
+                  text_len  10364.838329
+inbound_mentions_per_tweet   8176.937610
+      inbound_mentions_30d   7151.772587
+     reply_parent_is_reply   4569.339714
+    reply_parent_age_hours   3864.262233
+          inbound_mentions   3658.160453
+          stream_x_log_age   3562.606601
+
+---
+target_space: exposure_rate
+model: lgbm | account_te: True | era_te: False | era_heads: False | loss: asymmetric | early_stop: rmse | hybrid_rank: True
+primary_metrics: spearman_within_account_{nonreply,reply}_wmean (draft quality within author×stratum); guardrails: global spearman_*, rmse_log, mean_underpred_nonreply_top10
+spearman_within_account_nonreply_wmean: 0.2532831980030094
+spearman_within_account_nonreply_mean: 0.24813333127478002
+spearman_within_account_reply_wmean: 0.29028774071951907
+spearman_within_account_reply_mean: 0.2728725048961473
+spearman_nonreply: 0.5725590100851126
+spearman_reply: 0.3603436676510505
+spearman: 0.524554162279274
+rmse_log: 0.6045975402980555
+mean_underpred_nonreply_top10: 2.1535741177947174
+rmse_log_nonreply: 0.896820694351166
+rmse_log_reply: 0.40240353833346976
+mae_log: 0.30751014141227667
+r2_log: 0.17358745566987432
+rmse_log_raw_dump: 1.0484180275282133
+spearman_raw_dump: 0.43205954327703316
+mae_engagement: 2.912515257284411
+baseline_rmse_log: 0.7146245709321322
+breakout_auc: nan
+best_iteration: 224
+num_features: 358
+train_rows: 88500
+val_rows: 22125
+n_accounts_train: 868
+n_accounts_val: 594
+seconds: 123.24
+model_path: /home/ubuntu/.cache/will-it-bang/model.txt

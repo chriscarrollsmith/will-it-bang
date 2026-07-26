@@ -134,6 +134,17 @@ Full prepare `--skip-media` (~110k / 934 accounts). Resumable X lookup; sanitize
 
 **Verdict:** **default `--x-parents` on.** Complete fill softens the NR dip vs partial/near (−0.009 vs −0.018) with a small reply lift and flat/better magnitude. Prefer richer context over CA-gap proxies.
 
+### v49 2nd-hop parent chain (same X-complete rebuild)
+
+`prepare.py --parent-chain-only` on `dataset_xcomplete_full` (~110.6k / 934). Hop-1 filled from dump+X cache; hop-2 left 21k pending on HTTP 402. Detail: `logs/v49_parent_chain.md`.
+
+| Run | knob | wa_nr | wa_rp | global_nr | rmse | Notes |
+|---|---|---:|---:|---:|---:|---|
+| v49a | control | **0.262** | **0.298** | **0.579** | **0.599** | No chain cols (= v48b stack) |
+| v49b | `--parent-chain` | 0.253 | 0.290 | 0.573 | 0.605 | reply-chain 25% / quote-chain 2.8% |
+
+**Verdict:** leave **opt-in** / do not promote. Δ: wa_nr **−0.008** / wa_rp **−0.008** / global_nr −0.006 / rmse +0.005. Dense among-reply content corr fails gate; completing hop-2 X is unlikely to revive.
+
 ### v48 default rebase on X-complete full data (same rebuild)
 
 S3 `dataset_xcomplete_full` (~110.6k / 934; among-reply/quote parent emb **100%**). Fair twins: residual CAV off vs default-on. Detail: `logs/v48_xcomplete_residual_cav.md`.
@@ -226,6 +237,7 @@ Fair revisit of prior ablations after the metric lock. Control = asymmetric leve
 - Reply **LM stance** (agree/disagree vs parent) — **v42** Modal Qwen3-8B calibrated but dense corr fails gate (0.021); wa_rp regress; `--stance-labels` opt-in (`logs/v42_stance_smoke.md`).
 - Richer **descriptive LM tags** (humor/controversy/narrative/CTA/news/dunk) — **v43** 1.5B sparse smoke +wa_nr; **v45** Modal Qwen3-8B densifies all NR on medium (19% rows; better calibrated): dense narrative ρ=0.137 / humor 0.077; train wa_nr **−0.011** / rmse −0.005 — **leave opt-in**, do not promote (`logs/v45_desc_tags_8b.md`).
 - Residual emb CAV/PLS — **v44** medium + **v47** dump-parent full + **v48** X-complete rebase (`logs/v48_xcomplete_residual_cav.md`): R²(emb\|Z)≈0.01; PLS regresses wa_nr; residual CAV on X-complete wa_nr **+0.008** / wa_rp **+0.010** / global_nr −0.009 / rmse flat vs v48a — **default on**; locked scoreboard **v48b** (0.262 / 0.298); residual PLS stays opt-in.
+- 2nd-hop parent chain — **v49** (`logs/v49_parent_chain.md`): reply-chain 25% / among-reply 31%; among-reply content ρ fails gate; `--parent-chain` wa_nr **−0.008** / wa_rp **−0.008** / rmse +0.005 vs same-rebuild control — **leave opt-in**, do not promote.
 
 ---
 
@@ -268,7 +280,7 @@ Check off when tried; note outcome in one line.
 ### Graph / archive denser still
 - [x] Timestamped mention joins (via dump tweet join; `user_mentions` alone has no time) — **v35b: keep default**; vs same-rebuild wa_nr +0.006 / wa_rp −0.009 / rmse −0.015 / global_nr +0.061; `prepare.py --mentions-only`
 - [x] X API fallback for missing reply/quote parents — resumable `x_parent_cache.parquet` (batch flush; snowflake sanitize; no refetch of terminal statuses). **v39d complete:** cache 26,773 (24,988 ok / 969 forbidden / 816 not_found; **0 pending**); among-reply **73.4%→97.4%**, quote **70.4%→98.9%**; vs dump-only wa_nr 0.263→0.254, wa_rp 0.282→0.288, rmse 0.600→0.599 — **default on** (`--no-x-parents` to ablate).
-- [ ] Quote-of-quote / deeper parent chain (1–2 hops, still pre-T)
+- [x] Quote-of-quote / deeper parent chain (1–2 hops, still pre-T) — **v49** (`logs/v49_parent_chain.md`): hop-1 X-complete + hop-2 partial (402); reply-chain **25%** (among-reply 31%) / quote-chain 2.8%; among-reply content ρ≲0.05; train wa_nr 0.262→**0.253** / wa_rp 0.298→**0.290** / rmse 0.599→0.605 — harness `prepare.py --parent-chain-only` + `train.py --parent-chain` **leave opt-in** / do not promote
 - Note: CA `followers`/`following` are archive **snapshots** (no follow/unfollow event times) — not usable as pre-T graph history.
 
 ### Reply dyad / parent context
