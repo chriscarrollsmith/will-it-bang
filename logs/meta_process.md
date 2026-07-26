@@ -122,7 +122,7 @@ If (2)–(3) fail, treat as mechanism research — not a scoreboard bet. ε is a
 
 - Viral non-reply under-prediction (improved by SERA magnitude, still open on rank)
 - Quote/reply parents — **v39d** complete X fill default on (wa_rp +0.006 / wa_nr −0.009; richer context over CA-gap proxies); media vision smoke: Gemini tags fail CV gate (~0.03); SigLIP PCA-8 marginal (~0.10) — no full Gemini spend
-- Regime-specific heads / min-upload-hist once stream history is long enough for a stable stream-only scoreboard
+- Regime-specific heads — **v46 calendar era TE/heads:** regress / flat under mono-era time holdout (`logs/v46_era_regime_smoke.md`); leave opt-in. Stream/upload heads / min-upload-hist still open once stream-only scoreboard is stable
 - Fixed-horizon labels if CA/X ever provide time-series engagement
 
 ### v36 note (regime holdout + provenance features)

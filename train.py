@@ -220,6 +220,15 @@ ACCOUNT_TE_FEATURES = [
     "log_account_n",
 ]
 
+# Train-fold platform-era target encoding (--era-te); leakage-safe calendar prior.
+ERA_TE_FEATURES = [
+    "era_mean_rate",
+    "log_era_n",
+    "era_stratum_mean_rate",
+    "log_era_stratum_n",
+    "te_minus_era",
+]
+
 # Train-fold MiniLM neighborhood TE (cold-start content prior).
 EMB_KNN_TE_FEATURES = [
     "emb_knn_mean_rate",
@@ -341,6 +350,7 @@ def feature_matrix(df: pd.DataFrame, skip_embeddings: bool) -> tuple[np.ndarray,
             + STANCE_FEATURES
             + DESC_FEATURES
             + ACCOUNT_TE_FEATURES
+            + ERA_TE_FEATURES
             + EMB_KNN_TE_FEATURES
             + EMB_CAV_FEATURES
             + RESIDUAL_EMB_CAV_FEATURES
@@ -1563,6 +1573,38 @@ def parse_args() -> argparse.Namespace:
         help="Shrinkage strength toward global mean for --account-te",
     )
     p.add_argument(
+        "--era-te",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Train-fold smoothed mean target by --era-key (+ key×reply); "
+        "opt-in calendar prior (v46)",
+    )
+    p.add_argument(
+        "--era-te-prior",
+        type=float,
+        default=50.0,
+        help="Shrinkage strength toward global mean for --era-te",
+    )
+    p.add_argument(
+        "--era-heads",
+        action="store_true",
+        help="Fit a specialist model per --era-key bucket (fallback to global when "
+        "train n < --era-head-min-train); opt-in (v46)",
+    )
+    p.add_argument(
+        "--era-key",
+        choices=("platform_era", "year"),
+        default="platform_era",
+        help="Regime column for --era-te / --era-heads (year is denser under "
+        "time-holdout musk_late dominance)",
+    )
+    p.add_argument(
+        "--era-head-min-train",
+        type=int,
+        default=1500,
+        help="Min train rows required to fit an era specialist under --era-heads",
+    )
+    p.add_argument(
         "--loss",
         choices=("huber", "mse", "quantile", "asymmetric", "sera", "lambdarank"),
         default="asymmetric",
@@ -1777,6 +1819,12 @@ def parse_args() -> argparse.Namespace:
         raise SystemExit("GPBoost does not support --hybrid-rank; use --model lgbm")
     if args.hybrid_rank and args.loss == "lambdarank":
         raise SystemExit("Use --hybrid-rank with a level loss (e.g. asymmetric), not --loss lambdarank")
+    if args.era_heads and args.split_reply:
+        raise SystemExit("--era-heads is incompatible with --split-reply")
+    if args.era_heads and args.nonreply_only:
+        raise SystemExit("--era-heads is incompatible with --nonreply-only")
+    if args.era_heads and args.model == "gpboost":
+        raise SystemExit("--era-heads requires --model lgbm")
     return args
 
 
@@ -2132,6 +2180,86 @@ def add_account_target_encoding(
         f"Account TE: prior_m={m:g} global={global_mean:.4f} "
         f"train accounts={len(counts):,} val overlap={overlap:.1%} "
         f"val te p50={np.median(val_te):.4f}",
+        flush=True,
+    )
+    return train_out, val_out
+
+
+def add_era_target_encoding(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    *,
+    prior_strength: float = 50.0,
+    target_col: str = "log_engagement",
+    era_col: str = "platform_era",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Train-fold smoothed mean target by platform era (+ era×reply stratum).
+
+    LOO on train avoids row leak. On a mono-era val fold the era mean is nearly
+    constant, so this mainly calibrates level / RMSE; within-account rank needs
+    --era-heads. Cross with account TE via te_minus_era when both are present.
+    """
+    if era_col not in train_df.columns:
+        print(f"Skipping era TE (missing {era_col})", flush=True)
+        return train_df, val_df
+    train_out = train_df.copy()
+    val_out = val_df.copy()
+    y = train_out[target_col].to_numpy(dtype=np.float64)
+    global_mean = float(np.mean(y))
+    m = float(prior_strength)
+    era_tr = train_out[era_col].astype(np.int16)
+    reply_tr = train_out["is_reply"].astype(np.int8) if "is_reply" in train_out.columns else 0
+
+    def _loo_shrink(keys: pd.Series) -> tuple[np.ndarray, np.ndarray, pd.Series, pd.Series]:
+        grp = pd.DataFrame({"k": keys.to_numpy(), "y": y}).groupby("k", sort=False)["y"]
+        sums = grp.sum()
+        counts = grp.count().astype(np.float64)
+        means = grp.mean()
+        n = counts.reindex(keys).to_numpy(dtype=np.float64)
+        s = sums.reindex(keys).to_numpy(dtype=np.float64)
+        loo = np.where(n > 1.0, (s - y) / (n - 1.0), global_mean)
+        n_loo = np.maximum(n - 1.0, 0.0)
+        te = (n_loo * loo + m * global_mean) / (n_loo + m)
+        return te.astype(np.float64), n, counts, means
+
+    era_te, era_n, era_counts, era_means = _loo_shrink(era_tr)
+    train_out["era_mean_rate"] = era_te.astype(np.float32)
+    train_out["log_era_n"] = np.log1p(era_n).astype(np.float32)
+
+    stratum_tr = era_tr.astype(str) + "_" + pd.Series(reply_tr, index=train_out.index).astype(str)
+    st_te, st_n, st_counts, st_means = _loo_shrink(stratum_tr)
+    train_out["era_stratum_mean_rate"] = st_te.astype(np.float32)
+    train_out["log_era_stratum_n"] = np.log1p(st_n).astype(np.float32)
+
+    era_va = val_out[era_col].astype(np.int16)
+    n_va = era_counts.reindex(era_va).fillna(0.0).to_numpy(dtype=np.float64)
+    mean_va = era_means.reindex(era_va).fillna(global_mean).to_numpy(dtype=np.float64)
+    val_era_te = (n_va * mean_va + m * global_mean) / (n_va + m)
+    val_out["era_mean_rate"] = val_era_te.astype(np.float32)
+    val_out["log_era_n"] = np.log1p(n_va).astype(np.float32)
+
+    reply_va = val_out["is_reply"].astype(np.int8) if "is_reply" in val_out.columns else 0
+    stratum_va = era_va.astype(str) + "_" + pd.Series(reply_va, index=val_out.index).astype(str)
+    n_st = st_counts.reindex(stratum_va).fillna(0.0).to_numpy(dtype=np.float64)
+    mean_st = st_means.reindex(stratum_va).fillna(global_mean).to_numpy(dtype=np.float64)
+    val_st_te = (n_st * mean_st + m * global_mean) / (n_st + m)
+    val_out["era_stratum_mean_rate"] = val_st_te.astype(np.float32)
+    val_out["log_era_stratum_n"] = np.log1p(n_st).astype(np.float32)
+
+    if "account_mean_rate" in train_out.columns:
+        train_out["te_minus_era"] = (
+            train_out["account_mean_rate"].to_numpy(dtype=np.float64) - era_te
+        ).astype(np.float32)
+        val_out["te_minus_era"] = (
+            val_out["account_mean_rate"].to_numpy(dtype=np.float64) - val_era_te
+        ).astype(np.float32)
+
+    era_vc = era_tr.value_counts().sort_index()
+    print(
+        f"Era TE: prior_m={m:g} global={global_mean:.4f} "
+        f"train eras={ {int(k): int(v) for k, v in era_vc.items()} } "
+        f"val era_mean p50={np.median(val_era_te):.4f} "
+        f"val stratum_mean p50={np.median(val_st_te):.4f}",
         flush=True,
     )
     return train_out, val_out
@@ -3438,6 +3566,13 @@ def main() -> None:
         )
         train_df = add_te_affinity_interactions(train_df)
         val_df = add_te_affinity_interactions(val_df)
+    if args.era_te:
+        train_df, val_df = add_era_target_encoding(
+            train_df,
+            val_df,
+            prior_strength=args.era_te_prior,
+            era_col=args.era_key,
+        )
     if args.emb_knn_te and not args.skip_embeddings:
         train_df, val_df = add_emb_knn_target_encoding(
             train_df,
@@ -3556,31 +3691,35 @@ def main() -> None:
         )
 
     gpboost_meta: dict[str, float] = {}
+    fit_kwargs = dict(
+        residual=residual,
+        baseline_kind=args.baseline,
+        skip_embeddings=args.skip_embeddings,
+        seed=args.seed,
+        nonreply_weight=args.nonreply_weight,
+        loss=args.loss,
+        quantile_alpha=args.quantile_alpha,
+        asymmetric_under_weight=args.asymmetric_under_weight,
+        sera_floor=args.sera_floor,
+        sera_high_only=args.sera_high_only,
+        sera_nonreply_only=args.sera_nonreply_only,
+        early_stop_metric=args.early_stop_metric,
+        rank_nonreply_only=args.rank_nonreply_only,
+        rank_min_group=args.rank_min_group,
+        hybrid_rank=args.hybrid_rank,
+        model_kind=args.model,
+        stream_fresh_days=args.stream_fresh_days,
+        stream_fresh_floor=args.stream_fresh_floor,
+    )
     if args.nonreply_only:
         tr_nr = train_df[train_df["is_reply"] == 0]
         va_nr = val_df[val_df["is_reply"] == 0]
         print(f"Non-reply-only train: {len(tr_nr):,} / {len(train_df):,} (val NR {len(va_nr):,})")
+        nr_kwargs = {**fit_kwargs, "nonreply_weight": 1.0}
         _, model, feature_names, gpboost_meta = fit_predict_group(
             tr_nr,
             va_nr,
-            residual=residual,
-            baseline_kind=args.baseline,
-            skip_embeddings=args.skip_embeddings,
-            seed=args.seed,
-            nonreply_weight=1.0,
-            loss=args.loss,
-            quantile_alpha=args.quantile_alpha,
-            asymmetric_under_weight=args.asymmetric_under_weight,
-            sera_floor=args.sera_floor,
-            sera_high_only=args.sera_high_only,
-            sera_nonreply_only=args.sera_nonreply_only,
-            early_stop_metric=args.early_stop_metric,
-            rank_nonreply_only=args.rank_nonreply_only,
-            rank_min_group=args.rank_min_group,
-            hybrid_rank=args.hybrid_rank,
-            model_kind=args.model,
-            stream_fresh_days=args.stream_fresh_days,
-            stream_fresh_floor=args.stream_fresh_floor,
+            **nr_kwargs,
         )
         # Score full val with the non-reply model, then overwrite replies.
         x_val_full, _ = feature_matrix(val_df, skip_embeddings=args.skip_embeddings)
@@ -3606,6 +3745,55 @@ def main() -> None:
         reply_m = val_df["is_reply"].to_numpy() == 1
         pred[reply_m] = base_val[reply_m] + mean_r_resid
         print(f"Reply fallback residual mean: {mean_r_resid:.4f}")
+    elif args.era_heads:
+        era_col = args.era_key
+        if era_col not in train_df.columns:
+            raise SystemExit(
+                f"--era-heads requires {era_col} (add_time_regime_features)"
+            )
+        # Global fallback, then overwrite eras with enough train mass.
+        pred, model, feature_names, gpboost_meta = fit_predict_group(
+            train_df,
+            val_df,
+            **fit_kwargs,
+        )
+        era_tr = train_df[era_col].to_numpy()
+        era_va = val_df[era_col].to_numpy()
+        specialists = 0
+        for era in sorted(set(int(x) for x in era_va.tolist())):
+            tr_m = era_tr == era
+            va_m = era_va == era
+            n_tr = int(tr_m.sum())
+            n_va = int(va_m.sum())
+            if n_tr < args.era_head_min_train or n_va == 0:
+                print(
+                    f"  era head {era_col}={era}: skip (train={n_tr:,} val={n_va:,}; "
+                    f"min={args.era_head_min_train})",
+                    flush=True,
+                )
+                continue
+            print(
+                f"  era head {era_col}={era}: train={n_tr:,} val={n_va:,}",
+                flush=True,
+            )
+            era_kwargs = {**fit_kwargs, "seed": args.seed + 100 + int(era)}
+            p_era, model_era, feature_names, meta_era = fit_predict_group(
+                train_df.loc[tr_m].reset_index(drop=True),
+                val_df.loc[va_m].reset_index(drop=True),
+                **era_kwargs,
+            )
+            pred[va_m] = p_era
+            model = model_era
+            gpboost_meta.update({f"era{int(era)}_{k}": v for k, v in meta_era.items()})
+            specialists += 1
+        gpboost_meta["era_heads"] = 1.0
+        gpboost_meta["era_head_specialists"] = float(specialists)
+        gpboost_meta["era_key_year"] = float(era_col == "year")
+        print(
+            f"Era heads ({era_col}): specialists={specialists} "
+            f"(min_train={args.era_head_min_train}); rest use global fallback",
+            flush=True,
+        )
     elif args.split_reply:
         pred = np.zeros(len(val_df), dtype=np.float64)
         models = []
@@ -3767,6 +3955,11 @@ def main() -> None:
     metrics["breakout_auc"] = breakout_auc
     metrics["model"] = args.model
     metrics["account_te"] = bool(args.account_te)
+    metrics["era_te"] = float(args.era_te)
+    metrics["era_te_prior"] = float(args.era_te_prior) if args.era_te else 0.0
+    metrics["era_heads"] = float(args.era_heads)
+    metrics["era_key"] = args.era_key if (args.era_te or args.era_heads) else ""
+    metrics["era_head_min_train"] = float(args.era_head_min_train) if args.era_heads else 0.0
     metrics["loss"] = args.loss
     metrics["sera_floor"] = float(args.sera_floor) if args.loss == "sera" else 0.0
     metrics["sera_high_only"] = float(args.sera_high_only) if args.loss == "sera" else 0.0
@@ -3862,6 +4055,8 @@ def main() -> None:
     print(f"target_space: {metrics['target_space']}")
     print(
         f"model: {metrics['model']} | account_te: {metrics['account_te']} | "
+        f"era_te: {bool(metrics.get('era_te', 0))} | "
+        f"era_heads: {bool(metrics.get('era_heads', 0))} | "
         f"loss: {metrics['loss']} | early_stop: {metrics.get('early_stop_metric', 'rmse')} | "
         f"hybrid_rank: {bool(metrics.get('hybrid_rank', 0))}"
     )

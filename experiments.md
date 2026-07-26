@@ -132,6 +132,20 @@ Full prepare `--skip-media` (~110k / 934 accounts). Resumable X lookup; sanitize
 
 **Verdict:** **default `--x-parents` on.** Complete fill softens the NR dip vs partial/near (−0.009 vs −0.018) with a small reply lift and flat/better magnitude. Prefer richer context over CA-gap proxies.
 
+### v46 era TE / era heads (medium same-rebuild)
+
+`prepare --max-tweets 25000 --per-account-cap 100 --skip-media` (23.7k / 287). Val = 100% musk_late / 100% 2026.
+
+| Run | knob | wa_nr | wa_rp | global_nr | rmse | Notes |
+|---|---|---:|---:|---:|---:|---|
+| v46a | control | **0.221** | 0.214 | 0.504 | **0.726** | Medium hybrid baseline |
+| v46b | `--era-te` platform | 0.082 | 0.175 | 0.309 | 0.803 | `era_mean_rate` dominates gain; **regress** |
+| v46c | `--era-heads` platform | 0.217 | **0.237** | **0.506** | 0.728 | ≈ control (era-4 specialist drops ~246 rows) |
+| v46d | `--era-te --era-key year` | 0.157 | 0.137 | 0.376 | 0.770 | **regress** |
+| v46e | `--era-heads --era-key year` | 0.185 | 0.145 | 0.482 | 0.728 | 2026-only head loses 2025; **regress** |
+
+**Verdict:** harness stays opt-in; do not promote. Detail: `logs/v46_era_regime_smoke.md`.
+
 ### v38 media types (same rebuild after `--media-only`)
 
 | Run | wa_nr | wa_rp | global_nr | rmse | Notes |
@@ -198,7 +212,7 @@ Check off when tried; note outcome in one line.
 ### Time / regimes
 - [x] Calendar / era features (year, month seasonality, platform eras) — **v13: 0.978 → 0.967**
 - [x] Exposure-rate target as default objective — **v14e: rate rmse 0.642** (vs train-mean 0.701); dump-total decode intentionally weaker
-- [ ] Train-fit regime-specific baselines or separate heads by era
+- [x] Train-fit regime-specific baselines or separate heads by era — **v46** (`logs/v46_era_regime_smoke.md`): medium `--era-te` **regress** (platform wa_nr 0.221→0.082; year 0.157); `--era-heads` platform flat / year **regress** (wa_nr −0.036) — leave opt-in (`--era-key {platform_era,year}`); do not promote
 - [x] Explicit “CA corpus quality over time” proxies (upload density, archive coverage) — **audit 2026-07-24:** stream (`archive_upload_id` null) is 62% of 2025 / 98% of 2026 dump rows; latest time-quintile on eligible accounts is ~100% stream with ~73% replies missing `reply_to_user_id` (breaks inbound `reply_to_user` hist). Likes/followers only from archive uploads (extension does not capture). Report: `logs/ca_data_quality_audit.md`; re-run `uv run audit_ca_quality.py`.
 - [x] Provenance-aware eval: `analyze.py` slices wa_* by upload-linked vs stream (`is_stream` from null `archive_upload_id`; carried in prepare / joined from dump if missing).
 - [x] Backfill `reply_to_user_id` from parent `account_id` when parent ∈ dump — in `load_author_graph` (inbound hist) + sampled-row coalesce for `is_self_reply`; rebuild densifies `inbound_replies*` (v36a).
