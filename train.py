@@ -1576,7 +1576,7 @@ def parse_args() -> argparse.Namespace:
         "--era-te",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Train-fold smoothed mean target by platform_era (+ era×reply); "
+        help="Train-fold smoothed mean target by --era-key (+ key×reply); "
         "opt-in calendar prior (v46)",
     )
     p.add_argument(
@@ -1588,8 +1588,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--era-heads",
         action="store_true",
-        help="Fit a specialist model per platform_era (fallback to global when "
+        help="Fit a specialist model per --era-key bucket (fallback to global when "
         "train n < --era-head-min-train); opt-in (v46)",
+    )
+    p.add_argument(
+        "--era-key",
+        choices=("platform_era", "year"),
+        default="platform_era",
+        help="Regime column for --era-te / --era-heads (year is denser under "
+        "time-holdout musk_late dominance)",
     )
     p.add_argument(
         "--era-head-min-train",
@@ -3561,7 +3568,10 @@ def main() -> None:
         val_df = add_te_affinity_interactions(val_df)
     if args.era_te:
         train_df, val_df = add_era_target_encoding(
-            train_df, val_df, prior_strength=args.era_te_prior
+            train_df,
+            val_df,
+            prior_strength=args.era_te_prior,
+            era_col=args.era_key,
         )
     if args.emb_knn_te and not args.skip_embeddings:
         train_df, val_df = add_emb_knn_target_encoding(
@@ -3736,30 +3746,36 @@ def main() -> None:
         pred[reply_m] = base_val[reply_m] + mean_r_resid
         print(f"Reply fallback residual mean: {mean_r_resid:.4f}")
     elif args.era_heads:
-        if "platform_era" not in train_df.columns:
-            raise SystemExit("--era-heads requires platform_era (add_time_regime_features)")
+        era_col = args.era_key
+        if era_col not in train_df.columns:
+            raise SystemExit(
+                f"--era-heads requires {era_col} (add_time_regime_features)"
+            )
         # Global fallback, then overwrite eras with enough train mass.
         pred, model, feature_names, gpboost_meta = fit_predict_group(
             train_df,
             val_df,
             **fit_kwargs,
         )
-        era_tr = train_df["platform_era"].to_numpy()
-        era_va = val_df["platform_era"].to_numpy()
+        era_tr = train_df[era_col].to_numpy()
+        era_va = val_df[era_col].to_numpy()
         specialists = 0
-        for era in sorted(set(era_va.tolist())):
+        for era in sorted(set(int(x) for x in era_va.tolist())):
             tr_m = era_tr == era
             va_m = era_va == era
             n_tr = int(tr_m.sum())
             n_va = int(va_m.sum())
             if n_tr < args.era_head_min_train or n_va == 0:
                 print(
-                    f"  era head {era}: skip (train={n_tr:,} val={n_va:,}; "
+                    f"  era head {era_col}={era}: skip (train={n_tr:,} val={n_va:,}; "
                     f"min={args.era_head_min_train})",
                     flush=True,
                 )
                 continue
-            print(f"  era head {era}: train={n_tr:,} val={n_va:,}", flush=True)
+            print(
+                f"  era head {era_col}={era}: train={n_tr:,} val={n_va:,}",
+                flush=True,
+            )
             era_kwargs = {**fit_kwargs, "seed": args.seed + 100 + int(era)}
             p_era, model_era, feature_names, meta_era = fit_predict_group(
                 train_df.loc[tr_m].reset_index(drop=True),
@@ -3772,8 +3788,9 @@ def main() -> None:
             specialists += 1
         gpboost_meta["era_heads"] = 1.0
         gpboost_meta["era_head_specialists"] = float(specialists)
+        gpboost_meta["era_key_year"] = float(era_col == "year")
         print(
-            f"Era heads: specialists={specialists} "
+            f"Era heads ({era_col}): specialists={specialists} "
             f"(min_train={args.era_head_min_train}); rest use global fallback",
             flush=True,
         )
@@ -3941,6 +3958,7 @@ def main() -> None:
     metrics["era_te"] = float(args.era_te)
     metrics["era_te_prior"] = float(args.era_te_prior) if args.era_te else 0.0
     metrics["era_heads"] = float(args.era_heads)
+    metrics["era_key"] = args.era_key if (args.era_te or args.era_heads) else ""
     metrics["era_head_min_train"] = float(args.era_head_min_train) if args.era_heads else 0.0
     metrics["loss"] = args.loss
     metrics["sera_floor"] = float(args.sera_floor) if args.loss == "sera" else 0.0
