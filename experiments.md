@@ -20,7 +20,8 @@ Process retrospective (what moved the scoreboard vs what burned cycles): [`logs/
 
 | Objective | Run | wa_nr_wmean | wa_rp_wmean | global_nr | rmse_log | Notes |
 |---|---|---:|---:|---:|---:|---|
-| **Default stack** | **v36c** | **0.249** | **0.276** | 0.569 | **0.602** | Hybrid + mentions + provenance features (`stream_x_log_age` #21 gain) |
+| **Default stack** | **v47b** | **0.259** | **0.275** | **0.580** | 0.603 | Hybrid + mentions + provenance + residual emb CAV; dump parents (X 402); vs same-rebuild v47a |
+| Prior (no residual CAV) | v47a / v36c | 0.238 / **0.249** | 0.266 / **0.276** | 0.570 / 0.569 | **0.602** / **0.602** | v47a = dump-parent twin of v47b; v36c = prior default (`stream_x_log_age` #21) |
 | Media types (opt-in) | v38b | **0.252** | 0.267 | **0.589** | 0.602 | `--media-types` after media refresh; +wa_nr/−wa_rp vs v38a — leave opt-in |
 | X parents (complete) | v39d | 0.254 | **0.288** | 0.588 | **0.599** | vs v39a3: wa_nr −0.009 / wa_rp +0.006; among-reply 73%→97%, quote 70%→**99%**; **default on** |
 | No-X parents control | v39a3 | **0.263** | 0.282 | **0.588** | 0.600 | Dump-only twin of v39d |
@@ -33,8 +34,8 @@ Process retrospective (what moved the scoreboard vs what burned cycles): [`logs/
 | Dump total | v13 | — | — | — | 0.967 | Legacy objective |
 
 Rebuild: `uv run prepare.py --skip-media` (defaults are the v12 scale knobs; mentions + provenance/upload-end included).  
-Train: `uv run train.py --description "…"`. Patch older datasets with `--mentions-only` / `--provenance-only`.  
-Ablate provenance feats with `--no-provenance-features`. Regime holdouts: `--holdout-policy upload_era|stream_only` (opt-in; do not change locked scoreboard lightly).
+Train: `uv run train.py --description "…"` (residual emb CAV default on after **v47**). Patch older datasets with `--mentions-only` / `--provenance-only`.  
+Ablate with `--no-provenance-features` / `--no-residual-emb-cav`. Regime holdouts: `--holdout-policy upload_era|stream_only` (opt-in; do not change locked scoreboard lightly).
 
 ## Timeline (curated)
 
@@ -132,6 +133,17 @@ Full prepare `--skip-media` (~110k / 934 accounts). Resumable X lookup; sanitize
 
 **Verdict:** **default `--x-parents` on.** Complete fill softens the NR dip vs partial/near (−0.009 vs −0.018) with a small reply lift and flat/better magnitude. Prefer richer context over CA-gap proxies.
 
+### v47 residual emb CAV full-scale (same rebuild; dump parents)
+
+`prepare --skip-media` (~110.6k / 934). X parent fetch hit HTTP 402 immediately → dump-only parents (reply 59% / quote 10%). Detail: `logs/v47_residual_emb_cav_fullscale.md`.
+
+| Run | knob | wa_nr | wa_rp | global_nr | rmse | Notes |
+|---|---|---:|---:|---:|---:|---|
+| v47a | control | 0.238 | 0.266 | 0.570 | **0.602** | `--no-residual-emb-cav` |
+| **v47b** | `--residual-emb-cav` | **0.259** | **0.275** | **0.580** | 0.603 | R²(emb\|Z)=0.011; train corr(proj,y)=0.084; `res_emb_cav_proj` rank ~49 |
+
+**Verdict:** **promote / default on.** Δ vs control: wa_nr **+0.021** / wa_rp **+0.009** / global_nr **+0.010** / rmse flat. Confirms medium v44f (+0.025 wa_nr). Ablate with `--no-residual-emb-cav`. Residual PLS stays opt-in / do not promote.
+
 ### v46 era TE / era heads (medium same-rebuild)
 
 `prepare --max-tweets 25000 --per-account-cap 100 --skip-media` (23.7k / 287). Val = 100% musk_late / 100% 2026.
@@ -201,7 +213,7 @@ Fair revisit of prior ablations after the metric lock. Control = asymmetric leve
 - Parent-author **corpus MiniLM** — **v41d** 75% reply coverage but cos anti-aligned within-author; wa_* regress; stays under opt-in dyad (`logs/v41_parent_author_emb_smoke.md`).
 - Reply **LM stance** (agree/disagree vs parent) — **v42** Modal Qwen3-8B calibrated but dense corr fails gate (0.021); wa_rp regress; `--stance-labels` opt-in (`logs/v42_stance_smoke.md`).
 - Richer **descriptive LM tags** (humor/controversy/narrative/CTA/news/dunk) — **v43** 1.5B sparse smoke +wa_nr; **v45** Modal Qwen3-8B densifies all NR on medium (19% rows; better calibrated): dense narrative ρ=0.137 / humor 0.077; train wa_nr **−0.011** / rmse −0.005 — **leave opt-in**, do not promote (`logs/v45_desc_tags_8b.md`).
-- Residual emb CAV/PLS — **v44** (`logs/v44_residual_emb_smoke.md`): R²(emb\|Z)≈0.01; `--residual-emb-pls 8` wa_nr regress (medium −0.027); `--residual-emb-cav` medium wa_nr **+0.025** / wa_rp +0.007 vs control and beats raw `--emb-cav` twin (wa_nr −0.010) — **opt-in**, full-scale confirm before promote.
+- Residual emb CAV/PLS — **v44** medium + **v47** full (`logs/v47_residual_emb_cav_fullscale.md`): R²(emb\|Z)≈0.01; PLS regresses wa_nr; residual CAV full-scale wa_nr **+0.021** / wa_rp +0.009 / global_nr +0.010 / rmse flat vs same-rebuild — **default on** (`--no-residual-emb-cav` to ablate); residual PLS stays opt-in.
 
 ---
 
@@ -269,7 +281,7 @@ Cheap first bets (smoke: train-fold corr of 1–8 derived dims vs rate; then ful
 - [x] **Cluster TE:** — **v26a/b: regress**; **v32 rescore:** still regresses on wa_* (−0.037 / −0.057); `--emb-cluster-te` stays off. Cheap emb-discovery lane exhausted
 
 Heavier / researchy:
-- [x] Residual emb after regressing out account TE / reply baseline, then redo direction or PLS — **v44** (`logs/v44_residual_emb_smoke.md`): PLS regresses wa_nr; residual CAV medium +0.025 wa_nr vs control (raw CAV twin −0.010) — **opt-in**; full ~110k confirm before promote
+- [x] Residual emb after regressing out account TE / reply baseline, then redo direction or PLS — **v44** medium + **v47** full (`logs/v47_residual_emb_cav_fullscale.md`): PLS regresses wa_nr; residual CAV full-scale wa_nr **+0.021** / wa_rp +0.009 / global_nr +0.010 — **promote / default on** (`--no-residual-emb-cav`); residual PLS stays opt-in
 - [x] Error-driven clusters: — **v25a/b: flat**; **v32 rescore:** noise on wa_*; `--fail-clusters` stays opt-in
 - [ ] Supervised manifold (UMAP on RF-leaf similarity, etc.) — usually for analysis, not tabular features; only promote if a cheap projection beats PLS
 
