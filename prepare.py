@@ -759,8 +759,19 @@ def load_mention_times(account_ids: pd.Series, *, force: bool = False) -> dict[s
 
         fresh = _fetch_mention_events_api(missing, on_batch=_flush_mention_progress)
         # Final merge + dump backfill for timestamps (idempotent with batch flushes).
+        if len(cached):
+            cached = cached.copy()
+            cached["created_at"] = pd.to_datetime(
+                cached["created_at"], utc=True, errors="coerce"
+            )
         pieces = [cached] if len(cached) else []
         if not fresh.empty:
+            fresh = fresh.copy()
+            fresh["mentioned_user_id"] = fresh["mentioned_user_id"].astype(str)
+            fresh["tweet_id"] = fresh["tweet_id"].astype(str)
+            fresh["created_at"] = pd.to_datetime(
+                fresh["created_at"], utc=True, errors="coerce"
+            )
             fresh = _backfill_mention_times_from_dump(fresh)
             pieces.append(fresh)
         seen = set(fresh["mentioned_user_id"].astype(str).unique()) if not fresh.empty else set()
@@ -779,6 +790,9 @@ def load_mention_times(account_ids: pd.Series, *, force: bool = False) -> dict[s
         cached = pd.concat(pieces, ignore_index=True) if pieces else cached
         if not fresh.empty:
             cached = cached.drop_duplicates(["mentioned_user_id", "tweet_id"], keep="last")
+        cached["created_at"] = pd.to_datetime(
+            cached["created_at"], utc=True, errors="coerce"
+        )
         # Backfill created_at on any sentinel/partial rows still missing times.
         cached = _backfill_mention_times_from_dump(cached)
         cached.to_parquet(MENTION_CACHE_PATH, index=False)
