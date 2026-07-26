@@ -134,6 +134,17 @@ Full prepare `--skip-media` (~110k / 934 accounts). Resumable X lookup; sanitize
 
 **Verdict:** **default `--x-parents` on.** Complete fill softens the NR dip vs partial/near (−0.009 vs −0.018) with a small reply lift and flat/better magnitude. Prefer richer context over CA-gap proxies.
 
+### v50 extreme rank relevance (same X-complete rebuild)
+
+Hybrid stratum LambdaRank labels: dense 0..n-1 vs extreme 0–4 quantile grades (viral-tail focus). Detail: `logs/v50_rank_relevance.md`.
+
+| Run | knob | wa_nr | wa_rp | global_nr | rmse | Notes |
+|---|---|---:|---:|---:|---:|---|
+| v50a | `dense` | **0.262** | **0.298** | **0.579** | **0.599** | Control (= v48b) |
+| v50b | `extreme` | 0.195 | 0.232 | 0.564 | 0.603 | NDCG@10 NR 0.80→0.68 |
+
+**Verdict:** leave **opt-in** / do not promote. Mid-tier collapse hurts locked Spearman; under-pred unchanged. Prefer feature-side viral attacks next.
+
 ### v49 2nd-hop parent chain (same X-complete rebuild)
 
 `prepare.py --parent-chain-only` on `dataset_xcomplete_full` (~110.6k / 934). Hop-1 filled from dump+X cache; hop-2 left 21k pending on HTTP 402. Detail: `logs/v49_parent_chain.md`.
@@ -238,6 +249,7 @@ Fair revisit of prior ablations after the metric lock. Control = asymmetric leve
 - Richer **descriptive LM tags** (humor/controversy/narrative/CTA/news/dunk) — **v43** 1.5B sparse smoke +wa_nr; **v45** Modal Qwen3-8B densifies all NR on medium (19% rows; better calibrated): dense narrative ρ=0.137 / humor 0.077; train wa_nr **−0.011** / rmse −0.005 — **leave opt-in**, do not promote (`logs/v45_desc_tags_8b.md`).
 - Residual emb CAV/PLS — **v44** medium + **v47** dump-parent full + **v48** X-complete rebase (`logs/v48_xcomplete_residual_cav.md`): R²(emb\|Z)≈0.01; PLS regresses wa_nr; residual CAV on X-complete wa_nr **+0.008** / wa_rp **+0.010** / global_nr −0.009 / rmse flat vs v48a — **default on**; locked scoreboard **v48b** (0.262 / 0.298); residual PLS stays opt-in.
 - 2nd-hop parent chain — **v49** (`logs/v49_parent_chain.md`): reply-chain 25% / among-reply 31%; among-reply content ρ fails gate; `--parent-chain` wa_nr **−0.008** / wa_rp **−0.008** / rmse +0.005 vs same-rebuild control — **leave opt-in**, do not promote.
+- Extreme LambdaRank relevance grades — **v50** (`logs/v50_rank_relevance.md`): `--rank-relevance extreme` wa_nr **−0.067** / wa_rp **−0.066** / underpred flat; NDCG collapses — **leave opt-in**, do not promote. Viral NR needs new within-author signal, not coarser rank labels.
 
 ---
 
@@ -316,6 +328,7 @@ Heavier / researchy:
 - [x] Pairwise / listwise LambdaRank on non-replies by `account_id` — **v30b: fail on global spearman_nr** (0.051); slight **within-account** rank lift (wmean 0.187→0.211); `--loss lambdarank` opt-in only
 - [x] Hybrid level + stratum within-author ranker — **v31b: lift** wa_nr 0.187→0.227, wa_rp 0.172→0.280; guardrails flat/up; **default on** (`--no-hybrid-rank` to ablate)
 - [x] SERA on NR stratum / hybrid×SERA — **v33:** hybrid freezes wa_*; level `--sera-nonreply-only` **regress** wa_nr 0.187→0.138; leave opt-in, no promote
+- [x] Extreme / top-tail LambdaRank relevance grades — **v50** (`logs/v50_rank_relevance.md`): `--rank-relevance extreme` wa_nr **−0.067** / wa_rp **−0.066**; leave opt-in / do not promote
 - [ ] Larger frozen encoder (Modal credits) vs MiniLM
 - [ ] Further scale (>120k / more accounts with lower `min-account-tweets`)
 - [x] Account-level **target encoding** (train-fold LOO, leakage-safe) — **v19: 0.642 → 0.639 rate RMSE**, Spearman 0.441→0.452; default on (`--no-account-te` to ablate)
