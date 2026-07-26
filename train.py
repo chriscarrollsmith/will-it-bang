@@ -878,18 +878,50 @@ def _spearman_feval_all():
     return feval
 
 
+def _extreme_relevance_grades(y_group: np.ndarray) -> np.ndarray:
+    """Map continuous targets to 0–4 grades that emphasize the within-group top tail.
+
+    Quantile cuts at 50/75/90/95 within the account. Small groups (<6) fall back
+    to dense ranks so LambdaRank still sees pairwise order.
+    """
+    y_group = np.asarray(y_group, dtype=np.float64)
+    n = int(y_group.size)
+    if n < 6:
+        order_y = np.argsort(y_group, kind="mergesort")
+        ranks = np.empty(n, dtype=np.int32)
+        ranks[order_y] = np.arange(n, dtype=np.int32)
+        return ranks
+    q50, q75, q90, q95 = np.quantile(y_group, [0.50, 0.75, 0.90, 0.95])
+    # Degenerate flat groups: keep a single grade.
+    if not np.isfinite([q50, q75, q90, q95]).all() or float(y_group.max()) <= float(y_group.min()):
+        return np.zeros(n, dtype=np.int32)
+    grades = np.zeros(n, dtype=np.int32)
+    grades[y_group > q50] = 1
+    grades[y_group > q75] = 2
+    grades[y_group > q90] = 3
+    grades[y_group > q95] = 4
+    return grades
+
+
 def prepare_account_rank_order(
     account_ids: np.ndarray,
     x: np.ndarray,
     y: np.ndarray,
     *,
     min_group: int = 2,
+    relevance: str = "dense",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, float]]:
     """Sort by account, build group sizes, and integer within-group relevance ranks.
 
     LightGBM LambdaRank requires int labels; higher = more relevant. Ranks are
     computed from continuous ``y`` within each account (draft-ranking groups).
+
+    ``relevance``:
+      - ``dense``: 0..n-1 within account (default; full pairwise order)
+      - ``extreme``: 0–4 quantile grades emphasizing the top tail (viral focus)
     """
+    if relevance not in {"dense", "extreme"}:
+        raise ValueError(f"Unknown rank relevance mode: {relevance}")
     account_ids = np.asarray(account_ids)
     y = np.asarray(y, dtype=np.float64)
     order = np.argsort(account_ids, kind="mergesort")
@@ -907,15 +939,20 @@ def prepare_account_rank_order(
     y_keep = y[order_keep]
     _, _, group = np.unique(ids_keep, return_index=True, return_counts=True)
     group = group.astype(np.int32)
-    # Dense within-group ranks: higher y → higher relevance label.
     rel = np.empty(y_keep.shape[0], dtype=np.int32)
     start = 0
+    n_grade4 = 0
     for n in group:
         sl = slice(start, start + int(n))
-        order_y = np.argsort(y_keep[sl], kind="mergesort")
-        ranks = np.empty(int(n), dtype=np.int32)
-        ranks[order_y] = np.arange(int(n), dtype=np.int32)
-        rel[sl] = ranks
+        if relevance == "extreme":
+            grades = _extreme_relevance_grades(y_keep[sl])
+            rel[sl] = grades
+            n_grade4 += int((grades == 4).sum())
+        else:
+            order_y = np.argsort(y_keep[sl], kind="mergesort")
+            ranks = np.empty(int(n), dtype=np.int32)
+            ranks[order_y] = np.arange(int(n), dtype=np.int32)
+            rel[sl] = ranks
         start += int(n)
     meta = {
         "rank_n_rows": float(order_keep.size),
@@ -924,6 +961,8 @@ def prepare_account_rank_order(
         "rank_mean_group": float(np.mean(group)),
         "rank_frac_rows_kept": float(order_keep.size / max(account_ids.shape[0], 1)),
         "rank_label_max": float(rel.max()) if rel.size else 0.0,
+        "rank_relevance_extreme": 1.0 if relevance == "extreme" else 0.0,
+        "rank_frac_grade4": float(n_grade4 / max(order_keep.size, 1)) if relevance == "extreme" else 0.0,
     }
     return x[order_keep], y_keep, rel, group, meta
 
@@ -1651,6 +1690,13 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=2,
         help="Min tweets per account_id group for --loss lambdarank / --hybrid-rank",
+    )
+    p.add_argument(
+        "--rank-relevance",
+        choices=("dense", "extreme"),
+        default="dense",
+        help="LambdaRank label mode within account: dense 0..n-1 (default) or "
+        "extreme 0–4 top-tail quantile grades (viral under-pred attack; opt-in)",
     )
     p.add_argument(
         "--hybrid-rank",
@@ -3266,6 +3312,7 @@ def fit_predict_group(
     early_stop_metric: str = "rmse",
     rank_nonreply_only: bool = True,
     rank_min_group: int = 2,
+    rank_relevance: str = "dense",
     hybrid_rank: bool = True,
     model_kind: str = "lgbm",
     stream_fresh_days: float = 0.0,
@@ -3313,12 +3360,14 @@ def fit_predict_group(
             x_train[tr_mask],
             y_train[tr_mask],
             min_group=rank_min_group,
+            relevance=rank_relevance,
         )
         x_va_r, _y_va_cont, rel_va, g_va, meta_va = prepare_account_rank_order(
             account_val[va_mask],
             x_val[va_mask],
             y_val_model[va_mask],
             min_group=rank_min_group,
+            relevance=rank_relevance,
         )
         extra_metrics.update({f"{label}_train_{k}": v for k, v in meta_tr.items()})
         extra_metrics.update({f"{label}_val_{k}": v for k, v in meta_va.items()})
@@ -3747,11 +3796,14 @@ def main() -> None:
         early_stop_metric=args.early_stop_metric,
         rank_nonreply_only=args.rank_nonreply_only,
         rank_min_group=args.rank_min_group,
+        rank_relevance=args.rank_relevance,
         hybrid_rank=args.hybrid_rank,
         model_kind=args.model,
         stream_fresh_days=args.stream_fresh_days,
         stream_fresh_floor=args.stream_fresh_floor,
     )
+    if args.hybrid_rank or args.loss == "lambdarank":
+        print(f"Rank relevance labels: {args.rank_relevance}", flush=True)
     if args.nonreply_only:
         tr_nr = train_df[train_df["is_reply"] == 0]
         va_nr = val_df[val_df["is_reply"] == 0]
@@ -3863,6 +3915,7 @@ def main() -> None:
                 early_stop_metric=args.early_stop_metric,
                 rank_nonreply_only=args.rank_nonreply_only,
                 rank_min_group=args.rank_min_group,
+                rank_relevance=args.rank_relevance,
                 hybrid_rank=args.hybrid_rank,
                 model_kind=args.model,
                 stream_fresh_days=args.stream_fresh_days,
@@ -3890,6 +3943,7 @@ def main() -> None:
             early_stop_metric=args.early_stop_metric,
             rank_nonreply_only=args.rank_nonreply_only,
             rank_min_group=args.rank_min_group,
+            rank_relevance=args.rank_relevance,
             hybrid_rank=args.hybrid_rank,
             model_kind=args.model,
             stream_fresh_days=args.stream_fresh_days,
@@ -4014,6 +4068,9 @@ def main() -> None:
     )
     metrics["rank_min_group"] = (
         float(args.rank_min_group) if args.loss == "lambdarank" or args.hybrid_rank else 0.0
+    )
+    metrics["rank_relevance"] = (
+        args.rank_relevance if args.loss == "lambdarank" or args.hybrid_rank else "dense"
     )
     metrics["holdout_policy"] = args.holdout_policy
     metrics["min_upload_hist"] = float(args.min_upload_hist)
