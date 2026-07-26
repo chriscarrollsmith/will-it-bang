@@ -240,7 +240,7 @@ Fair revisit of prior ablations after the metric lock. Control = asymmetric leve
 
 ## Failure modes (still open)
 
-- High-engagement **non-replies** (viral under-prediction); often already-hot authors. Improved by SERA (v28b: mean under-pred 2.22→2.04) but still open.
+- High-engagement **non-replies** (viral under-prediction); often already-hot authors. Improved by SERA (v28b: mean under-pred 2.22→2.04) but still open on rank. **v50** extreme rank labels regress wa_* — need within-author *features*, not coarser LambdaRank grades.
 - **Media** / short+image posts — API refresh restores ~9% coverage (v18/v38a); binary-only refresh can regress wa_nr vs 0% media; type breakdown (v38b) recovers NR at reply cost — `--media-types` opt-in. Vision smoke: Gemini tags fail CV gate; SigLIP PCA-8 marginal — no full Gemini spend.
 - **Quote** / reply parents missing from CA — X fallback **complete** (**v39d**): among-reply 73%→97%, quote 70%→99%; wa_rp +0.006 / wa_nr −0.009 / rmse flat; keep default on.
 - Reply **dyad** / parent-author size — **v41 smoke** dense coverage but weak rate corr; wa_rp flat on small set; `--reply-dyad` stays opt-in (`logs/v41_reply_dyad_smoke.md`).
