@@ -236,6 +236,19 @@ EMB_CAV_FEATURES = [
     "emb_cav_proj_sq",
 ]
 
+# CAV on MiniLM residualized against account TE / reply baselines (opt-in).
+RESIDUAL_EMB_CAV_FEATURES = [
+    "res_emb_cav_proj",
+    "res_emb_cav_proj_sq",
+]
+
+# Default covariates for residual-emb (leakage-safe; account TE when present).
+RESIDUAL_EMB_BASELINES = (
+    "account_mean_rate",
+    "is_reply",
+    "inbound_replies_per_tweet",
+)
+
 # Train-fold MiniLM k-means cluster target encoding (content neighborhoods).
 EMB_CLUSTER_TE_FEATURES = [
     "cluster_mean_rate",
@@ -330,6 +343,7 @@ def feature_matrix(df: pd.DataFrame, skip_embeddings: bool) -> tuple[np.ndarray,
             + ACCOUNT_TE_FEATURES
             + EMB_KNN_TE_FEATURES
             + EMB_CAV_FEATURES
+            + RESIDUAL_EMB_CAV_FEATURES
             + EMB_CLUSTER_TE_FEATURES
             + provenance_cols
             + media_type_cols
@@ -353,6 +367,10 @@ def feature_matrix(df: pd.DataFrame, skip_embeddings: bool) -> tuple[np.ndarray,
     if pls_cols:
         pls_cols = sorted(pls_cols, key=lambda c: int(c.split("_", 1)[1]))
         cols = cols + pls_cols
+    res_pls_cols = [c for c in df.columns if re.fullmatch(r"res_pls_\d+", c)]
+    if res_pls_cols:
+        res_pls_cols = sorted(res_pls_cols, key=lambda c: int(c.rsplit("_", 1)[1]))
+        cols = cols + res_pls_cols
     fail_cols = [c for c in df.columns if c == "fail_min_dist" or re.fullmatch(r"fail_dist_\d+", c)]
     if fail_cols:
         fail_cols = sorted(
@@ -1645,6 +1663,19 @@ def parse_args() -> argparse.Namespace:
         "(fit before emb PCA; 0 disables). Use with --emb-pca 0 to replace variance PCA",
     )
     p.add_argument(
+        "--residual-emb-pls",
+        type=int,
+        default=0,
+        help="OLS-residualize MiniLM vs account TE / reply baselines, then train-fold "
+        "PLS→target; add this many res_pls_* dims (fit before emb PCA; 0 disables)",
+    )
+    p.add_argument(
+        "--residual-emb-cav",
+        action="store_true",
+        help="CAV on MiniLM residualized vs account TE / reply baselines "
+        "(res_emb_cav_proj; uses --emb-cav-quantile / --emb-cav-nonreply-only)",
+    )
+    p.add_argument(
         "--fail-clusters",
         action="store_true",
         help="Cluster train OOF under-prediction MiniLM vectors; add fail_min_dist / fail_dist_*",
@@ -2575,6 +2606,176 @@ def add_emb_pls(
     return train_out, val_out
 
 
+def _residual_emb_design(df: pd.DataFrame) -> tuple[np.ndarray, list[str]]:
+    """Intercept + leakage-safe account/reply baselines for emb residualization."""
+    names = [c for c in RESIDUAL_EMB_BASELINES if c in df.columns]
+    n = len(df)
+    if not names:
+        return np.ones((n, 1), dtype=np.float64), ["intercept"]
+    z = df[names].to_numpy(dtype=np.float64)
+    z = np.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0)
+    z = np.concatenate([np.ones((n, 1), dtype=np.float64), z], axis=1)
+    return z, ["intercept", *names]
+
+
+def residualize_embeddings(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+) -> tuple[np.ndarray, np.ndarray, list[str], float] | None:
+    """Per-dim OLS: emb ~ account TE / reply baselines; return residual MiniLM matrices.
+
+    Fit on the train fold only. Isolates content variation orthogonal (in OLS sense)
+    to account heat and reply stratum before CAV/PLS.
+    """
+    emb_cols = [c for c in train_df.columns if re.fullmatch(r"emb_\d+", c)]
+    if not emb_cols:
+        return None
+    emb_cols = sorted(emb_cols, key=lambda c: int(c.split("_", 1)[1]))
+    z_tr, names = _residual_emb_design(train_df)
+    z_va, _ = _residual_emb_design(val_df)
+    if z_tr.shape[1] != z_va.shape[1]:
+        # Val missing a baseline col that train had — rebuild val with train names.
+        names_core = [n for n in names if n != "intercept"]
+        z_va = np.ones((len(val_df), 1), dtype=np.float64)
+        if names_core:
+            missing = [c for c in names_core if c not in val_df.columns]
+            if missing:
+                print(f"Skipping residual emb (val missing baselines: {missing})", flush=True)
+                return None
+            z_rest = val_df[names_core].to_numpy(dtype=np.float64)
+            z_rest = np.nan_to_num(z_rest, nan=0.0, posinf=0.0, neginf=0.0)
+            z_va = np.concatenate([z_va, z_rest], axis=1)
+    x_tr = train_df[emb_cols].to_numpy(dtype=np.float64)
+    x_va = val_df[emb_cols].to_numpy(dtype=np.float64)
+    coef, *_ = np.linalg.lstsq(z_tr, x_tr, rcond=None)
+    hat_tr = z_tr @ coef
+    r_tr = x_tr - hat_tr
+    r_va = x_va - z_va @ coef
+    # Mean R² across emb dims (how much baseline explains raw MiniLM).
+    ss_res = np.sum((x_tr - hat_tr) ** 2, axis=0)
+    ss_tot = np.sum((x_tr - x_tr.mean(axis=0)) ** 2, axis=0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r2_dims = 1.0 - ss_res / np.where(ss_tot > 0, ss_tot, np.nan)
+    mean_r2 = float(np.nanmean(r2_dims))
+    print(
+        f"Residual emb: baselines={names} mean R²(emb|Z)={mean_r2:.4f} "
+        f"residual ||.||_rms train={float(np.sqrt(np.mean(r_tr ** 2))):.4f}",
+        flush=True,
+    )
+    return r_tr, r_va, names, mean_r2
+
+
+def add_residual_emb_cav(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    *,
+    quantile: float = 0.1,
+    nonreply_only: bool = True,
+    target_col: str = "log_engagement",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """CAV on residual MiniLM (after OLS vs account TE / reply baselines)."""
+    res = residualize_embeddings(train_df, val_df)
+    if res is None:
+        print("Skipping residual emb CAV (no emb_* columns)", flush=True)
+        return train_df, val_df
+    r_tr, r_va, _names, _mean_r2 = res
+    q = float(np.clip(quantile, 0.01, 0.49))
+
+    train_out = train_df.reset_index(drop=True).copy()
+    val_out = val_df.reset_index(drop=True).copy()
+    y = train_out[target_col].to_numpy(dtype=np.float64)
+    fit_mask = np.ones(len(train_out), dtype=bool)
+    if nonreply_only and "is_reply" in train_out.columns:
+        fit_mask &= train_out["is_reply"].to_numpy(dtype=np.float64) < 0.5
+    if fit_mask.sum() < 50:
+        print("Skipping residual emb CAV (too few fit rows)", flush=True)
+        return train_df, val_df
+
+    y_fit = y[fit_mask]
+    lo = float(np.quantile(y_fit, q))
+    hi = float(np.quantile(y_fit, 1.0 - q))
+    cold_mask = fit_mask & (y <= lo)
+    hot_mask = fit_mask & (y >= hi)
+    if cold_mask.sum() < 10 or hot_mask.sum() < 10:
+        print("Skipping residual emb CAV (empty hot/cold tails)", flush=True)
+        return train_df, val_df
+
+    mu_hot = r_tr[hot_mask].mean(axis=0)
+    mu_cold = r_tr[cold_mask].mean(axis=0)
+    direction = mu_hot - mu_cold
+    norm = float(np.linalg.norm(direction))
+    if norm < 1e-12:
+        print("Skipping residual emb CAV (degenerate direction)", flush=True)
+        return train_df, val_df
+    direction = direction / norm
+
+    proj_tr = (r_tr @ direction).astype(np.float32)
+    proj_va = (r_va @ direction).astype(np.float32)
+    train_out["res_emb_cav_proj"] = proj_tr
+    train_out["res_emb_cav_proj_sq"] = (proj_tr * proj_tr).astype(np.float32)
+    val_out["res_emb_cav_proj"] = proj_va
+    val_out["res_emb_cav_proj_sq"] = (proj_va * proj_va).astype(np.float32)
+
+    corr = float(np.corrcoef(proj_tr, y)[0, 1]) if len(y) > 2 else float("nan")
+    print(
+        f"Residual emb CAV: q={q:g} nonreply_only={nonreply_only} "
+        f"hot={int(hot_mask.sum()):,} cold={int(cold_mask.sum()):,} "
+        f"|μh−μc|={norm:.4f} train corr(proj,y)={corr:.4f}",
+        flush=True,
+    )
+    return train_out, val_out
+
+
+def add_residual_emb_pls(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    n_components: int,
+    *,
+    target_col: str = "log_engagement",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """PLS of residual MiniLM → target; dense res_pls_* scores (fit before emb PCA)."""
+    from sklearn.cross_decomposition import PLSRegression
+
+    if n_components <= 0:
+        return train_df, val_df
+    res = residualize_embeddings(train_df, val_df)
+    if res is None:
+        print("Skipping residual emb PLS (no emb_* columns)", flush=True)
+        return train_df, val_df
+    r_tr, r_va, _names, _mean_r2 = res
+    k = min(int(n_components), r_tr.shape[1], len(train_df) - 1)
+    if k < 1:
+        return train_df, val_df
+
+    train_out = train_df.reset_index(drop=True).copy()
+    val_out = val_df.reset_index(drop=True).copy()
+    y = train_out[target_col].to_numpy(dtype=np.float64)
+
+    pls = PLSRegression(n_components=k, scale=True)
+    z_tr = np.asarray(pls.fit_transform(r_tr, y)[0], dtype=np.float64)
+    z_va = np.asarray(pls.transform(r_va), dtype=np.float64)
+
+    drop = [c for c in train_out.columns if re.fullmatch(r"res_pls_\d+", c)]
+    if drop:
+        train_out = train_out.drop(columns=drop)
+        val_out = val_out.drop(columns=[c for c in drop if c in val_out.columns])
+    for i in range(z_tr.shape[1]):
+        train_out[f"res_pls_{i}"] = z_tr[:, i].astype(np.float32)
+        val_out[f"res_pls_{i}"] = z_va[:, i].astype(np.float32)
+
+    corr0 = float(np.corrcoef(z_tr[:, 0], y)[0, 1]) if len(y) > 2 else float("nan")
+    y_hat = np.asarray(pls.predict(r_tr), dtype=np.float64).reshape(-1)
+    ss_res = float(np.sum((y - y_hat) ** 2))
+    ss_tot = float(np.sum((y - y.mean()) ** 2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+    print(
+        f"Residual emb PLS: k={k} train corr(res_pls_0,y)={corr0:.4f} "
+        f"in-sample R²={r2:.4f} val res_pls_0 p50={float(np.median(z_va[:, 0])):.4f}",
+        flush=True,
+    )
+    return train_out, val_out
+
+
 def _train_oof_underpred(
     train_df: pd.DataFrame,
     *,
@@ -3255,6 +3456,18 @@ def main() -> None:
     if args.emb_pls > 0 and not args.skip_embeddings:
         # Fit on raw MiniLM before train-fit PCA replaces emb_*.
         train_df, val_df = add_emb_pls(train_df, val_df, args.emb_pls)
+    if args.residual_emb_pls > 0 and not args.skip_embeddings:
+        # Residualize raw MiniLM vs TE/reply baselines, then PLS (before emb PCA).
+        train_df, val_df = add_residual_emb_pls(
+            train_df, val_df, args.residual_emb_pls
+        )
+    if args.residual_emb_cav and not args.skip_embeddings:
+        train_df, val_df = add_residual_emb_cav(
+            train_df,
+            val_df,
+            quantile=args.emb_cav_quantile,
+            nonreply_only=args.emb_cav_nonreply_only,
+        )
     if args.fail_clusters and not args.skip_embeddings:
         # Cluster raw MiniLM of OOF under-preds before emb PCA replaces emb_*.
         train_df, val_df = add_fail_clusters(
