@@ -739,10 +739,22 @@ def load_mention_times(account_ids: pd.Series, *, force: bool = False) -> dict[s
                 return
             piece["mentioned_user_id"] = piece["mentioned_user_id"].astype(str)
             piece["tweet_id"] = piece["tweet_id"].astype(str)
+            # API returns ISO strings; cache is datetime64 — unify before concat/parquet.
+            piece["created_at"] = pd.to_datetime(
+                piece["created_at"], utc=True, errors="coerce"
+            )
+            if len(cached):
+                cached = cached.copy()
+                cached["created_at"] = pd.to_datetime(
+                    cached["created_at"], utc=True, errors="coerce"
+                )
             pieces = [cached] if len(cached) else []
             pieces.append(piece)
             cached = pd.concat(pieces, ignore_index=True)
             cached = cached.drop_duplicates(["mentioned_user_id", "tweet_id"], keep="last")
+            cached["created_at"] = pd.to_datetime(
+                cached["created_at"], utc=True, errors="coerce"
+            )
             cached.to_parquet(MENTION_CACHE_PATH, index=False)
 
         fresh = _fetch_mention_events_api(missing, on_batch=_flush_mention_progress)
