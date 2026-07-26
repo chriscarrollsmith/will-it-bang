@@ -1,0 +1,82 @@
+/workspace/.venv/lib/python3.12/site-packages/scipy/stats/_stats_py.py:5445: ConstantInputWarning: An input array is constant; the correlation coefficient is not defined.
+  warnings.warn(stats.ConstantInputWarning(warn_msg))
+/workspace/.venv/lib/python3.12/site-packages/scipy/stats/_stats_py.py:5445: ConstantInputWarning: An input array is constant; the correlation coefficient is not defined.
+  warnings.warn(stats.ConstantInputWarning(warn_msg))
+Primary (within-account Spearman):
+  NR  wmean=0.2617 mean=0.2526 (n=415)
+  reply wmean=0.2978 mean=0.2555 (n=267)
+  guardrails: global_nr=0.5786 global_reply=0.3828 rmse=0.5995 rows=22125
+
+Provenance mix: stream=100.0% upload-linked=0.0%
+Primary within-account (upload):
+  NR  wmean=nan mean=nan (n=0)
+  reply wmean=nan mean=nan (n=0)
+  guardrails: global_nr=nan global_reply=nan rmse=nan rows=0
+Primary within-account (stream):
+  NR  wmean=0.2617 mean=0.2526 (n=415)
+  reply wmean=0.2978 mean=0.2555 (n=267)
+  guardrails: global_nr=0.5786 global_reply=0.3828 rmse=0.5995 rows=22125
+
+Slice metrics:
+                slice     n  rmse_log  baseline_rmse_log     r2_log  spearman  mean_true_eng  mean_abs_err_log  frac_under_0_5
+                  all 22125  0.599475           0.714625   0.187532  0.537755       3.048136          0.304975        0.144045
+                reply 15112  0.399650           0.423403   0.055350  0.382812       0.647234          0.203332        0.087149
+             nonreply  7013  0.888587           1.106728   0.077517  0.578611       8.221730          0.524002        0.266648
+                quote  3907  0.825925           1.059840   0.147307  0.582163       5.674623          0.488438        0.235987
+             nonquote 18218  0.538653           0.615887   0.149256  0.485452       2.484864          0.265630        0.124328
+            has_media     0       NaN                NaN        NaN       NaN            NaN               NaN             NaN
+             no_media 22125  0.599475           0.714625   0.187532  0.537755       3.048136          0.304975        0.144045
+               upload     0       NaN                NaN        NaN       NaN            NaN               NaN             NaN
+               stream 22125  0.599475           0.714625   0.187532  0.537755       3.048136          0.304975        0.144045
+              eng_low  7375  0.186181           0.135911 -56.190435  0.016935       0.018109          0.131818        0.000000
+             eng_high  7375  1.008752           1.227811  -0.437534  0.433079       8.931542          0.679708        0.432136
+              eng_mid  7375  0.160833           0.077930  -3.699525  0.207890       0.194756          0.103399        0.000000
+     nonreply_eng_low  2338  0.307354           0.111186 -26.209088  0.180854       0.060531          0.217838        0.000000
+    nonreply_eng_high  2338  1.481618           1.879880  -1.305267  0.229094      23.990196          1.144039        0.778443
+     nonreply_eng_mid  2337  0.280715           0.357437  -1.466372  0.229224       0.611208          0.209995        0.021395
+         inbound_cold  7375  0.449145           0.519724   0.219275  0.476456       1.916820          0.214408        0.080542
+nonreply_inbound_cold  2474  0.633721           0.763014   0.199337  0.554768       5.040200          0.333795        0.133791
+          inbound_hot  7360  0.730059           0.876163   0.103166  0.549792       4.880894          0.399080        0.210734
+ nonreply_inbound_hot  2223  1.101958           1.385232  -0.125273  0.472268      13.722636          0.716663        0.392263
+         inbound_warm  7390  0.586326           0.703452   0.195265  0.526926       2.351837          0.301636        0.141001
+nonreply_inbound_warm  2316  0.892397           1.115882   0.022161  0.466543       6.340293          0.542261        0.287997
+
+Over-predict (err_log>0.5): 1.4%
+Under-predict (err_log<-0.5): 14.4%
+Non-reply under-predict: 26.7%
+Non-reply RMSE gain vs baseline: 0.2181
+
+Worst absolute misses:
+       username  engagement  y_pred_eng  abs_err_log   err_log  is_reply  is_quote  is_stream  has_media  text_len  inbound_replies                                                                                                                                    full_text
+   demiurgently       37118    3.125014     8.616547 -8.616547         0         0          1          0       218         7.851661 bought the cheapest possible flights to france off ultra discount airline ive never heard of. got 6 charges to my credit card from "le frenc
+   demiurgently       18958    2.467106     7.897617 -7.897617         0         0          1          0        41         7.848934                                                                                                    downloaded tiktok https://t.co/VrxaXg8i0w
+         sksq96       10413    1.132191     7.763970 -7.763970         0         1          1          0       546         5.700444 so, let’s get this straight…  an unreleased (gpt-6?) model was being tested in a no-internet scenario on openai’s servers. and it found seve
+   corbindreams       23972    2.818002     7.605816 -7.605816         0         0          1          0       140         6.869014 it turns out that if you accept yourself you might realize that you don't actually sincerely want a lot of the things you thought you wanted
+thinkingshivers       27037   10.374406     7.079294 -7.079294         0         0          1          0       154         7.267525 I’d love to dunk on zoomers for not knowing why one “rolls” down a window, or “rewinds” a video.  But I only just learned why it’s called th
+         sksq96        4112    0.751245     6.928582 -6.928582         0         1          1          0       577         5.700444 btw people are misunderstanding what ExploitGym actually is…  the benchmark literally gives the model a real vulnerability, a crashing input
+ connerdelights        5101    3.102188     6.687491 -6.687491         0         0          1          0       236         7.583756 Terence Tao posted his ChatGPT session trying to understand the Jacobian conjecture counterexample. It's so lovely reading a slice of how hi
+    kasratweets       29599   24.679529     6.633599 -6.633599         0         1          1          0       107         5.986452                                  bro who is this man lmao this is so funny to me  these paintings are from the 1950s https://t.co/uIpc7THwjG
+   demiurgently        3609    1.330641     6.597533 -6.597533         1         0          1          0        50         7.851661                                                                                           whatever. i’m on vacation! https://t.co/BCrzo63sJP
+        Coobyk_        2672    2.152996     6.356112 -6.356112         0         1          1          0        95         4.770685                                              Why do monitors and some other stuff have names like they're  ----- BEGIN RSA PRIVATE KEY -----
+      iwsfutcmd       19363   19.570867     6.345033 -6.345033         0         1          1          0       104         5.081404                                     the Chinese are way ahead of you, buddy  we're currently in the 小暑 (Lesser Heat) https://t.co/sRJWyoRW7s
+    latentjuice        3925    4.361309     6.243809 -6.243809         0         0          1          0       544         7.254885 Listening to an interaction at this coffeeshop between dad and his ~7 year old daughter and thinking abt how deeply deeply unfair life can b
+
+Biggest non-reply underpredicts (viral misses):
+       username  engagement  y_pred_eng   err_log  abs_err_log  has_media  is_quote  is_stream  text_len  inbound_replies  inbound_replies_per_tweet                                                                                                                                    full_text
+   demiurgently       37118    3.125014 -8.616547     8.616547          0         0          1       218         7.851661                   0.424353 bought the cheapest possible flights to france off ultra discount airline ive never heard of. got 6 charges to my credit card from "le frenc
+   demiurgently       18958    2.467106 -7.897617     7.897617          0         0          1        41         7.848934                   0.424122                                                                                                    downloaded tiktok https://t.co/VrxaXg8i0w
+         sksq96       10413    1.132191 -7.763970     7.763970          0         1          1       546         5.700444                   0.143932 so, let’s get this straight…  an unreleased (gpt-6?) model was being tested in a no-internet scenario on openai’s servers. and it found seve
+   corbindreams       23972    2.818002 -7.605816     7.605816          0         0          1       140         6.869014                   0.393519 it turns out that if you accept yourself you might realize that you don't actually sincerely want a lot of the things you thought you wanted
+thinkingshivers       27037   10.374406 -7.079294     7.079294          0         0          1       154         7.267525                   0.421442 I’d love to dunk on zoomers for not knowing why one “rolls” down a window, or “rewinds” a video.  But I only just learned why it’s called th
+         sksq96        4112    0.751245 -6.928582     6.928582          0         1          1       577         5.700444                   0.143862 btw people are misunderstanding what ExploitGym actually is…  the benchmark literally gives the model a real vulnerability, a crashing input
+ connerdelights        5101    3.102188 -6.687491     6.687491          0         0          1       236         7.583756                   0.274032 Terence Tao posted his ChatGPT session trying to understand the Jacobian conjecture counterexample. It's so lovely reading a slice of how hi
+    kasratweets       29599   24.679529 -6.633599     6.633599          0         1          1       107         5.986452                   1.910079                                  bro who is this man lmao this is so funny to me  these paintings are from the 1950s https://t.co/uIpc7THwjG
+        Coobyk_        2672    2.152996 -6.356112     6.356112          0         1          1        95         4.770685                   0.025444                                              Why do monitors and some other stuff have names like they're  ----- BEGIN RSA PRIVATE KEY -----
+      iwsfutcmd       19363   19.570867 -6.345033     6.345033          0         1          1       104         5.081404                   1.287289                                     the Chinese are way ahead of you, buddy  we're currently in the 小暑 (Lesser Heat) https://t.co/sRJWyoRW7s
+    latentjuice        3925    4.361309 -6.243809     6.243809          0         0          1       544         7.254885                   0.231586 Listening to an interaction at this coffeeshop between dad and his ~7 year old daughter and thinking abt how deeply deeply unfair life can b
+       Prigoose        5787    4.087544 -6.228168     6.228168          0         0          1        50         8.053887                   0.365360                                                                                           what a live ceo looks like https://t.co/yApL5jQE1h
+1thousandfaces_        2455    2.606819 -5.842991     5.842991          0         0          1        26         8.570734                   0.575161                                                                                                                   gm https://t.co/rmcZZhHyP3
+   corbindreams        2263    1.797627 -5.792544     5.792544          0         1          1        67         6.891626                   0.396029                                                                          if you keep self-sabotaging maybe you should stop lying to yourself
+  adityaarpitha        3846    1.514805 -5.766614     5.766614          0         0          1       540         6.222576                   0.200150 > be me  > Get a new 4 TB ssd from SanDisk and have Claude backup my home folder   > Opus notices 8 MB/s transfer speed  > Starts investigat
+
+Wrote /home/ubuntu/.cache/will-it-bang/error_analysis.json
