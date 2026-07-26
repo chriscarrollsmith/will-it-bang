@@ -185,7 +185,7 @@ Fair revisit of prior ablations after the metric lock. Control = asymmetric leve
 - **Quote** / reply parents missing from CA — X fallback **complete** (**v39d**): among-reply 73%→97%, quote 70%→99%; wa_rp +0.006 / wa_nr −0.009 / rmse flat; keep default on.
 - Reply **dyad** / parent-author size — **v41 smoke** dense coverage but weak rate corr; wa_rp flat on small set; `--reply-dyad` stays opt-in (`logs/v41_reply_dyad_smoke.md`).
 - Parent-author **corpus MiniLM** — **v41d** 75% reply coverage but cos anti-aligned within-author; wa_* regress; stays under opt-in dyad (`logs/v41_parent_author_emb_smoke.md`).
-- Reply **LM stance** (agree/disagree vs parent) — **v42** 1.5B smoke poorly calibrated; wa_rp regress under sparse join; `--stance-labels` opt-in (`logs/v42_stance_smoke.md`).
+- Reply **LM stance** (agree/disagree vs parent) — **v42** Modal Qwen3-8B calibrated but dense corr fails gate (0.021); wa_rp regress; `--stance-labels` opt-in (`logs/v42_stance_smoke.md`).
 - Richer **descriptive LM tags** (humor/controversy/narrative/CTA/news/dunk) — **v43** 1.5B NR smoke: humor/narrative ρ≈0.14 (gate pass); overconfident ≥7 on humor/controversy; sparse train +wa_nr +0.016 / wa_rp frozen; `--desc-labels` opt-in (`logs/v43_desc_tags_smoke.md`). Revisit denser/8B before promote.
 
 ---
@@ -235,7 +235,7 @@ Check off when tried; note outcome in one line.
 ### Reply dyad / parent context
 Mostly helps replies (not the main under-prediction bucket); still cheap if parent/dyad coverage exists.
 - [x] Prior reciprocal interaction (reply/quote edges; mentions omitted) + leakage-safe parent-author size — **v41 smoke** (`logs/v41_reply_dyad_smoke.md`): among-reply parent-author **81%**, prior_dyad **74%** / bidir **56%**; global spearman(rate)≲0.02 (fails ~0.06 content gate); within-account outbound/hist_n ~0.05–0.06; small-scale train wa_nr +0.012 / wa_rp −0.006 / rmse −0.007. Harness: `prepare.py --dyad-only` + `train.py --reply-dyad` — **leave opt-in**
-- [x] Agree vs disagree with the parent tweet (LM text-only) — **v42 smoke** (`logs/v42_stance_smoke.md`): Qwen2.5-1.5B local 508 pairs; agree overconfident (p50=8, ≥7 57%); agree spearman(rate)=0.057 / conflict 0.17; train wa_rp 0.247→0.221 with sparse join. Harness: `label_stance.py --local` / Modal Qwen3-8B; train `--stance-labels` — **leave opt-in**; revisit only with calibrated denser labels
+- [x] Agree vs disagree with the parent tweet (LM text-only) — **v42** (`logs/v42_stance_smoke.md`): Modal Qwen3-8B densifies 3,428/3,429 replies (80.5%); calibrated (disagree p50=0, ≥7 6%) vs noisy 1.5B; dense agree spearman(rate)=**0.021** (500-row 0.09 was noise); train wa_rp 0.247→0.218. Harness: `label_stance.py` / `--stance-labels` — **leave opt-in**; do not promote
 - [x] Leakage-safe parent-tweet heat — already in stack as `reply_parent_replies` / `quote_parent_replies` (v11+)
 - [x] Reply earliness — already in stack as `reply_parent_age_hours` / `quote_parent_age_hours` (log1p hours)
 - [x] Semantic similarity to **parent author’s** pre-T MiniLM corpus mean — **v41d smoke** (`logs/v41_parent_author_emb_smoke.md`): among-reply emb_has **75%** (even-spaced cap=200); corpus cos spearman≈0 / wa **−0.07**; train wa_nr 0.148→0.140 / wa_rp 0.247→0.214 — **regress**; leave under `--reply-dyad` opt-in / do not promote

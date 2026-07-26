@@ -227,30 +227,36 @@ def build_pair_frame(
     return pairs.reset_index(drop=True)
 
 
+_CACHE_COLS = [
+    "tweet_id",
+    "parent_tweet_id",
+    "kind",
+    "agree",
+    "disagree",
+    "ok",
+    "model",
+    "raw",
+]
+
+
 def _load_cache(path: Path):
     import pandas as pd
 
     if not path.exists():
-        return pd.DataFrame(
-            columns=[
-                "tweet_id",
-                "parent_tweet_id",
-                "kind",
-                "agree",
-                "disagree",
-                "ok",
-                "model",
-                "raw",
-            ]
-        )
+        return pd.DataFrame(columns=_CACHE_COLS)
     cache = pd.read_parquet(path)
     cache["tweet_id"] = cache["tweet_id"].astype(str)
     return cache
 
 
 def _save_cache(cache, path: Path) -> None:
+    import pandas as pd
+
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     out = cache.drop_duplicates("tweet_id", keep="last")
+    # Avoid FutureWarning on concat with empty/all-NA frames.
+    if len(out) == 0:
+        out = pd.DataFrame(columns=_CACHE_COLS)
     out.to_parquet(path, index=False)
     print(f"Wrote {path} ({len(out):,} rows)", flush=True)
 
