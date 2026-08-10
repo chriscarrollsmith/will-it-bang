@@ -4248,25 +4248,7 @@ def main() -> None:
         pred, model, feature_names, gpboost_meta = fit_predict_group(
             train_df,
             val_df,
-            residual=residual,
-            baseline_kind=args.baseline,
-            skip_embeddings=args.skip_embeddings,
-            seed=args.seed,
-            nonreply_weight=args.nonreply_weight,
-            loss=args.loss,
-            quantile_alpha=args.quantile_alpha,
-            asymmetric_under_weight=args.asymmetric_under_weight,
-            sera_floor=args.sera_floor,
-            sera_high_only=args.sera_high_only,
-            sera_nonreply_only=args.sera_nonreply_only,
-            early_stop_metric=args.early_stop_metric,
-            rank_nonreply_only=args.rank_nonreply_only,
-            rank_min_group=args.rank_min_group,
-            rank_relevance=args.rank_relevance,
-            hybrid_rank=args.hybrid_rank,
-            model_kind=args.model,
-            stream_fresh_days=args.stream_fresh_days,
-            stream_fresh_floor=args.stream_fresh_floor,
+            **fit_kwargs,
         )
 
     # Primary prediction/label are in training-target space.

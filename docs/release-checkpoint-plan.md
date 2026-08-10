@@ -178,9 +178,9 @@ On the release train’s time holdout:
 
 ## 7. Sequencing
 
-1. Land export + `predict.py` + schema writer against current code.
-2. Run release train on X-complete full data; write `logs/release_v1.md`.
-3. Freeze card text from `feature_schema.json` + §4 recipes.
-4. Upload to HF when metrics + round-trip look sane.
+1. ~~Land export + `predict.py` + schema writer against current code.~~
+2. ~~Run release train on X-complete full data; write `logs/release_v1.md`.~~
+3. ~~Freeze card text from `feature_schema.json` + §4 recipes.~~
+4. ~~Upload to HF when metrics + round-trip look sane.~~ → [chriscarrollsmith/will-it-bang](https://huggingface.co/chriscarrollsmith/will-it-bang)
 
 No change to the locked research default stack until we deliberately choose to align defaults with release knobs.

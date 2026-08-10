@@ -108,13 +108,21 @@ def build_feature_matrix(
     frame["res_emb_cav_proj_sq"] = (proj * proj).astype(np.float32)
 
     emb_pca = pca.transform(emb.astype(np.float32))
-    for i in range(emb_pca.shape[1]):
-        frame[f"emb_{i}"] = emb_pca[:, i]
-
+    emb_pca_df = pd.DataFrame(
+        emb_pca, columns=[f"emb_{i}" for i in range(emb_pca.shape[1])]
+    )
     texts = [str(r.get("full_text", "")) for r in rows]
     tfidf_z = svd.transform(tfidf.transform(texts)).astype(np.float32)
-    for i in range(tfidf_z.shape[1]):
-        frame[f"tfidf_{i}"] = tfidf_z[:, i]
+    tfidf_df = pd.DataFrame(
+        tfidf_z, columns=[f"tfidf_{i}" for i in range(tfidf_z.shape[1])]
+    )
+    drop_emb = [c for c in frame.columns if re.fullmatch(r"emb_\d+", c)]
+    if drop_emb:
+        frame = frame.drop(columns=drop_emb)
+    frame = pd.concat(
+        [frame.reset_index(drop=True), emb_pca_df, tfidf_df],
+        axis=1,
+    )
 
     x = np.column_stack(
         [
