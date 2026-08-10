@@ -1873,7 +1873,42 @@ def parse_args() -> argparse.Namespace:
         help="Smoothing days added to effective age",
     )
     p.add_argument("--description", type=str, default="exposure-rate hybrid")
+    p.add_argument(
+        "--domain-mean-te",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Train-fold mean target by expanded URL domain (default on). "
+        "Use --no-domain-mean-te for release export (structural URL flags only).",
+    )
+    p.add_argument(
+        "--export-release",
+        type=Path,
+        default=None,
+        help="Write HF-ready inference bundle to this directory (forces release "
+        "knobs: no emb-kNN / provenance / domain-mean TE). See "
+        "docs/release-checkpoint-plan.md.",
+    )
     args = p.parse_args()
+    if args.export_release is not None:
+        # Release bundle must not require private train residue at serve time.
+        if args.emb_knn_te:
+            print("export-release: forcing --no-emb-knn-te", flush=True)
+            args.emb_knn_te = False
+        if args.provenance_features:
+            print("export-release: forcing --no-provenance-features", flush=True)
+            args.provenance_features = False
+        if args.domain_mean_te:
+            print("export-release: forcing --no-domain-mean-te", flush=True)
+            args.domain_mean_te = False
+        if args.media_types:
+            print("export-release: forcing --no-media-types", flush=True)
+            args.media_types = False
+        if not args.account_te:
+            print("export-release: forcing --account-te", flush=True)
+            args.account_te = True
+        if not args.residual_emb_cav:
+            print("export-release: forcing --residual-emb-cav", flush=True)
+            args.residual_emb_cav = True
     # GPBoost already models account_id as a RE — default off LOO TE to avoid
     # double-counting author mean unless the user explicitly passes --account-te.
     if (
@@ -2826,7 +2861,7 @@ def _residual_emb_design(df: pd.DataFrame) -> tuple[np.ndarray, list[str]]:
 def residualize_embeddings(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
-) -> tuple[np.ndarray, np.ndarray, list[str], float] | None:
+) -> tuple[np.ndarray, np.ndarray, list[str], float, np.ndarray] | None:
     """Per-dim OLS: emb ~ account TE / reply baselines; return residual MiniLM matrices.
 
     Fit on the train fold only. Isolates content variation orthogonal (in OLS sense)
@@ -2867,7 +2902,7 @@ def residualize_embeddings(
         f"residual ||.||_rms train={float(np.sqrt(np.mean(r_tr ** 2))):.4f}",
         flush=True,
     )
-    return r_tr, r_va, names, mean_r2
+    return r_tr, r_va, names, mean_r2, coef
 
 
 def add_residual_emb_cav(
@@ -2877,13 +2912,14 @@ def add_residual_emb_cav(
     quantile: float = 0.1,
     nonreply_only: bool = True,
     target_col: str = "log_engagement",
+    artifacts: dict[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """CAV on residual MiniLM (after OLS vs account TE / reply baselines)."""
     res = residualize_embeddings(train_df, val_df)
     if res is None:
         print("Skipping residual emb CAV (no emb_* columns)", flush=True)
         return train_df, val_df
-    r_tr, r_va, _names, _mean_r2 = res
+    r_tr, r_va, names, _mean_r2, coef = res
     q = float(np.clip(quantile, 0.01, 0.49))
 
     train_out = train_df.reset_index(drop=True).copy()
@@ -2928,6 +2964,12 @@ def add_residual_emb_cav(
         f"|μh−μc|={norm:.4f} train corr(proj,y)={corr:.4f}",
         flush=True,
     )
+    if artifacts is not None:
+        artifacts["res_emb_cav_direction"] = np.asarray(direction, dtype=np.float64)
+        artifacts["res_emb_baseline_coef"] = np.asarray(coef, dtype=np.float64)
+        artifacts["res_emb_baseline_names"] = list(names)
+        artifacts["res_emb_cav_quantile"] = float(q)
+        artifacts["res_emb_cav_nonreply_only"] = bool(nonreply_only)
     return train_out, val_out
 
 
@@ -2947,7 +2989,7 @@ def add_residual_emb_pls(
     if res is None:
         print("Skipping residual emb PLS (no emb_* columns)", flush=True)
         return train_df, val_df
-    r_tr, r_va, _names, _mean_r2 = res
+    r_tr, r_va, _names, _mean_r2, _coef = res
     k = min(int(n_components), r_tr.shape[1], len(train_df) - 1)
     if k < 1:
         return train_df, val_df
@@ -3234,6 +3276,7 @@ def apply_emb_pca(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
     n_components: int,
+    artifacts: dict[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     from sklearn.decomposition import PCA
 
@@ -3250,6 +3293,9 @@ def apply_emb_pca(
         train_out[f"emb_{i}"] = train_z[:, i]
         val_out[f"emb_{i}"] = val_z[:, i]
     print(f"PCA embeddings: {len(emb_cols)} → {train_z.shape[1]} (var={pca.explained_variance_ratio_.sum():.3f})")
+    if artifacts is not None:
+        artifacts["emb_pca"] = pca
+        artifacts["emb_pca_n_input"] = len(emb_cols)
     return train_out, val_out
 
 
@@ -3257,6 +3303,7 @@ def apply_text_svd(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
     n_components: int,
+    artifacts: dict[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Bag-time text only; vectorizer + SVD fit on train fold."""
     from sklearn.decomposition import TruncatedSVD
@@ -3291,6 +3338,9 @@ def apply_text_svd(
         f"TF-IDF SVD: vocab={len(vectorizer.vocabulary_):,} → {train_z.shape[1]} "
         f"(var={svd.explained_variance_ratio_.sum():.3f})"
     )
+    if artifacts is not None:
+        artifacts["tfidf"] = vectorizer
+        artifacts["text_svd"] = svd
     return train_out, val_out
 
 
@@ -3317,6 +3367,7 @@ def fit_predict_group(
     model_kind: str = "lgbm",
     stream_fresh_days: float = 0.0,
     stream_fresh_floor: float = 0.25,
+    artifacts: dict[str, Any] | None = None,
 ) -> tuple[np.ndarray, Any, list[str], dict[str, float]]:
     x_train, feature_names = feature_matrix(train_df, skip_embeddings=skip_embeddings)
     x_val, _ = feature_matrix(val_df, skip_embeddings=skip_embeddings)
@@ -3467,14 +3518,19 @@ def fit_predict_group(
         va_nr = val_df["is_reply"].to_numpy() == 0
         tr_rp = ~tr_nr
         va_rp = ~va_nr
-        _nr_model, rank_nr = _fit_stratum_lambdarank(tr_nr, va_nr, label="nr", seed_offset=11)
-        _rp_model, rank_rp = _fit_stratum_lambdarank(tr_rp, va_rp, label="reply", seed_offset=17)
+        nr_model, rank_nr = _fit_stratum_lambdarank(tr_nr, va_nr, label="nr", seed_offset=11)
+        rp_model, rank_rp = _fit_stratum_lambdarank(tr_rp, va_rp, label="reply", seed_offset=17)
         rank_score = np.where(va_nr, rank_nr, rank_rp)
         # 3) Blend per stratum: keep level mean/std, impose ranker order.
         pred = blend_level_with_rank_scores(level_pred, rank_score, account_val, mask=va_nr)
         pred = blend_level_with_rank_scores(pred, rank_score, account_val, mask=va_rp)
         extra_metrics["hybrid_rank"] = 1.0
         print("Hybrid-rank: blended level + stratum LambdaRank within accounts", flush=True)
+        if artifacts is not None:
+            artifacts["model_level"] = model
+            artifacts["model_rank_nr"] = nr_model
+            artifacts["model_rank_rp"] = rp_model
+            artifacts["feature_names"] = list(feature_names)
         # LambdaRank scores already in pred; skip residual add below.
         return pred, model, feature_names, extra_metrics
     elif loss == "lambdarank":
@@ -3508,6 +3564,9 @@ def fit_predict_group(
         )
         extra_metrics.update(sera_meta)
         raw = model.predict(x_val, num_iteration=model.best_iteration)
+        if artifacts is not None:
+            artifacts["model_level"] = model
+            artifacts["feature_names"] = list(feature_names)
     # LambdaRank scores are not in label units — do not add residual baseline.
     if residual and loss != "lambdarank":
         pred = raw + base_val
@@ -3516,12 +3575,261 @@ def fit_predict_group(
     return pred, model, feature_names, extra_metrics
 
 
+def _feature_schema_entry(name: str, *, global_mean: float) -> dict[str, Any]:
+    default: float = 0.0
+    group = "other"
+    if name == "account_mean_rate":
+        default = float(global_mean)
+        group = "account_prior"
+    elif name == "log_account_n":
+        group = "account_prior"
+    elif name.startswith("emb_"):
+        group = "embedding_pca"
+    elif name.startswith("tfidf_"):
+        group = "text_svd"
+    elif name.startswith("res_emb_cav"):
+        group = "residual_cav"
+    elif name in TABULAR_FEATURES:
+        if name.startswith(("hist_", "inbound_")) or "inbound" in name:
+            group = "ego_history"
+        elif "parent" in name:
+            group = "parent_context"
+        elif name in {
+            "year",
+            "month_sin",
+            "month_cos",
+            "platform_era",
+            "era_pre_timeline",
+            "era_algo_timeline",
+            "era_pre_musk",
+            "era_musk_early",
+            "era_musk_late",
+            "hour",
+            "dow",
+            "is_weekend",
+            "hour_sin",
+            "hour_cos",
+            "dow_sin",
+            "dow_cos",
+        }:
+            group = "calendar"
+        else:
+            group = "structure"
+    elif name in URL_DOMAIN_FEATURES:
+        group = "url_structure"
+    return {
+        "name": name,
+        "dtype": "float32",
+        "default": default,
+        "group": group,
+    }
+
+
+def export_release_bundle(
+    out_dir: Path,
+    *,
+    artifacts: dict[str, Any],
+    model: Any,
+    feature_names: list[str],
+    metrics: dict[str, Any],
+    args: argparse.Namespace,
+    global_mean: float,
+) -> None:
+    """Persist a HF-ready inference bundle (no train TE maps / emb-kNN index)."""
+    import joblib
+    import shutil
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    level = artifacts.get("model_level", model)
+    if level is None:
+        raise SystemExit("export-release: no level model to export")
+    level.save_model(str(out_dir / "model_level.txt"))
+    if "model_rank_nr" in artifacts:
+        artifacts["model_rank_nr"].save_model(str(out_dir / "model_rank_nr.txt"))
+    if "model_rank_rp" in artifacts:
+        artifacts["model_rank_rp"].save_model(str(out_dir / "model_rank_rp.txt"))
+
+    if "emb_pca" not in artifacts:
+        raise SystemExit("export-release: missing emb PCA (need --emb-pca > 0)")
+    if "tfidf" not in artifacts or "text_svd" not in artifacts:
+        raise SystemExit("export-release: missing TF-IDF/SVD (need --text-svd > 0)")
+    if "res_emb_cav_direction" not in artifacts:
+        raise SystemExit("export-release: missing residual CAV (need --residual-emb-cav)")
+
+    joblib.dump(artifacts["emb_pca"], out_dir / "emb_pca.joblib")
+    joblib.dump(artifacts["tfidf"], out_dir / "tfidf.joblib")
+    joblib.dump(artifacts["text_svd"], out_dir / "text_svd.joblib")
+    np.save(out_dir / "res_emb_cav_direction.npy", artifacts["res_emb_cav_direction"])
+    np.save(out_dir / "res_emb_baseline_coef.npy", artifacts["res_emb_baseline_coef"])
+
+    baselines = {
+        "names": artifacts["res_emb_baseline_names"],
+        "quantile": artifacts.get("res_emb_cav_quantile", 0.1),
+        "nonreply_only": artifacts.get("res_emb_cav_nonreply_only", True),
+    }
+    (out_dir / "res_emb_baselines.json").write_text(json.dumps(baselines, indent=2) + "\n")
+
+    schema = {
+        "features": [_feature_schema_entry(n, global_mean=global_mean) for n in feature_names],
+        "feature_names": list(feature_names),
+        "n_features": len(feature_names),
+        "notes": (
+            "Pass Layer-A floats (ego history, structure, calendar, account_mean_rate). "
+            "Bundle applies residual CAV, emb PCA, and TF-IDF→SVD. "
+            "account_id is not a model input."
+        ),
+    }
+    (out_dir / "feature_schema.json").write_text(json.dumps(schema, indent=2) + "\n")
+
+    constants = {
+        "global_mean": float(global_mean),
+        "account_te_prior": float(args.account_te_prior),
+        "exposure_cap_days": float(args.exposure_cap_days),
+        "exposure_beta": float(args.exposure_beta),
+        "exposure_eps": float(args.exposure_eps),
+        "encoder_id": "sentence-transformers/all-MiniLM-L6-v2",
+        "encoder_dims": int(artifacts.get("emb_pca_n_input", 384)),
+        "emb_pca_dims": int(artifacts["emb_pca"].n_components_),
+        "text_svd_dims": int(artifacts["text_svd"].n_components),
+        "target": "log1p(eng / (min(age_days, exposure_cap_days) + exposure_eps) ** exposure_beta)",
+        "release_knobs": {
+            "account_te": bool(args.account_te),
+            "emb_knn_te": bool(args.emb_knn_te),
+            "domain_mean_te": bool(args.domain_mean_te),
+            "provenance_features": bool(args.provenance_features),
+            "residual_emb_cav": bool(args.residual_emb_cav),
+            "hybrid_rank": bool(args.hybrid_rank),
+        },
+    }
+    (out_dir / "constants.json").write_text(json.dumps(constants, indent=2) + "\n")
+    (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
+
+    predict_src = Path(__file__).resolve().parent / "predict.py"
+    if predict_src.exists():
+        shutil.copy2(predict_src, out_dir / "predict.py")
+
+    card = _release_model_card(constants=constants, metrics=metrics, n_features=len(feature_names))
+    (out_dir / "README.md").write_text(card)
+    print(f"Wrote release bundle: {out_dir}", flush=True)
+
+
+def _release_model_card(
+    *,
+    constants: dict[str, Any],
+    metrics: dict[str, Any],
+    n_features: int,
+) -> str:
+    wa_nr = metrics.get("spearman_within_account_nonreply_wmean")
+    wa_rp = metrics.get("spearman_within_account_reply_wmean")
+    g_nr = metrics.get("spearman_nonreply")
+    rmse = metrics.get("rmse_log")
+    return f"""---
+language: en
+tags:
+  - twitter
+  - engagement-prediction
+  - lightgbm
+  - tabular
+license: apache-2.0
+library_name: lightgbm
+---
+
+# will-it-bang (release inference checkpoint)
+
+Predict a tweet's **exposure-adjusted engagement rate** from post-time text +
+caller-supplied ego/history features. This artifact is the shippable booster +
+transforms for the [will-it-bang](https://github.com/chriscarrollsmith/will-it-bang)
+research stack — **not** a fine-tuned language model.
+
+## Target
+
+`{constants["target"]}`
+
+where `eng = favorite_count + retweet_count` on the target tweet. Retweets
+(`full_text` starting with `RT @`) are excluded from training.
+
+## Metrics (time holdout, release knobs)
+
+| Metric | Value |
+|---|---:|
+| within-account Spearman NR (wmean) | {wa_nr} |
+| within-account Spearman reply (wmean) | {wa_rp} |
+| global Spearman NR | {g_nr} |
+| rate RMSE | {rmse} |
+| features | {n_features} |
+
+Release train disables emb-kNN TE, CA provenance features, and domain-mean TE
+maps so serve-time does not need private train residue. `account_mean_rate` remains
+a **caller-supplied float** (recipe below).
+
+## Files
+
+| File | Role |
+|---|---|
+| `model_level.txt` | LightGBM level booster |
+| `model_rank_nr.txt` / `model_rank_rp.txt` | Optional hybrid stratum rankers |
+| `emb_pca.joblib` | MiniLM → PCA |
+| `tfidf.joblib` + `text_svd.joblib` | TF-IDF → TruncatedSVD |
+| `res_emb_cav_direction.npy` | Residual CAV direction |
+| `res_emb_baseline_coef.npy` + `res_emb_baselines.json` | OLS residualizer |
+| `feature_schema.json` | Ordered booster inputs + defaults |
+| `constants.json` | Priors / caps / encoder id |
+| `predict.py` | Reference scorer |
+
+## Input schema
+
+`account_id` is **not** a model input. Pass a feature row matching
+`feature_schema.json` (or raw `full_text` + Layer-A floats via `predict.py`).
+
+### `account_mean_rate` / `log_account_n`
+
+For a candidate at time T, take the author's earlier posts with known engagement,
+each converted to the same exposure-rate `y_i`. Let `n` be that count,
+`y_bar` their mean, `m = {constants["account_te_prior"]}`, and
+`mu = {constants["global_mean"]:.6f}` (from `constants.json`):
+
+`account_mean_rate = (n * y_bar + m * mu) / (n + m)`  
+`log_account_n = log1p(n)`
+
+If `n = 0`: `account_mean_rate = mu`, `log_account_n = 0`.
+
+### Ego history
+
+Use pre-T reply/quote/mention arrivals and structural flags — **never** dump-time
+favorite/retweet history or current follower snapshots. See repo `AGENTS.md`.
+
+### Text encoder
+
+`{constants["encoder_id"]}` (Apache-2.0), {constants["encoder_dims"]}-d mean pool,
+then bundle residual-CAV → PCA ({constants["emb_pca_dims"]} dims) and TF-IDF→SVD
+({constants["text_svd_dims"]} dims).
+
+## Quick start
+
+```bash
+pip install lightgbm scikit-learn numpy pandas joblib pyarrow sentence-transformers
+python predict.py --bundle . --input row.json
+```
+
+`row.json` may include `full_text` plus any Layer-A fields from `feature_schema.json`.
+Missing fields use schema defaults.
+
+## Not included
+
+Training dataset, val predictions, per-account TE maps, emb-kNN train index,
+CA graph caches. Rebuild features yourself from the recipes above.
+"""
+
+
 def main() -> None:
     args = parse_args()
     if not args.dataset.exists():
         raise SystemExit(f"Missing dataset at {args.dataset}. Run: uv run prepare.py")
 
     t0 = time.time()
+    release_art: dict[str, Any] | None = {} if args.export_release is not None else None
     df = pd.read_parquet(args.dataset)
     df["created_at"] = pd.to_datetime(df["created_at"], utc=True)
     if not args.media_types:
@@ -3648,14 +3956,19 @@ def main() -> None:
         y_train_raw_ref = train_df["log_engagement_raw"].to_numpy(dtype=np.float64)
         y_val_raw_ref = val_df["log_engagement_raw"].to_numpy(dtype=np.float64)
         val_eff_days = val_df["exposure_eff_days"].to_numpy(dtype=np.float64)
-    if "url_domain" in train_df.columns:
+    if "url_domain" in train_df.columns and args.domain_mean_te:
         train_df, val_df = add_domain_priors(train_df, val_df)
+    elif "url_domain" in train_df.columns:
+        print("Domain mean TE: off (structural URL flags only)", flush=True)
+    global_mean = float(train_df["log_engagement"].mean())
     if args.account_te:
         train_df, val_df = add_account_target_encoding(
             train_df, val_df, prior_strength=args.account_te_prior
         )
         train_df = add_te_affinity_interactions(train_df)
         val_df = add_te_affinity_interactions(val_df)
+        if release_art is not None:
+            release_art["global_mean"] = global_mean
     if args.era_te:
         train_df, val_df = add_era_target_encoding(
             train_df,
@@ -3692,6 +4005,7 @@ def main() -> None:
             val_df,
             quantile=args.emb_cav_quantile,
             nonreply_only=args.emb_cav_nonreply_only,
+            artifacts=release_art,
         )
     if args.fail_clusters and not args.skip_embeddings:
         # Cluster raw MiniLM of OOF under-preds before emb PCA replaces emb_*.
@@ -3714,9 +4028,13 @@ def main() -> None:
             seed=args.seed,
         )
     if args.emb_pca > 0 and not args.skip_embeddings:
-        train_df, val_df = apply_emb_pca(train_df, val_df, args.emb_pca)
+        train_df, val_df = apply_emb_pca(
+            train_df, val_df, args.emb_pca, artifacts=release_art
+        )
     if args.text_svd > 0:
-        train_df, val_df = apply_text_svd(train_df, val_df, args.text_svd)
+        train_df, val_df = apply_text_svd(
+            train_df, val_df, args.text_svd, artifacts=release_art
+        )
 
     rate_target = bool(args.exposure_correct and args.exposure_mode == "rate")
     if args.residual is None:
@@ -3801,6 +4119,7 @@ def main() -> None:
         model_kind=args.model,
         stream_fresh_days=args.stream_fresh_days,
         stream_fresh_floor=args.stream_fresh_floor,
+        artifacts=release_art,
     )
     if args.hybrid_rank or args.loss == "lambdarank":
         print(f"Rank relevance labels: {args.rank_relevance}", flush=True)
@@ -3929,25 +4248,7 @@ def main() -> None:
         pred, model, feature_names, gpboost_meta = fit_predict_group(
             train_df,
             val_df,
-            residual=residual,
-            baseline_kind=args.baseline,
-            skip_embeddings=args.skip_embeddings,
-            seed=args.seed,
-            nonreply_weight=args.nonreply_weight,
-            loss=args.loss,
-            quantile_alpha=args.quantile_alpha,
-            asymmetric_under_weight=args.asymmetric_under_weight,
-            sera_floor=args.sera_floor,
-            sera_high_only=args.sera_high_only,
-            sera_nonreply_only=args.sera_nonreply_only,
-            early_stop_metric=args.early_stop_metric,
-            rank_nonreply_only=args.rank_nonreply_only,
-            rank_min_group=args.rank_min_group,
-            rank_relevance=args.rank_relevance,
-            hybrid_rank=args.hybrid_rank,
-            model_kind=args.model,
-            stream_fresh_days=args.stream_fresh_days,
-            stream_fresh_floor=args.stream_fresh_floor,
+            **fit_kwargs,
         )
 
     # Primary prediction/label are in training-target space.
@@ -4196,6 +4497,23 @@ def main() -> None:
         if key in metrics:
             print(f"{key}: {metrics[key]}")
     print(f"model_path: {MODEL_PATH}")
+
+    if args.export_release is not None:
+        if release_art is None:
+            raise SystemExit("export-release: internal artifacts dict missing")
+        if "feature_names" not in release_art and feature_names:
+            release_art["feature_names"] = list(feature_names)
+        if "model_level" not in release_art and model is not None:
+            release_art["model_level"] = model
+        export_release_bundle(
+            args.export_release,
+            artifacts=release_art,
+            model=model,
+            feature_names=list(release_art.get("feature_names") or feature_names),
+            metrics=metrics,
+            args=args,
+            global_mean=float(release_art.get("global_mean", global_mean)),
+        )
 
 
 if __name__ == "__main__":

@@ -255,6 +255,9 @@ Fair revisit of prior ablations after the metric lock. Control = asymmetric leve
 
 ## Backlog — not yet explored
 
+### Release / packaging
+- [x] HF release inference checkpoint — plan [`docs/release-checkpoint-plan.md`](docs/release-checkpoint-plan.md); harness `train.py --export-release` + `predict.py`; **release-v1** on X-complete: wa_nr **0.246** / wa_rp **0.307** / global_nr **0.616** / rmse **0.588** (`logs/release_v1.md`); uploaded [chriscarrollsmith/will-it-bang](https://huggingface.co/chriscarrollsmith/will-it-bang). Research v48b defaults unchanged.
+
 Check off when tried; note outcome in one line.
 
 ### Time / regimes
