@@ -255,6 +255,9 @@ Fair revisit of prior ablations after the metric lock. Control = asymmetric leve
 
 ## Backlog — not yet explored
 
+### Release / packaging
+- [ ] HF release inference checkpoint — plan in [`docs/release-checkpoint-plan.md`](docs/release-checkpoint-plan.md): export bundle (level LGBM + PCA/TF-IDF/residual CAV), `feature_schema.json`, caller-supplied `account_mean_rate` recipe; train with `--no-emb-knn-te --no-provenance-features` and no domain-TE map; reference `predict.py`; keep research v48b defaults unchanged
+
 Check off when tried; note outcome in one line.
 
 ### Time / regimes
